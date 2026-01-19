@@ -70,20 +70,21 @@ class BatchedSVPF:
         # x: [B, N] -> diff: [B, N, N]
         diff = x.unsqueeze(2) - x.unsqueeze(1)
         
-        # Median heuristic per batch
-        pairwise_dist = torch.abs(diff)
-        # Get median of non-zero distances for each batch
-        mask = pairwise_dist > 0
-        
-        # Compute bandwidth per batch
         B, N, _ = diff.shape
-        bandwidths = torch.zeros(B, device=x.device)
-        for b in range(B):
-            dists = pairwise_dist[b][mask[b]]
-            if len(dists) > 0:
-                bandwidths[b] = torch.median(dists)
-            else:
-                bandwidths[b] = 1.0
+        
+        # Vectorized median heuristic (no Python loop)
+        pairwise_dist = torch.abs(diff)
+        
+        # Flatten each batch's upper triangle for median calculation
+        # Use a fixed percentile approximation instead of exact median for speed
+        # Median ≈ 50th percentile of non-zero distances
+        flat_dists = pairwise_dist.reshape(B, -1)  # [B, N*N]
+        
+        # Sort and take middle value (approximate median of all, including zeros)
+        # For non-zero median, we use 75th percentile of all values as approximation
+        sorted_dists, _ = flat_dists.sort(dim=1)
+        median_idx = int(0.75 * N * N)  # Approximate non-zero median position
+        bandwidths = sorted_dists[:, median_idx]
         
         bandwidths = torch.clamp(bandwidths, min=0.01, max=10.0)
         bandwidths = bandwidths / np.log(N + 1)

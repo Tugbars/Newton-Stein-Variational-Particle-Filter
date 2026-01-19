@@ -15,6 +15,12 @@ import numpy as np
 import matplotlib.pyplot as plt
 from dataclasses import dataclass
 
+# Detect GPU
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {DEVICE}")
+if DEVICE.type == 'cuda':
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+
 
 @dataclass
 class SVParams:
@@ -280,21 +286,17 @@ class SVPF(nn.Module):
 
 
 def train(model: SVPF, observations: torch.Tensor, n_epochs: int = 200, 
-          lr: float = 0.01, verbose: bool = True) -> dict:
+          lr: float = 0.01, chunk_size: int = 30, verbose: bool = True) -> dict:
     """
-    Train SVPF via gradient descent on negative log-likelihood.
+    Train SVPF via gradient descent with Truncated BPTT.
     
-    Args:
-        model: SVPF instance
-        observations: Training data [T]
-        n_epochs: Number of optimization steps
-        lr: Learning rate
-        verbose: Print progress
-    
-    Returns:
-        Dictionary with training history
+    Gradients flow within chunks (chunk_size steps), then detach between chunks.
+    This gives stronger gradient signal than single-step, but avoids full BPTT memory explosion.
     """
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    device = observations.device
+    dtype = observations.dtype
+    T = len(observations)
     
     history = {
         'loss': [],
@@ -305,19 +307,73 @@ def train(model: SVPF, observations: torch.Tensor, n_epochs: int = 200,
         'grad_sigma': [],
     }
     
+    # Pre-compute Student-t constants
+    nu = torch.tensor(model.nu, device=device, dtype=dtype)
+    const = (
+        torch.lgamma((nu + 1) / 2)
+        - torch.lgamma(nu / 2)
+        - 0.5 * torch.log(torch.pi * nu)
+    )
+    
     for epoch in range(n_epochs):
         optimizer.zero_grad()
         
-        log_lik, _ = model.forward(observations)
-        loss = -log_lik
+        total_loss = torch.tensor(0.0, device=device, dtype=dtype)
         
-        loss.backward()
+        # Initialize particles
+        particles = model.init_particles(device)
         
-        # Gradient clipping
+        # Process in chunks for truncated BPTT
+        for chunk_start in range(0, T, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, T)
+            
+            chunk_loss = torch.tensor(0.0, device=device, dtype=dtype)
+            
+            for t in range(chunk_start, chunk_end):
+                y_t = observations[t]
+                h_prev = particles  # Keep graph within chunk
+                
+                # Prediction step - gradients flow through θ
+                noise = torch.randn_like(particles)
+                h_pred = (model.mu + model.rho * (h_prev - model.mu) 
+                          + model.sigma_z * noise)
+                h_pred = torch.clamp(h_pred, -15.0, 5.0)
+                
+                # Observation likelihood
+                vol = torch.exp(h_pred)
+                scaled_y_sq = y_t**2 / (vol + 1e-8)
+                
+                log_w = (
+                    const
+                    - 0.5 * h_pred
+                    - (nu + 1) / 2 * torch.log1p(scaled_y_sq / nu)
+                )
+                
+                max_log_w = log_w.max()
+                step_log_lik = max_log_w + torch.log(torch.exp(log_w - max_log_w).mean() + 1e-10)
+                chunk_loss = chunk_loss - step_log_lik
+                
+                # Stein update (detached - inference only)
+                current_particles = h_pred.detach()
+                with torch.no_grad():
+                    for _ in range(model.n_stein_steps):
+                        grad_log_p = model.grad_log_posterior(current_particles, h_prev.detach(), y_t)
+                        current_particles = model.stein_update(current_particles, grad_log_p)
+                
+                particles = current_particles
+            
+            # Accumulate loss
+            total_loss = total_loss + chunk_loss
+            
+            # DETACH between chunks - this is the truncation
+            particles = particles.detach()
+        
+        # Backward and update
+        total_loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
         
-        # Record before step
-        history['loss'].append(loss.item())
+        # Record history
+        history['loss'].append(total_loss.item())
         history['rho'].append(model.rho.item())
         history['sigma_z'].append(model.sigma_z.item())
         history['mu'].append(model.mu.item())
@@ -327,10 +383,13 @@ def train(model: SVPF, observations: torch.Tensor, n_epochs: int = 200,
         optimizer.step()
         
         if verbose and epoch % 20 == 0:
-            print(f"Epoch {epoch:4d}: loss={loss.item():8.2f}, "
+            grad_rho = model.log_rho.grad.item() if model.log_rho.grad is not None else 0
+            grad_sigma = model.log_sigma.grad.item() if model.log_sigma.grad is not None else 0
+            print(f"Epoch {epoch:4d}: loss={total_loss.item():8.2f}, "
                   f"ρ={model.rho.item():.4f}, "
                   f"σ_z={model.sigma_z.item():.4f}, "
-                  f"μ={model.mu.item():.2f}")
+                  f"μ={model.mu.item():.2f} | "
+                  f"∇ρ={grad_rho:.2f}, ∇σ={grad_sigma:.2f}")
     
     return history
 
@@ -347,9 +406,10 @@ def test_gradient_sanity():
     
     true_params = SVParams(rho=0.95, sigma_z=0.20, mu=-5.0)
     y, h = generate_synthetic_data(T=200, params=true_params)
+    y = y.to(DEVICE)  # Move to GPU
     
     # Smaller model for fast validation
-    model = SVPF(n_particles=100, n_stein_steps=3)
+    model = SVPF(n_particles=100, n_stein_steps=3).to(DEVICE)
     
     # Set to wrong values: rho too low, sigma too high
     with torch.no_grad():
@@ -400,9 +460,10 @@ def test_parameter_recovery():
     true_params = SVParams(rho=0.95, sigma_z=0.20, mu=-5.0)
     # Shorter sequence for faster validation
     y, h = generate_synthetic_data(T=300, params=true_params)
+    y = y.to(DEVICE)  # Move to GPU
     
-    # Smaller model, fewer epochs
-    model = SVPF(n_particles=100, n_stein_steps=3)
+    # More particles for stable gradients
+    model = SVPF(n_particles=200, n_stein_steps=5).to(DEVICE)
     
     # Initialize at wrong values
     with torch.no_grad():
@@ -414,7 +475,7 @@ def test_parameter_recovery():
     print(f"Initial params: ρ={model.rho.item():.4f}, σ_z={model.sigma_z.item():.4f}, μ={model.mu.item():.2f}")
     print(f"\nTraining...")
     
-    history = train(model, y, n_epochs=80, lr=0.02, verbose=True)
+    history = train(model, y, n_epochs=200, lr=0.005, verbose=True)
     
     final_rho = model.rho.item()
     final_sigma = model.sigma_z.item()
@@ -483,13 +544,14 @@ def test_crash_response():
     
     # Generate data with crash at t=150 (T=300 for speed)
     y, h = generate_synthetic_data(T=300, params=true_params, crash_at=150)
+    y = y.to(DEVICE)  # Move to GPU
     
     print(f"Injected 5σ crash at t=150")
     print(f"Crash return: y[150] = {y[150].item():.4f}")
     print(f"Normal returns std: {y[:140].std().item():.4f}")
     
     # Run filter with true parameters - smaller model for speed
-    model = SVPF(n_particles=200, n_stein_steps=5)
+    model = SVPF(n_particles=200, n_stein_steps=5).to(DEVICE)
     with torch.no_grad():
         model.log_rho.fill_(torch.logit(torch.tensor(true_params.rho / 0.999)))
         model.log_sigma.fill_(np.log(true_params.sigma_z))
@@ -500,7 +562,7 @@ def test_crash_response():
     with torch.no_grad():
         _, vol_trajectory = model.forward(y)
     
-    vol_trajectory = vol_trajectory.numpy()
+    vol_trajectory = vol_trajectory.cpu().numpy()
     true_vol = torch.exp(h / 2).numpy()
     
     # Check for explosion
@@ -530,7 +592,7 @@ def test_crash_response():
     # Plot
     fig, axes = plt.subplots(2, 1, figsize=(12, 8))
     
-    axes[0].plot(y.numpy(), alpha=0.7, linewidth=0.5)
+    axes[0].plot(y.cpu().numpy(), alpha=0.7, linewidth=0.5)
     axes[0].axvline(150, color='r', linestyle='--', label='Crash')
     axes[0].set_xlabel('Time')
     axes[0].set_ylabel('Return')
@@ -562,12 +624,13 @@ def test_multiple_starting_points():
     true_params = SVParams(rho=0.95, sigma_z=0.20, mu=-5.0)
     # Shorter sequence for speed
     y, h = generate_synthetic_data(T=300, params=true_params)
+    y = y.to(DEVICE)  # Move to GPU
     
     starting_rhos = [0.3, 0.6, 0.85, 0.99]
     final_rhos = []
     
     for start_rho in starting_rhos:
-        model = SVPF(n_particles=100, n_stein_steps=3)
+        model = SVPF(n_particles=100, n_stein_steps=3).to(DEVICE)
         with torch.no_grad():
             model.log_rho.fill_(torch.logit(torch.tensor(start_rho / 0.999)))
             model.log_sigma.fill_(np.log(0.3))
