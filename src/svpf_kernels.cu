@@ -10,6 +10,11 @@
 #include <math.h>
 #include <stdio.h>
 
+// Windows doesn't define M_PI by default
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 // =============================================================================
 // DEVICE HELPER FUNCTIONS
 // =============================================================================

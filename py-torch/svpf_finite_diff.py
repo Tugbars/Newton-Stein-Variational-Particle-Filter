@@ -470,16 +470,20 @@ def test_parameter_recovery():
     print("TEST 2: Parameter Recovery (Finite Differences)")
     print("="*60)
     
+    # Increase T to ensure statistical identification of rho
+    T_steps = 2000
+    
     true_params = SVParams(rho=0.95, sigma_z=0.20, mu=-5.0)
-    y, h = generate_synthetic_data(T=300, params=true_params)
+    y, h = generate_synthetic_data(T=T_steps, params=true_params)
     y = y.to(DEVICE)
     
     print(f"True params:    ρ={true_params.rho:.4f}, σ_z={true_params.sigma_z:.4f}, μ={true_params.mu:.2f}")
     print(f"Initial params: ρ=0.5000, σ_z=0.5000, μ=-3.00")
+    print(f"Sequence length: T={T_steps} (long enough for ρ identification)")
     print(f"\nTraining...")
     
     optimizer, history = train_finite_diff(
-        y, n_epochs=150, lr=0.05, 
+        y, n_epochs=200, lr=0.05, 
         n_particles=300, n_stein_steps=5,
         init_rho=0.5, init_sigma=0.5, init_mu=-3.0,
         verbose=True
@@ -530,10 +534,10 @@ def test_parameter_recovery():
     plt.close()
     print("\n✓ Saved convergence plot to svpf_finite_diff_recovery.png")
     
-    # Success criterion - more lenient since finite diff has noise
-    success = rho_error < 0.15 and sigma_error < 0.15
+    # Success criterion - tighter now that we have enough data
+    success = rho_error < 0.10 and sigma_error < 0.05
     if success:
-        print("\n✓ Parameter recovery successful (within 0.15 of true values)")
+        print("\n✓ Parameter recovery successful")
     else:
         print("\n✗ Parameter recovery failed")
     
@@ -547,7 +551,8 @@ def test_multiple_starting_points():
     print("="*60)
     
     true_params = SVParams(rho=0.95, sigma_z=0.20, mu=-5.0)
-    y, h = generate_synthetic_data(T=300, params=true_params)
+    # Use longer sequence for proper identification
+    y, h = generate_synthetic_data(T=1000, params=true_params)
     y = y.to(DEVICE)
     
     starting_rhos = [0.3, 0.6, 0.85, 0.99]
@@ -555,7 +560,7 @@ def test_multiple_starting_points():
     
     for start_rho in starting_rhos:
         optimizer, history = train_finite_diff(
-            y, n_epochs=100, lr=0.05,
+            y, n_epochs=150, lr=0.05,
             n_particles=200, n_stein_steps=5,
             init_rho=start_rho, init_sigma=0.3, init_mu=-4.0,
             verbose=False
@@ -567,12 +572,14 @@ def test_multiple_starting_points():
     
     rho_spread = max(final_rhos) - min(final_rhos)
     print(f"\nSpread of final ρ values: {rho_spread:.4f}")
+    print(f"Mean final ρ: {np.mean(final_rhos):.4f} (true: {true_params.rho})")
     
-    success = rho_spread < 0.20
+    # Success: all converge to similar region AND close to true value
+    success = rho_spread < 0.15 and abs(np.mean(final_rhos) - true_params.rho) < 0.15
     if success:
-        print("✓ All starting points converged to similar region")
+        print("✓ All starting points converged to similar region near true value")
     else:
-        print("✗ Starting points diverged")
+        print("✗ Starting points diverged or converged to wrong value")
     
     return success
 

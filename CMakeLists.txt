@@ -1,14 +1,16 @@
 cmake_minimum_required(VERSION 3.24)
 
 # =============================================================================
-# Intel ICX as host compiler (must be set before project())
+# Compiler setup - Intel ICX on Linux, MSVC on Windows
 # =============================================================================
-if(WIN32)
-    set(CMAKE_C_COMPILER "icx")
-    set(CMAKE_CXX_COMPILER "icx")
-else()
-    set(CMAKE_C_COMPILER "icx")
-    set(CMAKE_CXX_COMPILER "icpx")
+if(NOT WIN32)
+    # Linux: Use Intel ICX if available
+    find_program(ICX_COMPILER icpx)
+    if(ICX_COMPILER)
+        set(CMAKE_C_COMPILER "icx")
+        set(CMAKE_CXX_COMPILER "icpx")
+        set(CMAKE_CUDA_HOST_COMPILER "icpx")
+    endif()
 endif()
 
 # =============================================================================
@@ -47,25 +49,26 @@ set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --use_fast_math")
 set(CMAKE_CUDA_FLAGS_RELEASE "${CMAKE_CUDA_FLAGS_RELEASE} -O3 -lineinfo")
 set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} -G -g")
 
-# Intel ICX as CUDA host compiler
-set(CMAKE_CUDA_HOST_COMPILER ${CMAKE_CXX_COMPILER})
-
 # =============================================================================
-# Intel ICX Flags
+# Compiler-specific flags
 # =============================================================================
 if(CMAKE_CXX_COMPILER_ID MATCHES "IntelLLVM")
     message(STATUS "Using Intel ICX compiler")
-    
-    # Optimization flags
     set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -mtune=native -ffast-math")
     set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")
-    
-    # Enable Intel-specific optimizations
-    if(WIN32)
-        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /Qopenmp")
-    else()
-        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -qopenmp")
-    endif()
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -qopenmp")
+elseif(MSVC)
+    message(STATUS "Using MSVC compiler")
+    set(CMAKE_CXX_FLAGS_RELEASE "/O2 /fp:fast /DNDEBUG")
+    set(CMAKE_CXX_FLAGS_DEBUG "/Zi /Od /RTC1")
+    # Enable OpenMP
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /openmp")
+    # Disable annoying warnings
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
+else()
+    message(STATUS "Using ${CMAKE_CXX_COMPILER_ID} compiler")
+    set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -ffast-math")
+    set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")
 endif()
 
 # =============================================================================
