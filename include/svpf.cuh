@@ -17,10 +17,11 @@
  *       // result.vol_mean is current volatility estimate
  *   svpf_destroy(filter);
  * 
- * For batch processing (faster):
- *   svpf_optimized_init(N);
+ * For batch processing (faster - thread-safe, auto-initialized):
  *   svpf_run_sequence_optimized(filter, d_observations, T, &params, d_loglik, d_vol);
- *   svpf_optimized_cleanup();
+ * 
+ * For maximum speed (CUDA Graph):
+ *   svpf_run_sequence_graph(filter, d_observations, T, &params, d_loglik, d_vol);
  * 
  * Memory Layout: Structure of Arrays (SoA) for coalesced GPU access
  * 
@@ -56,6 +57,54 @@ extern "C" {
 // =============================================================================
 // DATA STRUCTURES
 // =============================================================================
+
+/**
+ * @brief Optimized backend state for batch/graph processing
+ * 
+ * Embedded in SVPFState for thread safety - each filter instance
+ * has its own optimization buffers.
+ */
+typedef struct {
+    // CUB temporary storage
+    void* d_temp_storage;
+    size_t temp_storage_bytes;
+    
+    // Device scalars
+    float* d_max_log_w;
+    float* d_sum_exp;
+    float* d_bandwidth;
+    float* d_bandwidth_sq;
+    
+    // Device timestep counter (for CUDA Graph)
+    int* d_timestep;
+    
+    // Stein computation buffers
+    float* d_exp_w;
+    float* d_phi;
+    
+    // Staging buffers for CUDA Graph (fixed addresses)
+    float* d_obs_staging;
+    float* d_loglik_staging;
+    float* d_vol_staging;
+    
+    // Single-step API buffers (avoid malloc in hot loop)
+    float* d_y_single;
+    float* d_loglik_single;
+    float* d_vol_single;
+    
+    // CUDA Graph state
+    cudaGraph_t graph;
+    cudaGraphExec_t graphExec;
+    cudaStream_t graph_stream;  // Dedicated stream for graph capture (NULL/default doesn't work)
+    bool graph_captured;
+    int graph_n;        // N for which graph was captured
+    int graph_n_stein;  // n_stein for which graph was captured
+    
+    // Capacity tracking
+    int allocated_n;
+    int staging_T;
+    bool initialized;
+} SVPFOptimizedState;
 
 /**
  * @brief SV model parameters
@@ -121,6 +170,9 @@ typedef struct {
     int timestep;
     float y_prev;
     cudaStream_t stream;
+    
+    // Optimized backend (embedded for thread safety)
+    SVPFOptimizedState opt_backend;
     
 } SVPFState;
 
@@ -219,16 +271,6 @@ void svpf_run_sequence_device(
 // =============================================================================
 
 /**
- * @brief Initialize optimized SVPF state (call once before using optimized API)
- */
-void svpf_optimized_init(int n);
-
-/**
- * @brief Cleanup optimized SVPF state
- */
-void svpf_optimized_cleanup(void);
-
-/**
  * @brief OPTIMIZED: Run full sequence with 2D tiled Stein kernel
  * 
  * Key optimizations:
@@ -238,6 +280,8 @@ void svpf_optimized_cleanup(void);
  * - Small N path (N ≤ 4096): persistent CTA, all data in SMEM
  * - NO device→host copies in loop (CUDA Graph compatible)
  * - EMA bandwidth smoothing for stability
+ * 
+ * Thread-safe: Each SVPFState has its own optimization buffers.
  * 
  * @param state SVPF state
  * @param d_observations Device array [T]
@@ -256,10 +300,9 @@ void svpf_run_sequence_optimized(
 );
 
 /**
- * @brief OPTIMIZED: Single step (for real-time usage)
+ * @brief OPTIMIZED: Single step (for real-time/HFT usage)
  * 
- * Note: For best performance, use svpf_run_sequence_optimized instead.
- * Single-step API has unavoidable overhead from per-step memory allocation.
+ * Uses pre-allocated buffers (zero malloc in hot loop).
  * 
  * @param state SVPF state
  * @param y_t Current observation
@@ -300,6 +343,11 @@ void svpf_run_sequence_graph(
     float* d_loglik_out,
     float* d_vol_out
 );
+
+/**
+ * @brief Internal: Cleanup optimized backend (called by svpf_destroy)
+ */
+void svpf_optimized_cleanup_state(SVPFState* state);
 
 // =============================================================================
 // API: Diagnostics

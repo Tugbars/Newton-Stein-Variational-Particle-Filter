@@ -13,6 +13,7 @@
 #include <cub/cub.cuh>
 #include <math.h>
 #include <stdio.h>
+#include <string.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -358,6 +359,9 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     SVPFState* state = (SVPFState*)malloc(sizeof(SVPFState));
     if (!state) return NULL;
     
+    // Zero-initialize opt_backend (CRITICAL - malloc doesn't zero memory)
+    memset(&state->opt_backend, 0, sizeof(SVPFOptimizedState));
+    
     state->n_particles = n_particles;
     state->n_stein_steps = n_stein_steps;
     state->nu = nu;
@@ -405,6 +409,9 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
 
 void svpf_destroy(SVPFState* state) {
     if (!state) return;
+    
+    // Cleanup optimized backend
+    svpf_optimized_cleanup_state(state);
     
     cudaFree(state->h);
     cudaFree(state->h_prev);

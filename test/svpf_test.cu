@@ -204,7 +204,6 @@ int test_optimized_correctness() {
     SVPFState* state2 = svpf_create(N, 5, 5.0f, NULL);
     svpf_initialize(state2, &params, 42);
     
-    svpf_optimized_init(N);
     svpf_run_sequence_optimized(state2, d_y, T, &params, d_loglik, d_vol);
     
     cudaMemcpy(loglik_optimized, d_loglik, T * sizeof(float), cudaMemcpyDeviceToHost);
@@ -238,7 +237,6 @@ int test_optimized_correctness() {
     
     svpf_destroy(state1);
     svpf_destroy(state2);
-    svpf_optimized_cleanup();
     cudaFree(d_y);
     cudaFree(d_loglik);
     cudaFree(d_vol);
@@ -290,9 +288,6 @@ void benchmark_comparison() {
         SVPFState* state = svpf_create(N, 5, 5.0f, NULL);
         SVPFParams params = {0.95f, 0.20f, -5.0f, 0.0f};
         SVPFResult result;
-        
-        // Initialize optimized state
-        svpf_optimized_init(N);
         
         // --- Per-step API ---
         svpf_initialize(state, &params, 42);
@@ -378,7 +373,6 @@ void benchmark_comparison() {
                speedup);
         
         svpf_destroy(state);
-        svpf_optimized_cleanup();
     }
     
     cudaEventDestroy(start);
@@ -426,7 +420,6 @@ void benchmark_scaling() {
         int N = particle_counts[c];
         
         SVPFState* state = svpf_create(N, 5, 5.0f, NULL);
-        svpf_optimized_init(N);
         
         // Warmup (captures graph)
         svpf_initialize(state, &params, 42);
@@ -452,7 +445,6 @@ void benchmark_scaling() {
                N, avg_ms, avg_ms * 1000.0f / T, T / (avg_ms / 1000.0f), ops_per_step);
         
         svpf_destroy(state);
-        svpf_optimized_cleanup();
     }
     
     cudaFree(d_y);

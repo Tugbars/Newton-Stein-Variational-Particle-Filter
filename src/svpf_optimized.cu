@@ -439,12 +439,15 @@ __global__ void svpf_stein_2d_kernel(
  * - Each block loads ALL data once into SMEM
  * - Grid-stride over i: block b handles particles b, b+gridDim.x, b+2*gridDim.x...
  * - Within each i: threads cooperate on j summation
+ * 
+ * CRITICAL: Writes to phi[], NOT h[] - avoids race condition.
+ * Caller must apply transport separately with svpf_apply_transport_kernel.
  */
 __global__ void svpf_stein_persistent_kernel(
-    float* __restrict__ h,
+    const float* __restrict__ h,      // READ-ONLY
     const float* __restrict__ grad,
+    float* __restrict__ phi,          // OUTPUT: transport direction
     const float* __restrict__ d_bandwidth,
-    float step_size,
     int n
 ) {
     extern __shared__ float smem[];
@@ -495,9 +498,9 @@ __global__ void svpf_stein_persistent_kernel(
         gk_sum = (threadIdx.x < BLOCK_SIZE / WARP_SIZE) ? sh_reduce[threadIdx.x] : 0.0f;
         if (wid == 0) gk_sum = warp_reduce_sum(gk_sum);
         
-        // Thread 0 writes the update
+        // Thread 0 writes transport direction to phi (NOT h)
         if (threadIdx.x == 0) {
-            h[i] = clamp_logvol(h_i + step_size * (k_sum + gk_sum) / (float)n);
+            phi[i] = (k_sum + gk_sum) / (float)n;
         }
         __syncthreads();  // Ensure write completes before next iteration
     }
@@ -560,51 +563,23 @@ __global__ void svpf_vol_mean_opt_kernel_graph(
 }
 
 // =============================================================================
-// Host State (CUB temp storage, device scalars, CUDA Graph)
+// Host State - Uses SVPFOptimizedState from svpf.cuh (embedded in SVPFState)
 // =============================================================================
 
-struct SVPFOptimizedState {
-    // CUB temporary storage
-    void* d_temp_storage;
-    size_t temp_storage_bytes;
-    
-    // Device scalars (NO host copies needed)
-    float* d_max_log_w;
-    float* d_sum_exp;
-    float* d_bandwidth;
-    float* d_bandwidth_sq;
-    
-    // Device timestep counter (for CUDA Graph path)
-    int* d_timestep;
-    
-    // Buffers
-    float* d_exp_w;
-    float* d_phi;
-    
-    // Staging buffers for CUDA Graph (fixed addresses that graph captures)
-    float* d_obs_staging;      // Observations staging buffer
-    float* d_loglik_staging;   // Log-likelihood output staging
-    float* d_vol_staging;      // Volatility output staging
-    int staging_T;             // Current staging buffer size
-    
-    // Dedicated stream for graph capture (NULL/default stream doesn't work)
-    cudaStream_t graph_stream;
-    bool owns_stream;          // True if we created the stream
-    
-    // CUDA Graph (captured once, replayed T times)
-    cudaGraph_t graph;
-    cudaGraphExec_t graphExec;
-    bool graph_captured;
-    int graph_n;       // N for which graph was captured
-    int graph_T;       // n_stein for which graph was captured (for invalidation)
-    
-    bool initialized;
-};
+// Helper to get optimized backend from state
+static inline SVPFOptimizedState* get_opt(SVPFState* state) {
+    return &state->opt_backend;
+}
 
-static SVPFOptimizedState g_opt = {0};
+// Forward declaration
+void svpf_optimized_cleanup(SVPFOptimizedState* opt);
 
-void svpf_optimized_init(int n) {
-    if (g_opt.initialized) return;
+void svpf_optimized_init(SVPFOptimizedState* opt, int n) {
+    // Handle resize: if N increased, re-allocate
+    if (opt->initialized && n > opt->allocated_n) {
+        svpf_optimized_cleanup(opt);
+    }
+    if (opt->initialized) return;
     
     // Query CUB temp storage size
     float* d_dummy_in;
@@ -612,87 +587,96 @@ void svpf_optimized_init(int n) {
     cudaMalloc(&d_dummy_in, n * sizeof(float));
     cudaMalloc(&d_dummy_out, sizeof(float));
     
-    g_opt.temp_storage_bytes = 0;
-    cub::DeviceReduce::Max(nullptr, g_opt.temp_storage_bytes, d_dummy_in, d_dummy_out, n);
+    opt->temp_storage_bytes = 0;
+    cub::DeviceReduce::Max(nullptr, opt->temp_storage_bytes, d_dummy_in, d_dummy_out, n);
     size_t sum_bytes = 0;
     cub::DeviceReduce::Sum(nullptr, sum_bytes, d_dummy_in, d_dummy_out, n);
-    g_opt.temp_storage_bytes = max(g_opt.temp_storage_bytes, sum_bytes);
+    opt->temp_storage_bytes = max(opt->temp_storage_bytes, sum_bytes);
     
-    cudaMalloc(&g_opt.d_temp_storage, g_opt.temp_storage_bytes);
+    cudaMalloc(&opt->d_temp_storage, opt->temp_storage_bytes);
     cudaFree(d_dummy_in);
     cudaFree(d_dummy_out);
     
     // Device scalars
-    cudaMalloc(&g_opt.d_max_log_w, sizeof(float));
-    cudaMalloc(&g_opt.d_sum_exp, sizeof(float));
-    cudaMalloc(&g_opt.d_bandwidth, sizeof(float));
-    cudaMalloc(&g_opt.d_bandwidth_sq, sizeof(float));
+    cudaMalloc(&opt->d_max_log_w, sizeof(float));
+    cudaMalloc(&opt->d_sum_exp, sizeof(float));
+    cudaMalloc(&opt->d_bandwidth, sizeof(float));
+    cudaMalloc(&opt->d_bandwidth_sq, sizeof(float));
     
     // Device timestep counter
-    cudaMalloc(&g_opt.d_timestep, sizeof(int));
+    cudaMalloc(&opt->d_timestep, sizeof(int));
     
     // Initialize bandwidth_sq to 0 (triggers fresh computation on first step)
     float zero = 0.0f;
-    cudaMemcpy(g_opt.d_bandwidth_sq, &zero, sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(opt->d_bandwidth_sq, &zero, sizeof(float), cudaMemcpyHostToDevice);
     
     // Buffers
-    cudaMalloc(&g_opt.d_exp_w, n * sizeof(float));
-    cudaMalloc(&g_opt.d_phi, n * sizeof(float));
+    cudaMalloc(&opt->d_exp_w, n * sizeof(float));
+    cudaMalloc(&opt->d_phi, n * sizeof(float));
     
-    // Staging buffers for CUDA Graph (allocate initial size)
-    cudaMalloc(&g_opt.d_obs_staging, MAX_T_SIZE * sizeof(float));
-    cudaMalloc(&g_opt.d_loglik_staging, MAX_T_SIZE * sizeof(float));
-    cudaMalloc(&g_opt.d_vol_staging, MAX_T_SIZE * sizeof(float));
-    g_opt.staging_T = MAX_T_SIZE;
+    // Staging buffers for CUDA Graph
+    cudaMalloc(&opt->d_obs_staging, MAX_T_SIZE * sizeof(float));
+    cudaMalloc(&opt->d_loglik_staging, MAX_T_SIZE * sizeof(float));
+    cudaMalloc(&opt->d_vol_staging, MAX_T_SIZE * sizeof(float));
+    opt->staging_T = MAX_T_SIZE;
     
-    // Create dedicated stream for graph capture with non-blocking flag
-    // (avoids implicit sync with default stream)
-    cudaError_t streamErr = cudaStreamCreateWithFlags(&g_opt.graph_stream, cudaStreamNonBlocking);
-    if (streamErr != cudaSuccess) {
-        fprintf(stderr, "ERROR: Failed to create graph_stream: %s\n", cudaGetErrorString(streamErr));
-        g_opt.graph_stream = NULL;
-    } else {
-        printf("  [Created graph_stream successfully]\n");
-    }
-    g_opt.owns_stream = true;
+    // Single-step API buffers (avoid malloc in hot loop)
+    cudaMalloc(&opt->d_y_single, 2 * sizeof(float));
+    cudaMalloc(&opt->d_loglik_single, sizeof(float));
+    cudaMalloc(&opt->d_vol_single, sizeof(float));
     
     // Graph not yet captured
-    g_opt.graph_captured = false;
-    g_opt.graph_n = 0;
-    g_opt.graph_T = 0;
+    opt->graph_captured = false;
+    opt->graph_n = 0;
+    opt->graph_n_stein = 0;
     
-    g_opt.initialized = true;
+    // Create dedicated stream for graph capture (non-blocking to avoid sync with default stream)
+    cudaStreamCreateWithFlags(&opt->graph_stream, cudaStreamNonBlocking);
+    
+    opt->allocated_n = n;
+    opt->initialized = true;
 }
 
-void svpf_optimized_cleanup(void) {
-    if (!g_opt.initialized) return;
+void svpf_optimized_cleanup(SVPFOptimizedState* opt) {
+    if (!opt->initialized) return;
     
-    cudaFree(g_opt.d_temp_storage);
-    cudaFree(g_opt.d_max_log_w);
-    cudaFree(g_opt.d_sum_exp);
-    cudaFree(g_opt.d_bandwidth);
-    cudaFree(g_opt.d_bandwidth_sq);
-    cudaFree(g_opt.d_timestep);
-    cudaFree(g_opt.d_exp_w);
-    cudaFree(g_opt.d_phi);
-    cudaFree(g_opt.d_obs_staging);
-    cudaFree(g_opt.d_loglik_staging);
-    cudaFree(g_opt.d_vol_staging);
-    
-    // Destroy dedicated stream
-    if (g_opt.owns_stream && g_opt.graph_stream) {
-        cudaStreamDestroy(g_opt.graph_stream);
-        g_opt.graph_stream = NULL;
-    }
+    cudaFree(opt->d_temp_storage);
+    cudaFree(opt->d_max_log_w);
+    cudaFree(opt->d_sum_exp);
+    cudaFree(opt->d_bandwidth);
+    cudaFree(opt->d_bandwidth_sq);
+    cudaFree(opt->d_timestep);
+    cudaFree(opt->d_exp_w);
+    cudaFree(opt->d_phi);
+    cudaFree(opt->d_obs_staging);
+    cudaFree(opt->d_loglik_staging);
+    cudaFree(opt->d_vol_staging);
+    cudaFree(opt->d_y_single);
+    cudaFree(opt->d_loglik_single);
+    cudaFree(opt->d_vol_single);
     
     // Destroy CUDA Graph if captured
-    if (g_opt.graph_captured) {
-        cudaGraphExecDestroy(g_opt.graphExec);
-        cudaGraphDestroy(g_opt.graph);
-        g_opt.graph_captured = false;
+    if (opt->graph_captured) {
+        cudaGraphExecDestroy(opt->graphExec);
+        cudaGraphDestroy(opt->graph);
+        opt->graph_captured = false;
     }
     
-    g_opt.initialized = false;
+    // Destroy dedicated stream
+    if (opt->graph_stream) {
+        cudaStreamDestroy(opt->graph_stream);
+        opt->graph_stream = NULL;
+    }
+    
+    opt->allocated_n = 0;
+    opt->initialized = false;
+}
+
+// Wrapper for SVPFState cleanup (called by svpf_destroy)
+void svpf_optimized_cleanup_state(SVPFState* state) {
+    if (state) {
+        svpf_optimized_cleanup(&state->opt_backend);
+    }
 }
 
 // =============================================================================
@@ -707,11 +691,12 @@ void svpf_run_sequence_optimized(
     float* d_loglik_out,
     float* d_vol_out
 ) {
+    SVPFOptimizedState* opt = get_opt(state);
     int n = state->n_particles;
     int n_stein = state->n_stein_steps;
     cudaStream_t stream = state->stream;
     
-    svpf_optimized_init(n);
+    svpf_optimized_init(opt, n);
     
     // Pre-compute constant
     float student_t_const = lgammaf((state->nu + 1.0f) / 2.0f)
@@ -773,50 +758,57 @@ void svpf_run_sequence_optimized(
         if (n <= 4096) {
             // Single block for small N
             svpf_logsumexp_kernel<<<1, BLOCK_SIZE, 0, stream>>>(
-                state->log_weights, d_loglik_out, g_opt.d_max_log_w, t, n
+                state->log_weights, d_loglik_out, opt->d_max_log_w, t, n
             );
         } else {
             // Multi-block with CUB
-            cub::DeviceReduce::Max(g_opt.d_temp_storage, g_opt.temp_storage_bytes,
-                                   state->log_weights, g_opt.d_max_log_w, n, stream);
+            cub::DeviceReduce::Max(opt->d_temp_storage, opt->temp_storage_bytes,
+                                   state->log_weights, opt->d_max_log_w, n, stream);
             
             svpf_exp_shifted_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
-                state->log_weights, g_opt.d_max_log_w, g_opt.d_exp_w, n
+                state->log_weights, opt->d_max_log_w, opt->d_exp_w, n
             );
             
-            cub::DeviceReduce::Sum(g_opt.d_temp_storage, g_opt.temp_storage_bytes,
-                                   g_opt.d_exp_w, g_opt.d_sum_exp, n, stream);
+            cub::DeviceReduce::Sum(opt->d_temp_storage, opt->temp_storage_bytes,
+                                   opt->d_exp_w, opt->d_sum_exp, n, stream);
             
             svpf_finalize_loglik_kernel<<<1, 1, 0, stream>>>(
-                g_opt.d_max_log_w, g_opt.d_sum_exp, d_loglik_out, t, n
+                opt->d_max_log_w, opt->d_sum_exp, d_loglik_out, t, n
             );
         }
         
         // === 4. Bandwidth (every few steps for stability) ===
         if (t % BANDWIDTH_UPDATE_INTERVAL == 0) {
             svpf_bandwidth_kernel<<<1, BLOCK_SIZE, 0, stream>>>(
-                state->h, g_opt.d_bandwidth, g_opt.d_bandwidth_sq, bw_alpha, n
+                state->h, opt->d_bandwidth, opt->d_bandwidth_sq, bw_alpha, n
             );
         }
         
         // === 5. Stein Transport Iterations ===
         for (int s = 0; s < n_stein; s++) {
             if (use_small_n) {
-                // Persistent CTA path
+                // Persistent CTA path - writes to phi, then apply transport
+                cudaMemsetAsync(opt->d_phi, 0, n * sizeof(float), stream);
+                
                 svpf_stein_persistent_kernel<<<persistent_blocks, BLOCK_SIZE, persistent_smem, stream>>>(
                     state->h, state->grad_log_p,
-                    g_opt.d_bandwidth, SVPF_STEIN_STEP_SIZE, n
+                    opt->d_phi, opt->d_bandwidth, n
+                );
+                
+                // Apply transport (same as large N path)
+                svpf_apply_transport_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
+                    state->h, opt->d_phi, SVPF_STEIN_STEP_SIZE, n
                 );
             } else {
                 // 2D tiled path
-                cudaMemsetAsync(g_opt.d_phi, 0, n * sizeof(float), stream);
+                cudaMemsetAsync(opt->d_phi, 0, n * sizeof(float), stream);
                 
                 svpf_stein_2d_kernel<<<grid_2d, BLOCK_SIZE, 0, stream>>>(
-                    state->h, state->grad_log_p, g_opt.d_phi, g_opt.d_bandwidth, n
+                    state->h, state->grad_log_p, opt->d_phi, opt->d_bandwidth, n
                 );
                 
                 svpf_apply_transport_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
-                    state->h, g_opt.d_phi, SVPF_STEIN_STEP_SIZE, n
+                    state->h, opt->d_phi, SVPF_STEIN_STEP_SIZE, n
                 );
             }
             
@@ -867,62 +859,44 @@ void svpf_run_sequence_graph(
     float* d_loglik_out,
     float* d_vol_out
 ) {
+    SVPFOptimizedState* opt = get_opt(state);
     int n = state->n_particles;
     int n_stein = state->n_stein_steps;
     
     // Sanity check T
     if (T > MAX_T_SIZE) {
-        fprintf(stderr, "Error: T=%d exceeds MAX_T_SIZE=%d, falling back\n", T, MAX_T_SIZE);
         svpf_run_sequence_optimized(state, d_observations, T, params, d_loglik_out, d_vol_out);
         return;
     }
     
-    svpf_optimized_init(n);
-    
-    // Use dedicated graph stream (default/NULL stream doesn't support graph capture)
-    cudaStream_t stream = g_opt.graph_stream;
-    
-    // DEBUG: Check if stream is valid
-    if (stream == NULL) {
-        fprintf(stderr, "ERROR: graph_stream is NULL!\n");
-        svpf_run_sequence_optimized(state, d_observations, T, params, d_loglik_out, d_vol_out);
-        return;
-    }
-    
-    // Sync with state's stream to ensure particle arrays are ready
-    // (in case previous operations were on a different stream)
-    if (state->stream != stream) {
-        cudaStreamSynchronize(state->stream);
-    }
-    
-    // === PASSTHROUGH CHECK ===
-    // If the stream is already capturing (shouldn't happen with dedicated stream), fall back
+    // === CHECK STATE->STREAM CAPTURE STATUS FIRST (before any sync) ===
+    // If user's stream is capturing, we cannot interfere - fall back to optimized path
     cudaStreamCaptureStatus captureStatus;
-    cudaError_t queryErr = cudaStreamIsCapturing(stream, &captureStatus);
-    
-    if (queryErr != cudaSuccess) {
-        fprintf(stderr, "ERROR: cudaStreamIsCapturing failed: %s\n", cudaGetErrorString(queryErr));
-        svpf_run_sequence_optimized(state, d_observations, T, params, d_loglik_out, d_vol_out);
-        return;
-    }
-    
+    cudaStreamIsCapturing(state->stream, &captureStatus);
     if (captureStatus != cudaStreamCaptureStatusNone) {
-        // Stream is already capturing - fall back to optimized path
-        printf("  [Graph: stream busy (status=%d), using optimized fallback]\n", (int)captureStatus);
         svpf_run_sequence_optimized(state, d_observations, T, params, d_loglik_out, d_vol_out);
         return;
     }
+    
+    // Now safe to initialize (may create our dedicated stream)
+    svpf_optimized_init(opt, n);
+    
+    // Use our dedicated graph_stream (default/NULL stream doesn't support graph capture)
+    cudaStream_t stream = opt->graph_stream;
+    
+    // Sync with state->stream to ensure observations and particles are ready
+    cudaStreamSynchronize(state->stream);
     
     // === STAGING SETUP ===
     // Copy observations to fixed staging address that graph will use
-    cudaMemcpyAsync(g_opt.d_obs_staging, d_observations, T * sizeof(float), 
+    cudaMemcpyAsync(opt->d_obs_staging, d_observations, T * sizeof(float), 
                     cudaMemcpyDeviceToDevice, stream);
     
     // Reset counters
     int zero = 0;
     float zero_f = 0.0f;
-    cudaMemcpyAsync(g_opt.d_timestep, &zero, sizeof(int), cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(g_opt.d_bandwidth_sq, &zero_f, sizeof(float), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(opt->d_timestep, &zero, sizeof(int), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(opt->d_bandwidth_sq, &zero_f, sizeof(float), cudaMemcpyHostToDevice, stream);
     
     // Pre-compute constant
     float student_t_const = lgammaf((state->nu + 1.0f) / 2.0f)
@@ -957,36 +931,24 @@ void svpf_run_sequence_graph(
     
     // === GRAPH CAPTURE LOGIC ===
     // Invalidation: Check n AND n_stein
-    bool need_capture = !g_opt.graph_captured || 
-                        (g_opt.graph_n != n) || 
-                        (g_opt.graph_T != n_stein);  // Reuse graph_T for n_stein tracking
+    bool need_capture = !opt->graph_captured || 
+                        (opt->graph_n != n) || 
+                        (opt->graph_n_stein != n_stein);
     
     if (need_capture) {
         // Cleanup old graph
-        if (g_opt.graph_captured) {
-            cudaGraphExecDestroy(g_opt.graphExec);
-            cudaGraphDestroy(g_opt.graph);
-            g_opt.graph_captured = false;
+        if (opt->graph_captured) {
+            cudaGraphExecDestroy(opt->graphExec);
+            cudaGraphDestroy(opt->graph);
+            opt->graph_captured = false;
         }
         
-        // STRICT SYNC: Stream must be completely idle before capture
+        // STRICT SYNC: Stream must be idle before capture
         cudaStreamSynchronize(stream);
-        
-        // Double-check capture status after sync
-        cudaStreamIsCapturing(stream, &captureStatus);
-        if (captureStatus != cudaStreamCaptureStatusNone) {
-            fprintf(stderr, "ERROR: Stream still capturing after sync! status=%d\n", (int)captureStatus);
-            svpf_run_sequence_optimized(state, d_observations, T, params, d_loglik_out, d_vol_out);
-            return;
-        }
         
         // Begin capture
         cudaError_t err = cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
         if (err != cudaSuccess) {
-            fprintf(stderr, "Graph capture begin failed: %s, falling back\n", cudaGetErrorString(err));
-            // Check what went wrong
-            cudaStreamIsCapturing(stream, &captureStatus);
-            fprintf(stderr, "  After failed begin, capture status=%d\n", (int)captureStatus);
             svpf_run_sequence_optimized(state, d_observations, T, params, d_loglik_out, d_vol_out);
             return;
         }
@@ -996,7 +958,7 @@ void svpf_run_sequence_graph(
         // 1. Predict - use staging buffer
         svpf_predict_kernel_graph<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
             state->h, state->h_prev, state->rng_states,
-            g_opt.d_obs_staging, g_opt.d_timestep,
+            opt->d_obs_staging, opt->d_timestep,
             params->rho, params->sigma_z, params->mu, params->gamma,
             n
         );
@@ -1004,47 +966,54 @@ void svpf_run_sequence_graph(
         // 2. Likelihood + Gradient - use staging buffer
         svpf_likelihood_grad_kernel_graph<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
             state->h, state->h_prev, state->grad_log_p, state->log_weights,
-            g_opt.d_obs_staging, g_opt.d_timestep,
+            opt->d_obs_staging, opt->d_timestep,
             params->rho, params->sigma_z, params->mu, state->nu, student_t_const,
             n
         );
         
         // 3. Log-Sum-Exp - output to staging
         svpf_logsumexp_kernel_graph<<<1, BLOCK_SIZE, 0, stream>>>(
-            state->log_weights, g_opt.d_loglik_staging, g_opt.d_max_log_w, 
-            g_opt.d_timestep, n
+            state->log_weights, opt->d_loglik_staging, opt->d_max_log_w, 
+            opt->d_timestep, n
         );
         
         // 4. Bandwidth
         svpf_bandwidth_kernel<<<1, BLOCK_SIZE, 0, stream>>>(
-            state->h, g_opt.d_bandwidth, g_opt.d_bandwidth_sq, bw_alpha, n
+            state->h, opt->d_bandwidth, opt->d_bandwidth_sq, bw_alpha, n
         );
         
         // 5. Stein iterations
         for (int s = 0; s < n_stein; s++) {
             if (use_small_n) {
+                // Persistent CTA path - writes to phi, then apply transport
+                cudaMemsetAsync(opt->d_phi, 0, n * sizeof(float), stream);
+                
                 svpf_stein_persistent_kernel<<<persistent_blocks, BLOCK_SIZE, persistent_smem, stream>>>(
                     state->h, state->grad_log_p,
-                    g_opt.d_bandwidth, SVPF_STEIN_STEP_SIZE, n
+                    opt->d_phi, opt->d_bandwidth, n
+                );
+                
+                svpf_apply_transport_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
+                    state->h, opt->d_phi, SVPF_STEIN_STEP_SIZE, n
                 );
             } else {
-                cudaMemsetAsync(g_opt.d_phi, 0, n * sizeof(float), stream);
+                cudaMemsetAsync(opt->d_phi, 0, n * sizeof(float), stream);
                 
                 int num_tiles = (n + TILE_J - 1) / TILE_J;
                 dim3 grid_2d(n, num_tiles);
                 svpf_stein_2d_kernel<<<grid_2d, BLOCK_SIZE, 0, stream>>>(
-                    state->h, state->grad_log_p, g_opt.d_phi, g_opt.d_bandwidth, n
+                    state->h, state->grad_log_p, opt->d_phi, opt->d_bandwidth, n
                 );
                 
                 svpf_apply_transport_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
-                    state->h, g_opt.d_phi, SVPF_STEIN_STEP_SIZE, n
+                    state->h, opt->d_phi, SVPF_STEIN_STEP_SIZE, n
                 );
             }
             
             if (s < n_stein - 1) {
                 svpf_likelihood_grad_kernel_graph<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
                     state->h, state->h_prev, state->grad_log_p, state->log_weights,
-                    g_opt.d_obs_staging, g_opt.d_timestep,
+                    opt->d_obs_staging, opt->d_timestep,
                     params->rho, params->sigma_z, params->mu, state->nu, student_t_const,
                     n
                 );
@@ -1053,61 +1022,56 @@ void svpf_run_sequence_graph(
         
         // 6. Volatility mean - output to staging
         svpf_vol_mean_opt_kernel_graph<<<1, BLOCK_SIZE, 0, stream>>>(
-            state->h, g_opt.d_vol_staging, g_opt.d_timestep, n
+            state->h, opt->d_vol_staging, opt->d_timestep, n
         );
         
         // 7. Increment timestep counter
-        svpf_increment_timestep_kernel<<<1, 1, 0, stream>>>(g_opt.d_timestep);
+        svpf_increment_timestep_kernel<<<1, 1, 0, stream>>>(opt->d_timestep);
         
         // === KERNEL RECORDING END ===
         
         // End capture
-        err = cudaStreamEndCapture(stream, &g_opt.graph);
+        err = cudaStreamEndCapture(stream, &opt->graph);
         if (err != cudaSuccess) {
-            fprintf(stderr, "Graph capture end failed: %s, falling back\n", cudaGetErrorString(err));
-            g_opt.graph = NULL;
+            opt->graph = NULL;
             svpf_run_sequence_optimized(state, d_observations, T, params, d_loglik_out, d_vol_out);
             return;
         }
         
-        // Validation: Verify we captured something
+        // Validation: Verify we captured something meaningful
         size_t numNodes = 0;
-        cudaGraphGetNodes(g_opt.graph, NULL, &numNodes);
-        printf("  [Graph captured: %zu nodes for N=%d, stein=%d]\n", numNodes, n, n_stein);
+        cudaGraphGetNodes(opt->graph, NULL, &numNodes);
         
         if (numNodes < 5) {
-            fprintf(stderr, "WARNING: Graph has only %zu nodes - likely broken!\n", numNodes);
-            cudaGraphDestroy(g_opt.graph);
-            g_opt.graph = NULL;
+            cudaGraphDestroy(opt->graph);
+            opt->graph = NULL;
             svpf_run_sequence_optimized(state, d_observations, T, params, d_loglik_out, d_vol_out);
             return;
         }
         
-        err = cudaGraphInstantiate(&g_opt.graphExec, g_opt.graph, NULL, NULL, 0);
+        err = cudaGraphInstantiate(&opt->graphExec, opt->graph, NULL, NULL, 0);
         if (err != cudaSuccess) {
-            fprintf(stderr, "Graph instantiate failed: %s, falling back\n", cudaGetErrorString(err));
-            cudaGraphDestroy(g_opt.graph);
-            g_opt.graph = NULL;
+            cudaGraphDestroy(opt->graph);
+            opt->graph = NULL;
             svpf_run_sequence_optimized(state, d_observations, T, params, d_loglik_out, d_vol_out);
             return;
         }
         
-        g_opt.graph_captured = true;
-        g_opt.graph_n = n;
-        g_opt.graph_T = n_stein;  // Track n_stein for invalidation
+        opt->graph_captured = true;
+        opt->graph_n = n;
+        opt->graph_n_stein = n_stein;
     }
-    // Note: d_timestep already reset above via cudaMemcpyAsync
     
     // === LAUNCH ===
     for (int t = 0; t < T; t++) {
-        cudaGraphLaunch(g_opt.graphExec, stream);
+        cudaGraphLaunch(opt->graphExec, stream);
     }
     
     // === COPY OUTPUTS ===
-    cudaMemcpyAsync(d_loglik_out, g_opt.d_loglik_staging, T * sizeof(float),
+    cudaMemcpyAsync(d_loglik_out, opt->d_loglik_staging, T * sizeof(float),
                     cudaMemcpyDeviceToDevice, stream);
     if (d_vol_out) {
-        cudaMemcpyAsync(d_vol_out, g_opt.d_vol_staging, T * sizeof(float),
+        cudaMemcpyAsync(d_vol_out, opt->d_vol_staging, T * sizeof(float),
                         cudaMemcpyDeviceToDevice, stream);
     }
     
@@ -1126,24 +1090,15 @@ void svpf_step_optimized(
     float* h_loglik_out,    // Host pointer (copied at end)
     float* h_vol_out        // Host pointer (copied at end)
 ) {
-    // For single-step API, we need the observation on device
-    // This is a limitation - caller should use sequence API for best perf
-    
+    SVPFOptimizedState* opt = get_opt(state);
     int n = state->n_particles;
     cudaStream_t stream = state->stream;
     
-    svpf_optimized_init(n);
+    svpf_optimized_init(opt, n);
     
-    // Copy single observation to device (unavoidable for single-step API)
-    float* d_y_single;
-    cudaMalloc(&d_y_single, 2 * sizeof(float));
+    // Use pre-allocated buffers (zero malloc overhead)
     float y_arr[2] = {y_prev, y_t};
-    cudaMemcpy(d_y_single, y_arr, 2 * sizeof(float), cudaMemcpyHostToDevice);
-    
-    float* d_loglik_single;
-    float* d_vol_single;
-    cudaMalloc(&d_loglik_single, sizeof(float));
-    cudaMalloc(&d_vol_single, sizeof(float));
+    cudaMemcpyAsync(opt->d_y_single, y_arr, 2 * sizeof(float), cudaMemcpyHostToDevice, stream);
     
     // Run sequence of length 1 at t=1 (so y_prev is at index 0)
     SVPFParams p = *params;
@@ -1170,63 +1125,66 @@ void svpf_step_optimized(
     // Predict
     svpf_predict_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
         state->h, state->h_prev, state->rng_states,
-        d_y_single, 1, p.rho, p.sigma_z, p.mu, p.gamma, n
+        opt->d_y_single, 1, p.rho, p.sigma_z, p.mu, p.gamma, n
     );
     
     // Likelihood + Gradient
     svpf_likelihood_grad_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
         state->h, state->h_prev, state->grad_log_p, state->log_weights,
-        d_y_single, 1, p.rho, p.sigma_z, p.mu, state->nu, student_t_const, n
+        opt->d_y_single, 1, p.rho, p.sigma_z, p.mu, state->nu, student_t_const, n
     );
     
     // Log-Sum-Exp
     svpf_logsumexp_kernel<<<1, BLOCK_SIZE, 0, stream>>>(
-        state->log_weights, d_loglik_single, g_opt.d_max_log_w, 0, n
+        state->log_weights, opt->d_loglik_single, opt->d_max_log_w, 0, n
     );
     
     // Bandwidth
     svpf_bandwidth_kernel<<<1, BLOCK_SIZE, 0, stream>>>(
-        state->h, g_opt.d_bandwidth, g_opt.d_bandwidth_sq, 0.3f, n
+        state->h, opt->d_bandwidth, opt->d_bandwidth_sq, 0.3f, n
     );
     
     // Stein iterations
     for (int s = 0; s < state->n_stein_steps; s++) {
         if (use_small_n) {
+            // Persistent CTA path - writes to phi, then apply transport
+            cudaMemsetAsync(opt->d_phi, 0, n * sizeof(float), stream);
+            
             svpf_stein_persistent_kernel<<<persistent_blocks, BLOCK_SIZE, persistent_smem, stream>>>(
-                state->h, state->grad_log_p, g_opt.d_bandwidth, SVPF_STEIN_STEP_SIZE, n
+                state->h, state->grad_log_p, opt->d_phi, opt->d_bandwidth, n
+            );
+            
+            svpf_apply_transport_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
+                state->h, opt->d_phi, SVPF_STEIN_STEP_SIZE, n
             );
         } else {
-            cudaMemsetAsync(g_opt.d_phi, 0, n * sizeof(float), stream);
+            cudaMemsetAsync(opt->d_phi, 0, n * sizeof(float), stream);
             int num_tiles = (n + TILE_J - 1) / TILE_J;
             dim3 grid_2d(n, num_tiles);
             svpf_stein_2d_kernel<<<grid_2d, BLOCK_SIZE, 0, stream>>>(
-                state->h, state->grad_log_p, g_opt.d_phi, g_opt.d_bandwidth, n
+                state->h, state->grad_log_p, opt->d_phi, opt->d_bandwidth, n
             );
             svpf_apply_transport_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
-                state->h, g_opt.d_phi, SVPF_STEIN_STEP_SIZE, n
+                state->h, opt->d_phi, SVPF_STEIN_STEP_SIZE, n
             );
         }
         
         if (s < state->n_stein_steps - 1) {
             svpf_likelihood_grad_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
                 state->h, state->h_prev, state->grad_log_p, state->log_weights,
-                d_y_single, 1, p.rho, p.sigma_z, p.mu, state->nu, student_t_const, n
+                opt->d_y_single, 1, p.rho, p.sigma_z, p.mu, state->nu, student_t_const, n
             );
         }
     }
     
     // Vol mean
     svpf_vol_mean_opt_kernel<<<1, BLOCK_SIZE, 0, stream>>>(
-        state->h, d_vol_single, 0, n
+        state->h, opt->d_vol_single, 0, n
     );
     
     // Single sync + copy results
     cudaStreamSynchronize(stream);
     
-    if (h_loglik_out) cudaMemcpy(h_loglik_out, d_loglik_single, sizeof(float), cudaMemcpyDeviceToHost);
-    if (h_vol_out) cudaMemcpy(h_vol_out, d_vol_single, sizeof(float), cudaMemcpyDeviceToHost);
-    
-    cudaFree(d_y_single);
-    cudaFree(d_loglik_single);
-    cudaFree(d_vol_single);
+    if (h_loglik_out) cudaMemcpy(h_loglik_out, opt->d_loglik_single, sizeof(float), cudaMemcpyDeviceToHost);
+    if (h_vol_out) cudaMemcpy(h_vol_out, opt->d_vol_single, sizeof(float), cudaMemcpyDeviceToHost);
 }
