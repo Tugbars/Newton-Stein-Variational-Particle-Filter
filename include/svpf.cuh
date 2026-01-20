@@ -279,6 +279,31 @@ void svpf_run_sequence_fast(
     float* d_vol_out
 );
 
+/**
+ * @brief Multi-SM sequence runner (utilizes ALL SMs)
+ * 
+ * Unlike svpf_run_sequence_fast which uses single-block kernels,
+ * this version parallelizes the O(N²) Stein RBF computation across
+ * N blocks, utilizing all available SMs.
+ * 
+ * Expected: 10-50x faster than per-step API on modern GPUs.
+ * 
+ * @param state SVPF state
+ * @param d_observations Device array [T]
+ * @param T Number of observations
+ * @param params Model parameters
+ * @param d_loglik_out Device array [T] for log-likelihoods
+ * @param d_vol_out Device array [T] for volatilities (can be NULL)
+ */
+void svpf_run_sequence_multi_sm(
+    SVPFState* state,
+    const float* d_observations,
+    int T,
+    const SVPFParams* params,
+    float* d_loglik_out,
+    float* d_vol_out
+);
+
 // =============================================================================
 // API: Diagnostics
 // =============================================================================

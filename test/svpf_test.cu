@@ -254,12 +254,12 @@ void benchmark() {
 }
 
 // =============================================================================
-// BENCHMARK: Batch API vs Per-Step vs Fast
+// BENCHMARK: Batch API vs Per-Step vs Fast vs Multi-SM
 // =============================================================================
 
 void benchmark_batch() {
     printf("\n========================================\n");
-    printf("BENCHMARK: Per-Step vs Batch vs Fast\n");
+    printf("BENCHMARK: Per-Step vs Batch vs Fast vs Multi-SM\n");
     printf("========================================\n");
     
     int T = 1000;
@@ -273,7 +273,7 @@ void benchmark_batch() {
     
     generate_synthetic_data(y, h_true, T, 0.95f, 0.20f, -5.0f, 42);
     
-    // Allocate device arrays for fast version
+    // Allocate device arrays
     float *d_y, *d_loglik, *d_vol;
     cudaMalloc(&d_y, T * sizeof(float));
     cudaMalloc(&d_loglik, T * sizeof(float));
@@ -318,7 +318,7 @@ void benchmark_batch() {
     }
     double avg_batch_ms = total_batch / n_runs;
     
-    // --- Fast API (device arrays) ---
+    // --- Fast API (single-block) ---
     double total_fast = 0.0;
     for (int run = 0; run < n_runs; run++) {
         svpf_initialize(state, &params, 42 + run);
@@ -333,6 +333,21 @@ void benchmark_batch() {
     }
     double avg_fast_ms = total_fast / n_runs;
     
+    // --- Multi-SM API (uses all SMs) ---
+    double total_multi = 0.0;
+    for (int run = 0; run < n_runs; run++) {
+        svpf_initialize(state, &params, 42 + run);
+        cudaDeviceSynchronize();
+        clock_t start = clock();
+        
+        svpf_run_sequence_multi_sm(state, d_y, T, &params, d_loglik, d_vol);
+        
+        cudaDeviceSynchronize();
+        clock_t end = clock();
+        total_multi += (double)(end - start) / CLOCKS_PER_SEC * 1000.0;
+    }
+    double avg_multi_ms = total_multi / n_runs;
+    
     printf("%-15s %10s %15s %12s\n", "Method", "Total(ms)", "Per-step(μs)", "Steps/sec");
     printf("%-15s %10s %15s %12s\n", "------", "--------", "-----------", "---------");
     printf("%-15s %10.2f %15.1f %12.0f\n", "Per-step API", 
@@ -341,10 +356,13 @@ void benchmark_batch() {
            avg_batch_ms, avg_batch_ms * 1000.0 / T, T / (avg_batch_ms / 1000.0));
     printf("%-15s %10.2f %15.1f %12.0f\n", "Fast API",
            avg_fast_ms, avg_fast_ms * 1000.0 / T, T / (avg_fast_ms / 1000.0));
+    printf("%-15s %10.2f %15.1f %12.0f\n", "Multi-SM API",
+           avg_multi_ms, avg_multi_ms * 1000.0 / T, T / (avg_multi_ms / 1000.0));
     
     printf("\nSpeedup vs per-step:\n");
-    printf("  Batch: %.1fx\n", avg_per_step_ms / avg_batch_ms);
-    printf("  Fast:  %.1fx\n", avg_per_step_ms / avg_fast_ms);
+    printf("  Batch:    %.1fx\n", avg_per_step_ms / avg_batch_ms);
+    printf("  Fast:     %.1fx\n", avg_per_step_ms / avg_fast_ms);
+    printf("  Multi-SM: %.1fx\n", avg_per_step_ms / avg_multi_ms);
     
     // Verify correctness
     svpf_initialize(state, &params, 42);
@@ -355,17 +373,17 @@ void benchmark_batch() {
     }
     
     svpf_initialize(state, &params, 42);
-    svpf_run_sequence_fast(state, d_y, T, &params, d_loglik, d_vol);
+    svpf_run_sequence_multi_sm(state, d_y, T, &params, d_loglik, d_vol);
     cudaMemcpy(loglik_out, d_loglik, T * sizeof(float), cudaMemcpyDeviceToHost);
-    float total_ll_fast = 0.0f;
+    float total_ll_multi = 0.0f;
     for (int t = 0; t < T; t++) {
-        total_ll_fast += loglik_out[t];
+        total_ll_multi += loglik_out[t];
     }
     
     printf("\nCorrectness check:\n");
     printf("  Per-step total LL: %.4f\n", total_ll_step);
-    printf("  Fast total LL:     %.4f\n", total_ll_fast);
-    printf("  Difference:        %.6f\n", fabsf(total_ll_step - total_ll_fast));
+    printf("  Multi-SM total LL: %.4f\n", total_ll_multi);
+    printf("  Difference:        %.6f\n", fabsf(total_ll_step - total_ll_multi));
     
     svpf_destroy(state);
     cudaFree(d_y);
