@@ -1,0 +1,789 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SVPF CUDA Optimization Guide</title>
+    <style>
+        :root {
+            --bg-primary: #0d1117;
+            --bg-secondary: #161b22;
+            --bg-tertiary: #21262d;
+            --text-primary: #e6edf3;
+            --text-secondary: #8b949e;
+            --accent-blue: #58a6ff;
+            --accent-green: #3fb950;
+            --accent-purple: #a371f7;
+            --accent-orange: #d29922;
+            --accent-red: #f85149;
+            --border: #30363d;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            line-height: 1.6;
+            padding: 40px 20px;
+        }
+
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+        }
+
+        h1 {
+            font-size: 2.5rem;
+            font-weight: 600;
+            margin-bottom: 8px;
+            background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .subtitle {
+            color: var(--text-secondary);
+            font-size: 1.1rem;
+            margin-bottom: 48px;
+        }
+
+        h2 {
+            font-size: 1.5rem;
+            font-weight: 600;
+            margin: 48px 0 24px 0;
+            color: var(--text-primary);
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        h2::before {
+            content: '';
+            display: block;
+            width: 4px;
+            height: 24px;
+            background: var(--accent-blue);
+            border-radius: 2px;
+        }
+
+        h3 {
+            font-size: 1.2rem;
+            font-weight: 600;
+            margin: 32px 0 16px 0;
+            color: var(--accent-blue);
+        }
+
+        p {
+            color: var(--text-secondary);
+            margin-bottom: 16px;
+        }
+
+        .card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 24px;
+            margin: 24px 0;
+        }
+
+        .card-header {
+            font-weight: 600;
+            font-size: 1.1rem;
+            margin-bottom: 16px;
+            color: var(--text-primary);
+        }
+
+        .diagram {
+            background: var(--bg-tertiary);
+            border-radius: 8px;
+            padding: 24px;
+            margin: 24px 0;
+            display: flex;
+            justify-content: center;
+            overflow-x: auto;
+        }
+
+        .diagram svg {
+            max-width: 100%;
+            height: auto;
+        }
+
+        .optimization-layer {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 24px;
+            margin: 24px 0;
+            border-left: 4px solid var(--accent-blue);
+        }
+
+        .optimization-layer.layer-2 {
+            border-left-color: var(--accent-green);
+        }
+
+        .optimization-layer.layer-3 {
+            border-left-color: var(--accent-purple);
+        }
+
+        .optimization-layer.layer-4 {
+            border-left-color: var(--accent-orange);
+        }
+
+        .layer-title {
+            font-size: 1.2rem;
+            font-weight: 600;
+            margin-bottom: 12px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .layer-badge {
+            font-size: 0.75rem;
+            padding: 4px 10px;
+            border-radius: 12px;
+            font-weight: 500;
+        }
+
+        .layer-1 .layer-badge { background: rgba(88, 166, 255, 0.2); color: var(--accent-blue); }
+        .layer-2 .layer-badge { background: rgba(63, 185, 80, 0.2); color: var(--accent-green); }
+        .layer-3 .layer-badge { background: rgba(163, 113, 247, 0.2); color: var(--accent-purple); }
+        .layer-4 .layer-badge { background: rgba(210, 153, 34, 0.2); color: var(--accent-orange); }
+
+        .key-insight {
+            background: rgba(88, 166, 255, 0.1);
+            border-radius: 8px;
+            padding: 16px;
+            margin: 16px 0;
+            border-left: 3px solid var(--accent-blue);
+        }
+
+        .key-insight strong {
+            color: var(--accent-blue);
+        }
+
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+            margin: 24px 0;
+        }
+
+        .metric-card {
+            background: var(--bg-tertiary);
+            border-radius: 8px;
+            padding: 20px;
+            text-align: center;
+        }
+
+        .metric-value {
+            font-size: 2rem;
+            font-weight: 700;
+            color: var(--accent-green);
+        }
+
+        .metric-label {
+            font-size: 0.875rem;
+            color: var(--text-secondary);
+            margin-top: 4px;
+        }
+
+        .comparison {
+            display: grid;
+            grid-template-columns: 1fr auto 1fr;
+            gap: 24px;
+            align-items: center;
+            margin: 24px 0;
+        }
+
+        .comparison-box {
+            background: var(--bg-tertiary);
+            border-radius: 8px;
+            padding: 20px;
+            text-align: center;
+        }
+
+        .comparison-box.before {
+            border: 2px solid var(--accent-red);
+        }
+
+        .comparison-box.after {
+            border: 2px solid var(--accent-green);
+        }
+
+        .comparison-arrow {
+            font-size: 2rem;
+            color: var(--text-secondary);
+        }
+
+        .waterfall-bar {
+            display: flex;
+            align-items: center;
+            margin: 12px 0;
+            gap: 16px;
+        }
+
+        .waterfall-label {
+            width: 180px;
+            font-size: 0.875rem;
+            color: var(--text-secondary);
+            text-align: right;
+        }
+
+        .waterfall-track {
+            flex: 1;
+            height: 32px;
+            background: var(--bg-tertiary);
+            border-radius: 4px;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .waterfall-fill {
+            height: 100%;
+            border-radius: 4px;
+            display: flex;
+            align-items: center;
+            justify-content: flex-end;
+            padding-right: 12px;
+            font-size: 0.875rem;
+            font-weight: 600;
+            color: var(--bg-primary);
+            transition: width 0.5s ease;
+        }
+
+        .toc {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 24px;
+            margin: 32px 0;
+        }
+
+        .toc-title {
+            font-weight: 600;
+            margin-bottom: 16px;
+            color: var(--text-primary);
+        }
+
+        .toc-list {
+            list-style: none;
+        }
+
+        .toc-list li {
+            padding: 8px 0;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .toc-list li:last-child {
+            border-bottom: none;
+        }
+
+        .toc-list a {
+            color: var(--accent-blue);
+            text-decoration: none;
+        }
+
+        .toc-list a:hover {
+            text-decoration: underline;
+        }
+
+        .formula {
+            font-family: 'Georgia', serif;
+            font-style: italic;
+            background: var(--bg-tertiary);
+            padding: 16px 24px;
+            border-radius: 8px;
+            text-align: center;
+            margin: 16px 0;
+            font-size: 1.1rem;
+        }
+
+        .caption {
+            text-align: center;
+            font-size: 0.875rem;
+            color: var(--text-secondary);
+            margin-top: 12px;
+            font-style: italic;
+        }
+
+        @media (max-width: 768px) {
+            h1 { font-size: 1.8rem; }
+            .comparison { grid-template-columns: 1fr; }
+            .comparison-arrow { transform: rotate(90deg); }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>SVPF CUDA Optimization Guide</h1>
+        <p class="subtitle">Stein Variational Particle Filter — From baseline to 3.6× throughput</p>
+
+        <nav class="toc">
+            <div class="toc-title">Contents</div>
+            <ul class="toc-list">
+                <li><a href="#problem">1. Problem Context</a></li>
+                <li><a href="#memory">2. GPU Memory Hierarchy</a></li>
+                <li><a href="#layer1">3. Layer 1: Device-Side Reductions</a></li>
+                <li><a href="#layer2">4. Layer 2: 2D Tiled Stein Kernel</a></li>
+                <li><a href="#layer3">5. Layer 3: Persistent CTA (Small N)</a></li>
+                <li><a href="#layer4">6. Layer 4: CUDA Graph Capture</a></li>
+                <li><a href="#summary">7. Performance Summary</a></li>
+            </ul>
+        </nav>
+
+        <!-- Section 1: Problem Context -->
+        <h2 id="problem">Problem Context</h2>
+        
+        <p>The Stein Variational Particle Filter (SVPF) is a Bayesian filtering algorithm that uses Stein Variational Gradient Descent (SVGD) to transport particles toward the posterior distribution. Unlike standard resampling, SVGD preserves particle diversity through a repulsive kernel term.</p>
+
+        <div class="card">
+            <div class="card-header">Core Computational Pattern</div>
+            <p>Each filtering step requires computing pairwise interactions between all N particles:</p>
+            <div class="formula">
+                φ(xᵢ) = (1/N) Σⱼ [ K(xᵢ, xⱼ) ∇ log p(xⱼ) + ∇ₓᵢ K(xᵢ, xⱼ) ]
+            </div>
+            <p>This results in <strong>O(N²)</strong> kernel evaluations per Stein iteration, making it the dominant cost in the algorithm.</p>
+        </div>
+
+        <div class="key-insight">
+            <strong>Key Insight:</strong> The O(N²) pairwise computation is embarrassingly parallel but requires careful orchestration to achieve full GPU utilization and memory efficiency.
+        </div>
+
+        <!-- Section 2: Memory Hierarchy -->
+        <h2 id="memory">GPU Memory Hierarchy</h2>
+        
+        <p>Understanding the GPU memory hierarchy is essential for optimizing data-intensive kernels. Each level offers different trade-offs between capacity, latency, and bandwidth.</p>
+
+        <div class="diagram">
+            <svg width="500" height="320" viewBox="0 0 500 320">
+                <!-- Pyramid layers -->
+                <polygon points="250,20 350,100 150,100" fill="#3fb950" opacity="0.8"/>
+                <polygon points="150,100 350,100 400,180 100,180" fill="#58a6ff" opacity="0.8"/>
+                <polygon points="100,180 400,180 450,260 50,260" fill="#a371f7" opacity="0.8"/>
+                <polygon points="50,260 450,260 480,300 20,300" fill="#d29922" opacity="0.8"/>
+                
+                <!-- Labels -->
+                <text x="250" y="70" text-anchor="middle" fill="#0d1117" font-weight="600" font-size="14">Registers</text>
+                <text x="250" y="145" text-anchor="middle" fill="#0d1117" font-weight="600" font-size="14">Shared Memory</text>
+                <text x="250" y="225" text-anchor="middle" fill="#0d1117" font-weight="600" font-size="14">L2 Cache</text>
+                <text x="250" y="285" text-anchor="middle" fill="#0d1117" font-weight="600" font-size="14">Global Memory (HBM)</text>
+                
+                <!-- Right side annotations -->
+                <text x="420" y="60" fill="#8b949e" font-size="12">~1 cycle</text>
+                <text x="420" y="85" fill="#8b949e" font-size="12">64 KB/SM</text>
+                
+                <text x="430" y="135" fill="#8b949e" font-size="12">~20 cycles</text>
+                <text x="430" y="160" fill="#8b949e" font-size="12">48-164 KB/SM</text>
+                
+                <text x="460" y="215" fill="#8b949e" font-size="12">~200 cycles</text>
+                <text x="460" y="240" fill="#8b949e" font-size="12">6-50 MB</text>
+                
+                <text x="485" y="285" fill="#8b949e" font-size="12">~400 cycles</text>
+
+                <!-- Left side: Speed arrow -->
+                <line x1="30" y1="300" x2="30" y2="40" stroke="#8b949e" stroke-width="2" marker-end="url(#arrowhead)"/>
+                <text x="20" y="170" fill="#8b949e" font-size="11" transform="rotate(-90, 20, 170)">Faster</text>
+                
+                <defs>
+                    <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+                        <polygon points="0 0, 10 3.5, 0 7" fill="#8b949e"/>
+                    </marker>
+                </defs>
+            </svg>
+        </div>
+        <p class="caption">GPU memory hierarchy: optimizations move frequently-accessed data toward faster, smaller memories.</p>
+
+        <!-- Section 3: Layer 1 -->
+        <h2 id="layer1">Layer 1: Device-Side Reductions</h2>
+        
+        <div class="optimization-layer layer-1">
+            <div class="layer-title">
+                <span>Eliminate Host-Device Synchronization</span>
+                <span class="layer-badge">Foundation</span>
+            </div>
+            
+            <p>The baseline implementation performed reductions (log-sum-exp, mean, variance) by copying intermediate results to the host. Each copy introduces synchronization latency and prevents kernel overlap.</p>
+
+            <div class="comparison">
+                <div class="comparison-box before">
+                    <div style="color: var(--accent-red); font-weight: 600; margin-bottom: 8px;">Before</div>
+                    <div style="font-size: 0.9rem; color: var(--text-secondary);">
+                        Kernel → cudaMemcpy → Host compute → cudaMemcpy → Kernel
+                    </div>
+                </div>
+                <div class="comparison-arrow">→</div>
+                <div class="comparison-box after">
+                    <div style="color: var(--accent-green); font-weight: 600; margin-bottom: 8px;">After</div>
+                    <div style="font-size: 0.9rem; color: var(--text-secondary);">
+                        Kernel → Kernel → Kernel (all device-side)
+                    </div>
+                </div>
+            </div>
+
+            <div class="key-insight">
+                <strong>Theory:</strong> Device-side reductions using warp shuffles and shared memory atomics keep all intermediate values on-chip, enabling fully asynchronous kernel execution.
+            </div>
+        </div>
+
+        <!-- Section 4: Layer 2 -->
+        <h2 id="layer2">Layer 2: 2D Tiled Stein Kernel</h2>
+        
+        <div class="optimization-layer layer-2">
+            <div class="layer-title">
+                <span>SM Saturation via 2D Grid</span>
+                <span class="layer-badge">Parallelism</span>
+            </div>
+            
+            <p>A naive 1D grid launches N blocks—one per particle. On modern GPUs with 80+ SMs, small particle counts (N=256-1024) leave most SMs idle.</p>
+
+            <div class="diagram">
+                <svg width="600" height="280" viewBox="0 0 600 280">
+                    <!-- Before: 1D grid -->
+                    <text x="150" y="30" text-anchor="middle" fill="#f85149" font-weight="600">1D Grid (N blocks)</text>
+                    
+                    <!-- SM boxes - before -->
+                    <g transform="translate(20, 50)">
+                        <rect x="0" y="0" width="50" height="40" fill="#3fb950" rx="4"/>
+                        <rect x="55" y="0" width="50" height="40" fill="#3fb950" rx="4"/>
+                        <rect x="110" y="0" width="50" height="40" fill="#3fb950" rx="4"/>
+                        <rect x="165" y="0" width="50" height="40" fill="#3fb950" rx="4"/>
+                        <rect x="220" y="0" width="50" height="40" fill="#21262d" rx="4" stroke="#30363d"/>
+                        
+                        <rect x="0" y="50" width="50" height="40" fill="#21262d" rx="4" stroke="#30363d"/>
+                        <rect x="55" y="50" width="50" height="40" fill="#21262d" rx="4" stroke="#30363d"/>
+                        <rect x="110" y="50" width="50" height="40" fill="#21262d" rx="4" stroke="#30363d"/>
+                        <rect x="165" y="50" width="50" height="40" fill="#21262d" rx="4" stroke="#30363d"/>
+                        <rect x="220" y="50" width="50" height="40" fill="#21262d" rx="4" stroke="#30363d"/>
+                        
+                        <text x="135" y="130" text-anchor="middle" fill="#8b949e" font-size="12">Only 4 SMs active</text>
+                    </g>
+
+                    <!-- Arrow -->
+                    <text x="300" y="120" text-anchor="middle" fill="#8b949e" font-size="24">→</text>
+
+                    <!-- After: 2D grid -->
+                    <text x="450" y="30" text-anchor="middle" fill="#3fb950" font-weight="600">2D Grid (N × tiles)</text>
+                    
+                    <!-- SM boxes - after -->
+                    <g transform="translate(320, 50)">
+                        <rect x="0" y="0" width="50" height="40" fill="#3fb950" rx="4"/>
+                        <rect x="55" y="0" width="50" height="40" fill="#3fb950" rx="4"/>
+                        <rect x="110" y="0" width="50" height="40" fill="#3fb950" rx="4"/>
+                        <rect x="165" y="0" width="50" height="40" fill="#3fb950" rx="4"/>
+                        <rect x="220" y="0" width="50" height="40" fill="#3fb950" rx="4"/>
+                        
+                        <rect x="0" y="50" width="50" height="40" fill="#3fb950" rx="4"/>
+                        <rect x="55" y="50" width="50" height="40" fill="#3fb950" rx="4"/>
+                        <rect x="110" y="50" width="50" height="40" fill="#3fb950" rx="4"/>
+                        <rect x="165" y="50" width="50" height="40" fill="#3fb950" rx="4"/>
+                        <rect x="220" y="50" width="50" height="40" fill="#3fb950" rx="4"/>
+                        
+                        <text x="135" y="130" text-anchor="middle" fill="#8b949e" font-size="12">All SMs saturated</text>
+                    </g>
+
+                    <!-- Legend -->
+                    <g transform="translate(180, 220)">
+                        <rect x="0" y="0" width="20" height="14" fill="#3fb950" rx="2"/>
+                        <text x="28" y="11" fill="#8b949e" font-size="12">Active</text>
+                        <rect x="90" y="0" width="20" height="14" fill="#21262d" rx="2" stroke="#30363d"/>
+                        <text x="118" y="11" fill="#8b949e" font-size="12">Idle</text>
+                    </g>
+                </svg>
+            </div>
+
+            <p>The 2D tiled approach partitions the j-summation across multiple blocks. Each block loads a tile of particles into shared memory, computes partial sums, and atomically accumulates to the output.</p>
+
+            <div class="diagram">
+                <svg width="400" height="250" viewBox="0 0 400 250">
+                    <!-- Grid -->
+                    <text x="200" y="25" text-anchor="middle" fill="#e6edf3" font-weight="600">Tiled Computation Grid</text>
+                    
+                    <!-- i axis label -->
+                    <text x="45" y="140" fill="#8b949e" font-size="12" transform="rotate(-90, 45, 140)">Particle i</text>
+                    
+                    <!-- j axis label -->
+                    <text x="220" y="230" fill="#8b949e" font-size="12">Particle j (tiled)</text>
+                    
+                    <!-- Grid cells -->
+                    <g transform="translate(70, 50)">
+                        <!-- Row 0 -->
+                        <rect x="0" y="0" width="60" height="35" fill="#58a6ff" opacity="0.6" stroke="#58a6ff" rx="2"/>
+                        <rect x="65" y="0" width="60" height="35" fill="#58a6ff" opacity="0.4" stroke="#58a6ff" rx="2"/>
+                        <rect x="130" y="0" width="60" height="35" fill="#58a6ff" opacity="0.3" stroke="#58a6ff" rx="2"/>
+                        <rect x="195" y="0" width="60" height="35" fill="#58a6ff" opacity="0.2" stroke="#58a6ff" rx="2"/>
+                        
+                        <!-- Row 1 -->
+                        <rect x="0" y="40" width="60" height="35" fill="#3fb950" opacity="0.6" stroke="#3fb950" rx="2"/>
+                        <rect x="65" y="40" width="60" height="35" fill="#3fb950" opacity="0.4" stroke="#3fb950" rx="2"/>
+                        <rect x="130" y="40" width="60" height="35" fill="#3fb950" opacity="0.3" stroke="#3fb950" rx="2"/>
+                        <rect x="195" y="40" width="60" height="35" fill="#3fb950" opacity="0.2" stroke="#3fb950" rx="2"/>
+                        
+                        <!-- Row 2 -->
+                        <rect x="0" y="80" width="60" height="35" fill="#a371f7" opacity="0.6" stroke="#a371f7" rx="2"/>
+                        <rect x="65" y="80" width="60" height="35" fill="#a371f7" opacity="0.4" stroke="#a371f7" rx="2"/>
+                        <rect x="130" y="80" width="60" height="35" fill="#a371f7" opacity="0.3" stroke="#a371f7" rx="2"/>
+                        <rect x="195" y="80" width="60" height="35" fill="#a371f7" opacity="0.2" stroke="#a371f7" rx="2"/>
+                        
+                        <!-- Row 3 -->
+                        <rect x="0" y="120" width="60" height="35" fill="#d29922" opacity="0.6" stroke="#d29922" rx="2"/>
+                        <rect x="65" y="120" width="60" height="35" fill="#d29922" opacity="0.4" stroke="#d29922" rx="2"/>
+                        <rect x="130" y="120" width="60" height="35" fill="#d29922" opacity="0.3" stroke="#d29922" rx="2"/>
+                        <rect x="195" y="120" width="60" height="35" fill="#d29922" opacity="0.2" stroke="#d29922" rx="2"/>
+                        
+                        <!-- Tile labels -->
+                        <text x="30" y="22" text-anchor="middle" fill="#0d1117" font-size="10">Tile 0</text>
+                        <text x="95" y="22" text-anchor="middle" fill="#0d1117" font-size="10">Tile 1</text>
+                        <text x="160" y="22" text-anchor="middle" fill="#0d1117" font-size="10">Tile 2</text>
+                        <text x="225" y="22" text-anchor="middle" fill="#0d1117" font-size="10">Tile 3</text>
+                    </g>
+                    
+                    <!-- Annotation -->
+                    <text x="340" y="100" fill="#8b949e" font-size="11">Each tile</text>
+                    <text x="340" y="115" fill="#8b949e" font-size="11">loaded to</text>
+                    <text x="340" y="130" fill="#8b949e" font-size="11">SMEM once</text>
+                </svg>
+            </div>
+
+            <div class="key-insight">
+                <strong>Theory:</strong> By decomposing the N×N computation into (N × ⌈N/tile⌉) blocks, we guarantee sufficient parallelism to saturate all SMs regardless of particle count.
+            </div>
+        </div>
+
+        <!-- Section 5: Layer 3 -->
+        <h2 id="layer3">Layer 3: Persistent CTA (Small N Path)</h2>
+        
+        <div class="optimization-layer layer-3">
+            <div class="layer-title">
+                <span>Shared Memory Residency</span>
+                <span class="layer-badge">Memory Efficiency</span>
+            </div>
+            
+            <p>For small particle counts (N ≤ 4096), all particle data fits in shared memory. Instead of repeatedly loading tiles, we load once and keep data resident across all Stein iterations.</p>
+
+            <div class="diagram">
+                <svg width="550" height="200" viewBox="0 0 550 200">
+                    <!-- Tiled approach -->
+                    <g transform="translate(20, 30)">
+                        <text x="100" y="0" text-anchor="middle" fill="#f85149" font-weight="600" font-size="13">Tiled: Reload Per Iteration</text>
+                        
+                        <!-- Iteration boxes -->
+                        <g transform="translate(0, 20)">
+                            <rect x="0" y="0" width="60" height="50" fill="#21262d" stroke="#f85149" rx="4"/>
+                            <text x="30" y="20" text-anchor="middle" fill="#8b949e" font-size="10">Load</text>
+                            <text x="30" y="35" text-anchor="middle" fill="#8b949e" font-size="10">Tiles</text>
+                            
+                            <text x="75" y="28" fill="#8b949e">→</text>
+                            
+                            <rect x="90" y="0" width="60" height="50" fill="#21262d" stroke="#f85149" rx="4"/>
+                            <text x="120" y="20" text-anchor="middle" fill="#8b949e" font-size="10">Load</text>
+                            <text x="120" y="35" text-anchor="middle" fill="#8b949e" font-size="10">Tiles</text>
+                            
+                            <text x="165" y="28" fill="#8b949e">→</text>
+                            
+                            <rect x="180" y="0" width="60" height="50" fill="#21262d" stroke="#f85149" rx="4"/>
+                            <text x="210" y="20" text-anchor="middle" fill="#8b949e" font-size="10">Load</text>
+                            <text x="210" y="35" text-anchor="middle" fill="#8b949e" font-size="10">Tiles</text>
+                        </g>
+                        
+                        <text x="120" y="100" text-anchor="middle" fill="#8b949e" font-size="11">Redundant global memory traffic</text>
+                    </g>
+
+                    <!-- Persistent approach -->
+                    <g transform="translate(300, 30)">
+                        <text x="110" y="0" text-anchor="middle" fill="#3fb950" font-weight="600" font-size="13">Persistent: Load Once</text>
+                        
+                        <!-- Single load + iterations -->
+                        <g transform="translate(0, 20)">
+                            <rect x="0" y="0" width="60" height="50" fill="#3fb950" opacity="0.3" stroke="#3fb950" rx="4"/>
+                            <text x="30" y="20" text-anchor="middle" fill="#e6edf3" font-size="10">Load</text>
+                            <text x="30" y="35" text-anchor="middle" fill="#e6edf3" font-size="10">All</text>
+                            
+                            <text x="75" y="28" fill="#8b949e">→</text>
+                            
+                            <!-- SMEM resident block -->
+                            <rect x="90" y="0" width="130" height="50" fill="#3fb950" opacity="0.2" stroke="#3fb950" rx="4" stroke-dasharray="4"/>
+                            <text x="155" y="20" text-anchor="middle" fill="#e6edf3" font-size="10">Compute iterations</text>
+                            <text x="155" y="35" text-anchor="middle" fill="#e6edf3" font-size="10">(data stays in SMEM)</text>
+                        </g>
+                        
+                        <text x="110" y="100" text-anchor="middle" fill="#8b949e" font-size="11">One-time load, O(S) iterations</text>
+                    </g>
+                </svg>
+            </div>
+
+            <div class="key-insight">
+                <strong>Theory:</strong> Persistent CTAs amortize global memory latency across all Stein iterations. With S iterations, we reduce global loads by a factor of S compared to per-iteration tiling.
+            </div>
+        </div>
+
+        <!-- Section 6: Layer 4 -->
+        <h2 id="layer4">Layer 4: CUDA Graph Capture</h2>
+        
+        <div class="optimization-layer layer-4">
+            <div class="layer-title">
+                <span>Eliminate Launch Overhead</span>
+                <span class="layer-badge">System Efficiency</span>
+            </div>
+            
+            <p>Each kernel launch incurs CPU-side overhead: driver calls, parameter marshaling, and stream synchronization. For short-running kernels, this overhead can dominate execution time.</p>
+
+            <div class="diagram">
+                <svg width="550" height="240" viewBox="0 0 550 240">
+                    <!-- Traditional launches -->
+                    <g transform="translate(20, 30)">
+                        <text x="120" y="0" text-anchor="middle" fill="#f85149" font-weight="600" font-size="13">Traditional: Per-Kernel Launch</text>
+                        
+                        <!-- CPU timeline -->
+                        <text x="0" y="40" fill="#8b949e" font-size="11">CPU</text>
+                        <line x1="35" y1="35" x2="250" y2="35" stroke="#30363d" stroke-width="2"/>
+                        
+                        <rect x="40" y="25" width="30" height="20" fill="#d29922" rx="2"/>
+                        <rect x="80" y="25" width="30" height="20" fill="#d29922" rx="2"/>
+                        <rect x="120" y="25" width="30" height="20" fill="#d29922" rx="2"/>
+                        <rect x="160" y="25" width="30" height="20" fill="#d29922" rx="2"/>
+                        <rect x="200" y="25" width="30" height="20" fill="#d29922" rx="2"/>
+                        
+                        <!-- GPU timeline -->
+                        <text x="0" y="80" fill="#8b949e" font-size="11">GPU</text>
+                        <line x1="35" y1="75" x2="250" y2="75" stroke="#30363d" stroke-width="2"/>
+                        
+                        <rect x="55" y="65" width="20" height="20" fill="#58a6ff" rx="2"/>
+                        <rect x="95" y="65" width="20" height="20" fill="#58a6ff" rx="2"/>
+                        <rect x="135" y="65" width="20" height="20" fill="#58a6ff" rx="2"/>
+                        <rect x="175" y="65" width="20" height="20" fill="#58a6ff" rx="2"/>
+                        <rect x="215" y="65" width="20" height="20" fill="#58a6ff" rx="2"/>
+                        
+                        <!-- Arrows showing latency -->
+                        <line x1="55" y1="45" x2="55" y2="65" stroke="#8b949e" stroke-dasharray="2"/>
+                        <line x1="95" y1="45" x2="95" y2="65" stroke="#8b949e" stroke-dasharray="2"/>
+                    </g>
+
+                    <!-- Graph approach -->
+                    <g transform="translate(290, 30)">
+                        <text x="120" y="0" text-anchor="middle" fill="#3fb950" font-weight="600" font-size="13">CUDA Graph: Single Dispatch</text>
+                        
+                        <!-- Capture phase (dimmed) -->
+                        <text x="0" y="40" fill="#8b949e" font-size="10">Capture</text>
+                        <rect x="50" y="25" width="60" height="20" fill="#a371f7" opacity="0.3" rx="2" stroke="#a371f7" stroke-dasharray="3"/>
+                        
+                        <!-- Replay phase -->
+                        <text x="0" y="80" fill="#8b949e" font-size="11">CPU</text>
+                        <line x1="35" y1="75" x2="250" y2="75" stroke="#30363d" stroke-width="2"/>
+                        <rect x="40" y="65" width="25" height="20" fill="#3fb950" rx="2"/>
+                        <text x="52" y="79" text-anchor="middle" fill="#0d1117" font-size="9">Go</text>
+                        
+                        <!-- GPU timeline - continuous -->
+                        <text x="0" y="120" fill="#8b949e" font-size="11">GPU</text>
+                        <line x1="35" y1="115" x2="250" y2="115" stroke="#30363d" stroke-width="2"/>
+                        <rect x="50" y="105" width="180" height="20" fill="#58a6ff" rx="2"/>
+                        <text x="140" y="119" text-anchor="middle" fill="#0d1117" font-size="10">Entire graph executes</text>
+                    </g>
+                    
+                    <!-- Legend -->
+                    <g transform="translate(120, 200)">
+                        <rect x="0" y="0" width="16" height="12" fill="#d29922" rx="2"/>
+                        <text x="22" y="10" fill="#8b949e" font-size="11">Launch overhead</text>
+                        
+                        <rect x="140" y="0" width="16" height="12" fill="#58a6ff" rx="2"/>
+                        <text x="162" y="10" fill="#8b949e" font-size="11">GPU work</text>
+                        
+                        <rect x="260" y="0" width="16" height="12" fill="#3fb950" rx="2"/>
+                        <text x="282" y="10" fill="#8b949e" font-size="11">Graph launch</text>
+                    </g>
+                </svg>
+            </div>
+
+            <p>CUDA Graphs capture a sequence of operations into a static DAG, then replay the entire graph with a single API call. This eliminates per-kernel CPU overhead and enables driver-level optimizations.</p>
+
+            <div class="key-insight">
+                <strong>Theory:</strong> Graph replay reduces T kernel launches to a single graph launch per timestep. For T=1000 steps with 10+ kernels each, this eliminates ~10,000 individual launch calls.
+            </div>
+        </div>
+
+        <!-- Section 7: Performance Summary -->
+        <h2 id="summary">Performance Summary</h2>
+
+        <p>The cumulative effect of all optimization layers yields significant throughput improvements across all particle counts.</p>
+
+        <div class="card">
+            <div class="card-header">Speedup Waterfall</div>
+            
+            <div class="waterfall-bar">
+                <div class="waterfall-label">Baseline (Per-Step)</div>
+                <div class="waterfall-track">
+                    <div class="waterfall-fill" style="width: 27%; background: #8b949e;">1.0×</div>
+                </div>
+            </div>
+            
+            <div class="waterfall-bar">
+                <div class="waterfall-label">+ Device Reductions</div>
+                <div class="waterfall-track">
+                    <div class="waterfall-fill" style="width: 40%; background: #58a6ff;">1.5×</div>
+                </div>
+            </div>
+            
+            <div class="waterfall-bar">
+                <div class="waterfall-label">+ 2D Tiled Stein</div>
+                <div class="waterfall-track">
+                    <div class="waterfall-fill" style="width: 55%; background: #3fb950;">2.0×</div>
+                </div>
+            </div>
+            
+            <div class="waterfall-bar">
+                <div class="waterfall-label">+ Persistent CTA</div>
+                <div class="waterfall-track">
+                    <div class="waterfall-fill" style="width: 70%; background: #a371f7;">2.6×</div>
+                </div>
+            </div>
+            
+            <div class="waterfall-bar">
+                <div class="waterfall-label">+ CUDA Graph</div>
+                <div class="waterfall-track">
+                    <div class="waterfall-fill" style="width: 100%; background: linear-gradient(90deg, #d29922, #f0883e);">3.6×</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="metrics-grid">
+            <div class="metric-card">
+                <div class="metric-value">3.6×</div>
+                <div class="metric-label">Peak Speedup</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-value">14,350</div>
+                <div class="metric-label">Steps/sec (N=256)</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-value">69 μs</div>
+                <div class="metric-label">Per-step Latency</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-value">25</div>
+                <div class="metric-label">Graph Nodes</div>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-header">Key Takeaways</div>
+            <ul style="color: var(--text-secondary); padding-left: 20px;">
+                <li style="margin: 12px 0;"><strong style="color: var(--text-primary);">Parallelism first:</strong> 2D tiling ensures SM saturation regardless of problem size</li>
+                <li style="margin: 12px 0;"><strong style="color: var(--text-primary);">Memory hierarchy matters:</strong> Persistent CTAs exploit shared memory residency for repeated access patterns</li>
+                <li style="margin: 12px 0;"><strong style="color: var(--text-primary);">System overhead adds up:</strong> CUDA Graphs amortize launch costs across many kernels</li>
+                <li style="margin: 12px 0;"><strong style="color: var(--text-primary);">Layer appropriately:</strong> Each optimization has a regime where it shines—combine them for broad coverage</li>
+            </ul>
+        </div>
+
+        <div style="margin-top: 64px; padding-top: 24px; border-top: 1px solid var(--border); color: var(--text-secondary); font-size: 0.875rem;">
+            SVPF CUDA Optimization Guide · Internal Documentation · 2025
+        </div>
+    </div>
+</body>
+</html>
