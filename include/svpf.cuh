@@ -17,7 +17,16 @@
  *       // result.vol_mean is current volatility estimate
  *   svpf_destroy(filter);
  * 
+ * For batch processing (faster):
+ *   svpf_optimized_init(N);
+ *   svpf_run_sequence_optimized(filter, d_observations, T, &params, d_loglik, d_vol);
+ *   svpf_optimized_cleanup();
+ * 
  * Memory Layout: Structure of Arrays (SoA) for coalesced GPU access
+ * 
+ * References:
+ * - Liu & Wang (2016): SVGD algorithm
+ * - Fan et al. (2021): Stein Particle Filtering
  */
 
 #ifndef SVPF_CUH
@@ -34,16 +43,14 @@ extern "C" {
 // CONFIGURATION
 // =============================================================================
 
-#define SVPF_DEFAULT_PARTICLES     512    // Power of 2 for reductions
+#define SVPF_DEFAULT_PARTICLES     512
 #define SVPF_DEFAULT_STEIN_STEPS   5
-#define SVPF_DEFAULT_NU            5.0f   // Student-t degrees of freedom
+#define SVPF_DEFAULT_NU            5.0f
 #define SVPF_STEIN_STEP_SIZE       0.1f
 #define SVPF_BANDWIDTH_MIN         0.01f
 #define SVPF_BANDWIDTH_MAX         10.0f
 #define SVPF_H_MIN                 -15.0f
 #define SVPF_H_MAX                 5.0f
-
-// Block size for kernels
 #define SVPF_BLOCK_SIZE            256
 
 // =============================================================================
@@ -57,23 +64,16 @@ extern "C" {
  *   h_t = mu + rho*(h_{t-1} - mu) + sigma_z*eps_t + gamma*y_{t-1}/exp(h_{t-1}/2)
  * 
  * Observation: y_t = exp(h_t/2) * eta_t, eta_t ~ Student-t(nu)
- * 
- * Leverage: gamma < 0 means negative returns increase volatility (typical for equities)
  */
 typedef struct {
     float rho;      // Persistence (0 < rho < 1, typically 0.9-0.99)
     float sigma_z;  // Vol-of-vol (typically 0.1-0.3)
     float mu;       // Long-run mean log-volatility (typically -5 to -3)
-    float gamma;    // Leverage effect (typically -0.5 to 0 for equities, 0 for crypto)
+    float gamma;    // Leverage effect (typically -0.5 to 0 for equities)
 } SVPFParams;
 
 /**
  * @brief SVPF filter state (SoA layout for GPU)
- * 
- * All arrays have length n_particles, allocated on device.
- * 
- * OPTIMIZATION: All intermediate scalars live in device memory.
- * No D2H transfers during step execution - fully async pipeline.
  */
 typedef struct {
     // Particle states
@@ -89,46 +89,37 @@ typedef struct {
     // Likelihood computation
     float* log_weights; // [N] Log importance weights
     
-    // Bandwidth computation (variance-based, O(N) not O(N²))
+    // Bandwidth computation
     float* d_h_centered;  // [N] Centered particles for variance computation
     
-    // RNG states (Philox for fast CRN)
+    // RNG states
     curandStatePhilox4_32_10_t* rng_states;  // [N] CURAND Philox states
     
-    // Reduction workspace (pre-allocated for CUB)
-    float* d_reduce_buf;    // [N] Workspace for parallel reduction
-    float* d_temp;          // [N] Temp buffer for intermediate results
-    void* d_cub_temp;       // Pre-allocated CUB temp storage
-    size_t cub_temp_bytes;  // Size of CUB temp storage
+    // Reduction workspace
+    float* d_reduce_buf;
+    float* d_temp;
+    void* d_cub_temp;
+    size_t cub_temp_bytes;
     
-    // =========================================================================
-    // DEVICE SCALARS - Eliminates PCIe roundtrips during step execution
-    // These stay on GPU; kernels read/write via pointers, not D2H copies
-    // =========================================================================
-    float* d_scalar_max;       // [1] Max log-weight for log-sum-exp
-    float* d_scalar_sum;       // [1] Sum for reductions  
-    float* d_scalar_mean;      // [1] Mean for bandwidth computation
-    float* d_scalar_bandwidth; // [1] Computed bandwidth (stays on GPU)
-    float* d_y_prev;           // [1] Previous observation (for batch leverage)
+    // Device scalars
+    float* d_scalar_max;
+    float* d_scalar_sum;
+    float* d_scalar_mean;
+    float* d_scalar_bandwidth;
+    float* d_y_prev;
     
-    // Result buffer - stays on GPU until user calls svpf_get_result()
-    float* d_result_loglik;    // [1] Log-likelihood increment
-    float* d_result_vol_mean;  // [1] Volatility mean
-    float* d_result_h_mean;    // [1] Log-vol mean
+    // Result buffer
+    float* d_result_loglik;
+    float* d_result_vol_mean;
+    float* d_result_h_mean;
     
     // Configuration
     int n_particles;
     int n_stein_steps;
-    float nu;               // Student-t degrees of freedom
-    
-    // Pre-computed Student-t constant
+    float nu;
     float student_t_const;
-    
-    // State for seeded stepping (CRN reproducibility)
-    int timestep;           // Current timestep (reset in initialize)
-    float y_prev;           // Previous observation (for leverage effect)
-    
-    // Stream for async execution
+    int timestep;
+    float y_prev;
     cudaStream_t stream;
     
 } SVPFState;
@@ -137,14 +128,14 @@ typedef struct {
  * @brief Result of one SVPF filtering step
  */
 typedef struct {
-    float log_lik_increment;  // log p(y_t | y_{1:t-1}, theta) - for SMC²
-    float vol_mean;           // E[exp(h/2)] - primary output for trading
-    float vol_std;            // Std[exp(h/2)] - uncertainty estimate
-    float h_mean;             // E[h] - log-volatility estimate
+    float log_lik_increment;  // log p(y_t | y_{1:t-1}, theta)
+    float vol_mean;           // E[exp(h/2)]
+    float vol_std;            // Std[exp(h/2)]
+    float h_mean;             // E[h]
 } SVPFResult;
 
 // =============================================================================
-// API: Core Filter Functions
+// API: Core Filter Functions (svpf_kernels.cu)
 // =============================================================================
 
 /**
@@ -166,9 +157,6 @@ void svpf_destroy(SVPFState* state);
 /**
  * @brief Initialize particles from stationary distribution
  * 
- * Call before first observation or when resetting filter.
- * Particles drawn from N(mu, sigma_z² / (1 - rho²))
- * 
  * @param state SVPF state
  * @param params Model parameters
  * @param seed Random seed for reproducibility
@@ -177,11 +165,6 @@ void svpf_initialize(SVPFState* state, const SVPFParams* params, unsigned long l
 
 /**
  * @brief Process one observation (main filtering step)
- * 
- * Pipeline:
- * 1. AR(1) prediction: h_pred = mu + rho*(h - mu) + sigma_z*noise
- * 2. Compute predictive likelihood p(y_t | h_pred)
- * 3. Stein transport: move particles toward posterior
  * 
  * @param state SVPF state
  * @param y_t Observation (return) at time t
@@ -192,28 +175,16 @@ void svpf_step(SVPFState* state, float y_t, const SVPFParams* params, SVPFResult
 
 /**
  * @brief Process observation with seeded RNG (for SMC²/CPMMH)
- * 
- * Same as svpf_step but uses deterministic noise from seed.
- * Critical for correlated pseudo-marginal methods.
- * 
- * @param state SVPF state  
- * @param y_t Observation
- * @param params Model parameters
- * @param rng_seed Seed for this step's random numbers
- * @param result Output
  */
 void svpf_step_seeded(SVPFState* state, float y_t, const SVPFParams* params,
                       unsigned long long rng_seed, SVPFResult* result);
 
 // =============================================================================
-// API: Batch Processing (Maximum Throughput - Single Sync for Full Sequence)
+// API: Batch Processing (svpf_kernels.cu)
 // =============================================================================
 
 /**
- * @brief Process entire observation sequence with minimal sync overhead
- * 
- * Runs T timesteps with only ONE synchronization at the end.
- * ~10x faster than calling svpf_step T times.
+ * @brief Process entire observation sequence
  * 
  * @param state SVPF state
  * @param h_observations Host array [T] of observations
@@ -233,16 +204,6 @@ void svpf_run_sequence(
 
 /**
  * @brief Process sequence with data already on GPU
- * 
- * For when observations are pre-loaded to device memory.
- * Avoids H2D copy of observations.
- * 
- * @param state SVPF state
- * @param d_observations Device array [T] of observations
- * @param T Number of observations
- * @param params Model parameters
- * @param d_loglik_out Device array [T] for outputs (pre-allocated)
- * @param d_vol_out Device array [T] for outputs (can be NULL, pre-allocated)
  */
 void svpf_run_sequence_device(
     SVPFState* state,
@@ -253,40 +214,30 @@ void svpf_run_sequence_device(
     float* d_vol_out
 );
 
-/**
- * @brief Ultra-fast sequence runner (for N <= 1024)
- * 
- * Uses single-block kernels with warp-shuffle reductions.
- * ~4x fewer kernel launches than standard version.
- * 
- * Kernel count per step:
- * - Standard: ~31 kernels
- * - Fast: 8 kernels (1 forward + 1 bandwidth + 5 Stein + 1 vol)
- * 
- * @param state SVPF state (must have n_particles <= 1024)
- * @param d_observations Device array [T]
- * @param T Number of observations  
- * @param params Model parameters
- * @param d_loglik_out Device array [T] for log-likelihoods
- * @param d_vol_out Device array [T] for volatilities (can be NULL)
- */
-void svpf_run_sequence_fast(
-    SVPFState* state,
-    const float* d_observations,
-    int T,
-    const SVPFParams* params,
-    float* d_loglik_out,
-    float* d_vol_out
-);
+// =============================================================================
+// API: Optimized (svpf_optimized.cu) - PRODUCTION USE
+// =============================================================================
 
 /**
- * @brief Multi-SM sequence runner (utilizes ALL SMs)
+ * @brief Initialize optimized SVPF state (call once before using optimized API)
+ */
+void svpf_optimized_init(int n);
+
+/**
+ * @brief Cleanup optimized SVPF state
+ */
+void svpf_optimized_cleanup(void);
+
+/**
+ * @brief OPTIMIZED: Run full sequence with 2D tiled Stein kernel
  * 
- * Unlike svpf_run_sequence_fast which uses single-block kernels,
- * this version parallelizes the O(N²) Stein RBF computation across
- * N blocks, utilizing all available SMs.
- * 
- * Expected: 10-50x faster than per-step API on modern GPUs.
+ * Key optimizations:
+ * - 2D tiled grid for O(N²) Stein: guarantees SM saturation for any N
+ * - Shared memory tiling for bandwidth-efficient access
+ * - CUB reductions for log-sum-exp
+ * - Small N path (N ≤ 4096): persistent CTA, all data in SMEM
+ * - NO device→host copies in loop (CUDA Graph compatible)
+ * - EMA bandwidth smoothing for stability
  * 
  * @param state SVPF state
  * @param d_observations Device array [T]
@@ -295,7 +246,7 @@ void svpf_run_sequence_fast(
  * @param d_loglik_out Device array [T] for log-likelihoods
  * @param d_vol_out Device array [T] for volatilities (can be NULL)
  */
-void svpf_run_sequence_multi_sm(
+void svpf_run_sequence_optimized(
     SVPFState* state,
     const float* d_observations,
     int T,
@@ -304,24 +255,39 @@ void svpf_run_sequence_multi_sm(
     float* d_vol_out
 );
 
+/**
+ * @brief OPTIMIZED: Single step (for real-time usage)
+ * 
+ * Note: For best performance, use svpf_run_sequence_optimized instead.
+ * Single-step API has unavoidable overhead from per-step memory allocation.
+ * 
+ * @param state SVPF state
+ * @param y_t Current observation
+ * @param y_prev Previous observation (for leverage)
+ * @param params Model parameters
+ * @param h_loglik_out Host pointer for log-likelihood output (can be NULL)
+ * @param h_vol_out Host pointer for volatility output (can be NULL)
+ */
+void svpf_step_optimized(
+    SVPFState* state,
+    float y_t,
+    float y_prev,
+    const SVPFParams* params,
+    float* h_loglik_out,
+    float* h_vol_out
+);
+
 // =============================================================================
 // API: Diagnostics
 // =============================================================================
 
 /**
  * @brief Copy particles to host (for diagnostics/plotting)
- * 
- * @param state SVPF state
- * @param h_out Host array of length n_particles
  */
 void svpf_get_particles(const SVPFState* state, float* h_out);
 
 /**
  * @brief Get current particle statistics
- * 
- * @param state SVPF state
- * @param h_mean Output: mean of h particles
- * @param h_std Output: std of h particles
  */
 void svpf_get_stats(const SVPFState* state, float* h_mean, float* h_std);
 

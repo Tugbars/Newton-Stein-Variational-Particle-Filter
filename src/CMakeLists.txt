@@ -5,8 +5,7 @@
 set(SVPF_SOURCES
     svpf_kernels.cu
     svpf_finite_diff.cu
-    svpf_fast.cu
-    svpf_multi_sm.cu
+    svpf_optimized.cu
 )
 
 # =============================================================================
