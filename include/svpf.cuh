@@ -141,6 +141,17 @@ typedef struct {
     // Bandwidth computation
     float* d_h_centered;  // [N] Centered particles for variance computation
     
+    // === ADAPTIVE SVPF ADDITIONS ===
+    // Per-particle Adam momentum (improvement #3)
+    float* d_grad_m;       // [N] First moment (mean of gradients)
+    float* d_grad_v;       // [N] Second moment (uncentered variance)
+    
+    // Regime detection for bandwidth scaling (improvement #1)
+    float* d_return_ema;   // Scalar: EMA of |returns|
+    float* d_return_var;   // Scalar: EMA of return variance
+    float* d_bw_alpha;     // Scalar: adaptive bandwidth alpha
+    // ===============================
+    
     // RNG states
     curandStatePhilox4_32_10_t* rng_states;  // [N] CURAND Philox states
     
@@ -170,6 +181,14 @@ typedef struct {
     int timestep;
     float y_prev;
     cudaStream_t stream;
+    
+    // Adaptive SVPF config
+    int use_adam;           // Enable per-particle Adam
+    int use_annealing;      // Enable annealed Stein
+    int n_anneal_steps;     // Number of annealing steps (2-3)
+    float adam_beta1;       // Adam first moment decay (0.9)
+    float adam_beta2;       // Adam second moment decay (0.999)
+    float adam_eps;         // Adam epsilon (1e-8)
     
     // Optimized backend (embedded for thread safety)
     SVPFOptimizedState opt_backend;
@@ -318,6 +337,38 @@ void svpf_step_optimized(
     const SVPFParams* params,
     float* h_loglik_out,
     float* h_vol_out
+);
+
+/**
+ * @brief ADAPTIVE SVPF: Single step with all improvements
+ * 
+ * Improvements enabled:
+ *   1. Adaptive bandwidth α scaling (tighter kernel during high vol)
+ *   2. Annealed Stein updates (β schedule: 0.3 → 0.65 → 1.0)
+ *   3. Per-particle Adam momentum (stable transport, no explosion)
+ * 
+ * Configure via SVPFState fields:
+ *   - use_adam: Enable/disable Adam (default: 1)
+ *   - use_annealing: Enable/disable annealing (default: 1)
+ *   - n_anneal_steps: Number of β levels (default: 3)
+ *   - adam_beta1/beta2/eps: Adam hyperparameters
+ * 
+ * @param state SVPF state
+ * @param y_t Current observation
+ * @param y_prev Previous observation
+ * @param params Model parameters
+ * @param h_loglik_out Host pointer for log-likelihood output (can be NULL)
+ * @param h_vol_out Host pointer for volatility output (can be NULL)
+ * @param h_mean_out Host pointer for mean log-vol output (can be NULL)
+ */
+void svpf_step_adaptive(
+    SVPFState* state,
+    float y_t,
+    float y_prev,
+    const SVPFParams* params,
+    float* h_loglik_out,
+    float* h_vol_out,
+    float* h_mean_out
 );
 
 /**

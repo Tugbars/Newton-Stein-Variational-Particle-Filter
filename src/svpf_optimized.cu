@@ -69,6 +69,14 @@ __device__ __forceinline__ float warp_reduce_max(float val) {
     return val;
 }
 
+__device__ __forceinline__ float warp_reduce_min(float val) {
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        val = fminf(val, __shfl_down_sync(0xffffffff, val, offset));
+    }
+    return val;
+}
+
 // Block reduction - result valid in thread 0 only
 __device__ float block_reduce_sum(float val) {
     __shared__ float warp_sums[BLOCK_SIZE / WARP_SIZE];
@@ -81,6 +89,34 @@ __device__ float block_reduce_sum(float val) {
     
     val = (threadIdx.x < BLOCK_SIZE / WARP_SIZE) ? warp_sums[threadIdx.x] : 0.0f;
     if (wid == 0) val = warp_reduce_sum(val);
+    return val;
+}
+
+__device__ float block_reduce_min(float val) {
+    __shared__ float warp_vals[BLOCK_SIZE / WARP_SIZE];
+    int lane = threadIdx.x % WARP_SIZE;
+    int wid = threadIdx.x / WARP_SIZE;
+    
+    val = warp_reduce_min(val);
+    if (lane == 0) warp_vals[wid] = val;
+    __syncthreads();
+    
+    val = (threadIdx.x < BLOCK_SIZE / WARP_SIZE) ? warp_vals[threadIdx.x] : 1e10f;
+    if (wid == 0) val = warp_reduce_min(val);
+    return val;
+}
+
+__device__ float block_reduce_max(float val) {
+    __shared__ float warp_vals[BLOCK_SIZE / WARP_SIZE];
+    int lane = threadIdx.x % WARP_SIZE;
+    int wid = threadIdx.x / WARP_SIZE;
+    
+    val = warp_reduce_max(val);
+    if (lane == 0) warp_vals[wid] = val;
+    __syncthreads();
+    
+    val = (threadIdx.x < BLOCK_SIZE / WARP_SIZE) ? warp_vals[threadIdx.x] : -1e10f;
+    if (wid == 0) val = warp_reduce_max(val);
     return val;
 }
 
@@ -519,6 +555,187 @@ __global__ void svpf_apply_transport_kernel(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     h[i] = clamp_logvol(h[i] + step_size * phi[i]);
+}
+
+// =============================================================================
+// ADAPTIVE SVPF KERNELS
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+// Kernel A1: Apply Transport with Adam Momentum (Improvement #3)
+// 
+// Adam update per particle:
+//   m = β1*m + (1-β1)*g
+//   v = β2*v + (1-β2)*g²
+//   g_hat = m / sqrt(v + ε)
+//   h = h + step_size * g_hat
+// -----------------------------------------------------------------------------
+
+__global__ void svpf_apply_transport_adam_kernel(
+    float* __restrict__ h,
+    const float* __restrict__ phi,        // Raw gradient direction
+    float* __restrict__ adam_m,           // First moment [N]
+    float* __restrict__ adam_v,           // Second moment [N]
+    float step_size,
+    float beta1,                          // First moment decay (0.9)
+    float beta2,                          // Second moment decay (0.999)
+    float eps,                            // Stability (1e-8)
+    int t,                                // Timestep for bias correction
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    
+    float g = phi[i];
+    
+    // Update biased first moment
+    float m = beta1 * adam_m[i] + (1.0f - beta1) * g;
+    adam_m[i] = m;
+    
+    // Update biased second moment
+    float v = beta2 * adam_v[i] + (1.0f - beta2) * g * g;
+    adam_v[i] = v;
+    
+    // Bias correction
+    float t_f = (float)(t + 1);  // t is 0-indexed
+    float m_hat = m / (1.0f - powf(beta1, t_f));
+    float v_hat = v / (1.0f - powf(beta2, t_f));
+    
+    // Adam-normalized update
+    float update = m_hat / (sqrtf(v_hat) + eps);
+    
+    h[i] = clamp_logvol(h[i] + step_size * update);
+}
+
+// -----------------------------------------------------------------------------
+// Kernel A2: Adaptive Bandwidth Scaling (Improvement #1)
+//
+// Detects high-vol regime via particle spread and scales bandwidth α:
+//   - High spread (particles dispersed) → α = 0.5-0.6 (tighter kernel)
+//   - Low spread (particles clustered) → α = 1.0 (standard kernel)
+//
+// This is called AFTER standard bandwidth computation to scale it.
+// -----------------------------------------------------------------------------
+
+__global__ void svpf_adaptive_bandwidth_kernel(
+    const float* __restrict__ h,
+    float* __restrict__ d_bandwidth,      // Modified in-place
+    float* __restrict__ d_return_ema,     // EMA of |return|
+    float* __restrict__ d_return_var,     // EMA of return variance
+    float new_return,                     // Current observation
+    float ema_alpha,                      // EMA smoothing (0.05)
+    int n
+) {
+    // Compute particle spread (single block)
+    float local_min = 1e10f, local_max = -1e10f;
+    float local_sum = 0.0f;
+    
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float val = h[i];
+        local_min = fminf(local_min, val);
+        local_max = fmaxf(local_max, val);
+        local_sum += val;
+    }
+    
+    // Reduce to get min/max/mean
+    local_min = block_reduce_min(local_min);
+    __syncthreads();
+    local_max = block_reduce_max(local_max);
+    __syncthreads();
+    local_sum = block_reduce_sum(local_sum);
+    
+    if (threadIdx.x == 0) {
+        float spread = local_max - local_min;
+        float mean_h = local_sum / (float)n;
+        
+        // Update return EMA for regime detection
+        float abs_ret = fabsf(new_return);
+        float ret_ema = *d_return_ema;
+        float ret_var = *d_return_var;
+        
+        ret_ema = (ret_ema > 0.0f) 
+                ? ema_alpha * abs_ret + (1.0f - ema_alpha) * ret_ema 
+                : abs_ret;
+        ret_var = (ret_var > 0.0f)
+                ? ema_alpha * abs_ret * abs_ret + (1.0f - ema_alpha) * ret_var
+                : abs_ret * abs_ret;
+        
+        *d_return_ema = ret_ema;
+        *d_return_var = ret_var;
+        
+        // Compute adaptive alpha based on regime
+        // High return magnitude relative to EMA → high vol regime → lower alpha
+        float vol_ratio = abs_ret / fmaxf(ret_ema, 1e-8f);
+        
+        // Also consider particle spread - high spread means uncertainty
+        // Typical spread in calm: 0.5-1.0, in crisis: 2.0-4.0
+        float spread_factor = fminf(spread / 2.0f, 2.0f);  // Normalized
+        
+        // Combine signals: higher vol_ratio or spread → lower alpha
+        float combined_signal = fmaxf(vol_ratio, spread_factor);
+        
+        // Map to alpha: signal=1 → α=1.0, signal=3+ → α=0.5
+        float alpha = 1.0f - 0.25f * fminf(combined_signal - 1.0f, 2.0f);
+        alpha = fmaxf(fminf(alpha, 1.0f), 0.5f);
+        
+        // Scale bandwidth
+        float bw = *d_bandwidth;
+        *d_bandwidth = bw * alpha;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Kernel A3: Annealed Gradient Computation (Improvement #2)
+//
+// Computes gradient with annealing factor β:
+//   grad = β * grad_likelihood + grad_prior
+//
+// Called instead of standard gradient kernel during annealing passes.
+// -----------------------------------------------------------------------------
+
+__global__ void svpf_gradient_annealed_kernel(
+    const float* __restrict__ h,
+    const float* __restrict__ h_prev,
+    float* __restrict__ grad_log_p,
+    float y,
+    float rho,
+    float sigma_z,
+    float mu,
+    float gamma,
+    float nu,
+    float student_t_const,
+    float y_prev,
+    float beta,                           // Annealing factor [0, 1]
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    
+    float h_i = h[i];
+    float h_prev_i = h_prev[i];
+    
+    // Prior gradient: d/dh log p(h|h_prev)
+    // p(h|h_prev) ~ N(mu + rho*(h_prev - mu) + gamma*leverage, sigma_z²)
+    float prior_mean = mu + rho * (h_prev_i - mu);
+    if (fabsf(y_prev) > 1e-8f) {
+        float vol_prev = safe_exp(h_prev_i / 2.0f);
+        prior_mean += gamma * y_prev / vol_prev;
+    }
+    float grad_prior = -(h_i - prior_mean) / (sigma_z * sigma_z);
+    
+    // Likelihood gradient: d/dh log p(y|h)
+    // Student-t: log p(y|h) = const - (nu+1)/2 * log(1 + (y/vol)²/nu) - h/2
+    float vol = safe_exp(h_i / 2.0f);
+    float z = y / vol;
+    float z_sq_over_nu = (z * z) / nu;
+    
+    // d/dh log p(y|h) = -1/2 + (nu+1)/2 * (z²/nu) / (1 + z²/nu) * (-1)
+    //                 = -1/2 + (nu+1)/2 * z² / (nu + z²) * (-1)
+    // Simplified: grad = -0.5 + (nu+1) * z² / (2*(nu + z²))
+    float grad_lik = -0.5f + ((nu + 1.0f) * z * z) / (2.0f * (nu + z * z));
+    
+    // Annealed gradient: β * likelihood + prior
+    grad_log_p[i] = beta * grad_lik + grad_prior;
 }
 
 // =============================================================================
@@ -1187,4 +1404,194 @@ void svpf_step_optimized(
     
     if (h_loglik_out) cudaMemcpy(h_loglik_out, opt->d_loglik_single, sizeof(float), cudaMemcpyDeviceToHost);
     if (h_vol_out) cudaMemcpy(h_vol_out, opt->d_vol_single, sizeof(float), cudaMemcpyDeviceToHost);
+}
+
+// =============================================================================
+// ADAPTIVE SVPF STEP - All three improvements combined
+// 
+// Improvements:
+//   1. Adaptive bandwidth α scaling based on regime detection
+//   2. Annealed Stein updates (β schedule: 0.3 → 0.65 → 1.0)
+//   3. Per-particle Adam momentum for stable transport
+// =============================================================================
+
+void svpf_step_adaptive(
+    SVPFState* state,
+    float y_t,
+    float y_prev,
+    const SVPFParams* params,
+    float* h_loglik_out,    // Host pointer (copied at end)
+    float* h_vol_out,       // Host pointer (copied at end)
+    float* h_mean_out       // Host pointer for mean h (optional)
+) {
+    SVPFOptimizedState* opt = get_opt(state);
+    int n = state->n_particles;
+    cudaStream_t stream = state->stream;
+    int t = state->timestep;
+    
+    svpf_optimized_init(opt, n);
+    
+    // Use pre-allocated buffers
+    float y_arr[2] = {y_prev, y_t};
+    cudaMemcpyAsync(opt->d_y_single, y_arr, 2 * sizeof(float), cudaMemcpyHostToDevice, stream);
+    
+    SVPFParams p = *params;
+    
+    float student_t_const = lgammaf((state->nu + 1.0f) / 2.0f)
+                          - lgammaf(state->nu / 2.0f)
+                          - 0.5f * logf((float)M_PI * state->nu);
+    
+    int n_blocks_1d = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    bool use_small_n = (n <= SMALL_N_THRESHOLD);
+    
+    int device;
+    cudaGetDevice(&device);
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, device);
+    int persistent_blocks = min(prop.multiProcessorCount, n);
+    size_t persistent_smem = (2 * n + BLOCK_SIZE / WARP_SIZE) * sizeof(float);
+    
+    if (persistent_smem > prop.sharedMemPerBlockOptin) {
+        use_small_n = false;
+    }
+    
+    // =========================================================================
+    // PREDICT
+    // =========================================================================
+    svpf_predict_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
+        state->h, state->h_prev, state->rng_states,
+        opt->d_y_single, 1, p.rho, p.sigma_z, p.mu, p.gamma, n
+    );
+    
+    // =========================================================================
+    // BANDWIDTH with adaptive scaling (Improvement #1)
+    // =========================================================================
+    svpf_bandwidth_kernel<<<1, BLOCK_SIZE, 0, stream>>>(
+        state->h, opt->d_bandwidth, opt->d_bandwidth_sq, 0.3f, n
+    );
+    
+    // Apply adaptive scaling based on regime
+    svpf_adaptive_bandwidth_kernel<<<1, BLOCK_SIZE, 0, stream>>>(
+        state->h, opt->d_bandwidth, 
+        state->d_return_ema, state->d_return_var,
+        y_t, 0.05f, n
+    );
+    
+    // =========================================================================
+    // ANNEALED STEIN UPDATES (Improvement #2)
+    //
+    // β schedule: 0.3 → 0.65 → 1.0 (configurable via state)
+    // This allows particles to explore before committing to likelihood
+    // =========================================================================
+    
+    int n_anneal = state->use_annealing ? state->n_anneal_steps : 1;
+    float beta_schedule[3] = {0.3f, 0.65f, 1.0f};  // Default schedule
+    
+    for (int anneal_idx = 0; anneal_idx < n_anneal; anneal_idx++) {
+        float beta = state->use_annealing 
+                   ? beta_schedule[anneal_idx % 3]
+                   : 1.0f;
+        
+        // Compute gradient with annealing factor
+        svpf_gradient_annealed_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
+            state->h, state->h_prev, state->grad_log_p,
+            y_t, p.rho, p.sigma_z, p.mu, p.gamma,
+            state->nu, student_t_const, y_prev, beta, n
+        );
+        
+        // Also compute log-weights for final likelihood (β=1 only)
+        if (beta >= 1.0f - 1e-6f) {
+            svpf_likelihood_grad_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
+                state->h, state->h_prev, state->grad_log_p, state->log_weights,
+                opt->d_y_single, 1, p.rho, p.sigma_z, p.mu, state->nu, student_t_const, n
+            );
+        }
+        
+        // Stein iterations at this β level
+        int stein_iters = state->n_stein_steps / n_anneal;
+        if (anneal_idx == n_anneal - 1) {
+            // Last annealing level gets remaining iterations
+            stein_iters = state->n_stein_steps - stein_iters * (n_anneal - 1);
+        }
+        
+        for (int s = 0; s < stein_iters; s++) {
+            // Compute Stein direction
+            if (use_small_n) {
+                cudaMemsetAsync(opt->d_phi, 0, n * sizeof(float), stream);
+                svpf_stein_persistent_kernel<<<persistent_blocks, BLOCK_SIZE, persistent_smem, stream>>>(
+                    state->h, state->grad_log_p, opt->d_phi, opt->d_bandwidth, n
+                );
+            } else {
+                cudaMemsetAsync(opt->d_phi, 0, n * sizeof(float), stream);
+                int num_tiles = (n + TILE_J - 1) / TILE_J;
+                dim3 grid_2d(n, num_tiles);
+                svpf_stein_2d_kernel<<<grid_2d, BLOCK_SIZE, 0, stream>>>(
+                    state->h, state->grad_log_p, opt->d_phi, opt->d_bandwidth, n
+                );
+            }
+            
+            // Apply transport with Adam momentum (Improvement #3)
+            if (state->use_adam) {
+                svpf_apply_transport_adam_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
+                    state->h, opt->d_phi,
+                    state->d_grad_m, state->d_grad_v,
+                    SVPF_STEIN_STEP_SIZE,
+                    state->adam_beta1, state->adam_beta2, state->adam_eps,
+                    t, n
+                );
+            } else {
+                svpf_apply_transport_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
+                    state->h, opt->d_phi, SVPF_STEIN_STEP_SIZE, n
+                );
+            }
+            
+            // Recompute gradient if more iterations remain
+            if (s < stein_iters - 1) {
+                svpf_gradient_annealed_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
+                    state->h, state->h_prev, state->grad_log_p,
+                    y_t, p.rho, p.sigma_z, p.mu, p.gamma,
+                    state->nu, student_t_const, y_prev, beta, n
+                );
+            }
+        }
+    }
+    
+    // =========================================================================
+    // FINAL LIKELIHOOD (for output)
+    // =========================================================================
+    svpf_logsumexp_kernel<<<1, BLOCK_SIZE, 0, stream>>>(
+        state->log_weights, opt->d_loglik_single, opt->d_max_log_w, 0, n
+    );
+    
+    // =========================================================================
+    // VOL MEAN + H MEAN
+    // =========================================================================
+    svpf_vol_mean_opt_kernel<<<1, BLOCK_SIZE, 0, stream>>>(
+        state->h, opt->d_vol_single, 0, n
+    );
+    
+    // H mean (simple block reduce)
+    // We reuse the logsumexp infrastructure to get h mean
+    float* d_h_mean = state->d_result_h_mean;
+    {
+        // Quick inline h-mean computation
+        float h_sum = 0.0f;
+        cudaMemcpyAsync(&h_sum, state->d_scalar_sum, sizeof(float), cudaMemcpyDeviceToHost, stream);
+        // Actually, let's do this properly with a kernel call - use CUB
+        cub::DeviceReduce::Sum(state->d_cub_temp, state->cub_temp_bytes, 
+                               state->h, state->d_scalar_sum, n, stream);
+    }
+    
+    // Single sync + copy results
+    cudaStreamSynchronize(stream);
+    
+    // Copy results
+    float h_sum_host;
+    cudaMemcpy(&h_sum_host, state->d_scalar_sum, sizeof(float), cudaMemcpyDeviceToHost);
+    
+    if (h_loglik_out) cudaMemcpy(h_loglik_out, opt->d_loglik_single, sizeof(float), cudaMemcpyDeviceToHost);
+    if (h_vol_out) cudaMemcpy(h_vol_out, opt->d_vol_single, sizeof(float), cudaMemcpyDeviceToHost);
+    if (h_mean_out) *h_mean_out = h_sum_host / (float)n;
+    
+    state->timestep++;
 }

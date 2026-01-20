@@ -388,6 +388,30 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     cudaMalloc(&state->d_reduce_buf, n * sizeof(float));
     cudaMalloc(&state->d_temp, n * sizeof(float));
     
+    // === ADAPTIVE SVPF: Per-particle Adam momentum ===
+    cudaMalloc(&state->d_grad_m, n * sizeof(float));
+    cudaMalloc(&state->d_grad_v, n * sizeof(float));
+    cudaMemset(state->d_grad_m, 0, n * sizeof(float));
+    cudaMemset(state->d_grad_v, 0, n * sizeof(float));
+    
+    // === ADAPTIVE SVPF: Regime detection scalars ===
+    cudaMalloc(&state->d_return_ema, sizeof(float));
+    cudaMalloc(&state->d_return_var, sizeof(float));
+    cudaMalloc(&state->d_bw_alpha, sizeof(float));
+    float init_ema = 0.0f;
+    float init_alpha = 0.3f;
+    cudaMemcpy(state->d_return_ema, &init_ema, sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(state->d_return_var, &init_ema, sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(state->d_bw_alpha, &init_alpha, sizeof(float), cudaMemcpyHostToDevice);
+    
+    // === ADAPTIVE SVPF: Configuration defaults ===
+    state->use_adam = 1;         // Enable Adam by default
+    state->use_annealing = 1;    // Enable annealing by default
+    state->n_anneal_steps = 3;   // β = 0.3, 0.65, 1.0
+    state->adam_beta1 = 0.9f;
+    state->adam_beta2 = 0.999f;
+    state->adam_eps = 1e-8f;
+    
     // Device scalars (the key to async execution)
     cudaMalloc(&state->d_scalar_max, sizeof(float));
     cudaMalloc(&state->d_scalar_sum, sizeof(float));
@@ -425,6 +449,13 @@ void svpf_destroy(SVPFState* state) {
     cudaFree(state->d_reduce_buf);
     cudaFree(state->d_temp);
     cudaFree(state->d_cub_temp);
+    
+    // Adaptive SVPF arrays
+    cudaFree(state->d_grad_m);
+    cudaFree(state->d_grad_v);
+    cudaFree(state->d_return_ema);
+    cudaFree(state->d_return_var);
+    cudaFree(state->d_bw_alpha);
     
     cudaFree(state->d_scalar_max);
     cudaFree(state->d_scalar_sum);
