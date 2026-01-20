@@ -248,12 +248,12 @@ int test_optimized_correctness() {
 }
 
 // =============================================================================
-// BENCHMARK: Per-Step vs Optimized
+// BENCHMARK: Per-Step vs Optimized vs CUDA Graph
 // =============================================================================
 
 void benchmark_comparison() {
     printf("\n========================================\n");
-    printf("BENCHMARK: Per-Step vs Optimized API\n");
+    printf("BENCHMARK: Per-Step vs Optimized vs Graph\n");
     printf("========================================\n");
     
     int T = 1000;
@@ -273,10 +273,10 @@ void benchmark_comparison() {
     cudaMemcpy(d_y, y, T * sizeof(float), cudaMemcpyHostToDevice);
     
     printf("T=%d, %d runs each\n\n", T, n_runs);
-    printf("%-8s | %-12s %-12s | %-12s %-12s | %-8s\n", 
-           "N", "Per-step(ms)", "steps/sec", "Optimized(ms)", "steps/sec", "Speedup");
-    printf("%-8s-+-%-12s-%-12s-+-%-12s-%-12s-+-%-8s\n",
-           "--------", "------------", "------------", "------------", "------------", "--------");
+    printf("%-6s | %-10s %-10s | %-10s %-10s | %-10s %-10s | %-8s\n", 
+           "N", "PerStep", "steps/s", "Optimized", "steps/s", "Graph", "steps/s", "Speedup");
+    printf("%-6s-+-%-10s-%-10s-+-%-10s-%-10s-+-%-10s-%-10s-+-%-8s\n",
+           "------", "----------", "----------", "----------", "----------", "----------", "----------", "--------");
     
     for (int c = 0; c < n_configs; c++) {
         int N = particle_counts[c];
@@ -289,7 +289,6 @@ void benchmark_comparison() {
         svpf_optimized_init(N);
         
         // --- Per-step API ---
-        // Warmup
         svpf_initialize(state, &params, 42);
         for (int t = 0; t < T; t++) {
             svpf_step(state, y[t], &params, &result);
@@ -312,7 +311,6 @@ void benchmark_comparison() {
         double avg_perstep_ms = total_perstep / n_runs;
         
         // --- Optimized API ---
-        // Warmup
         svpf_initialize(state, &params, 42);
         svpf_run_sequence_optimized(state, d_y, T, &params, d_loglik, d_vol);
         
@@ -330,12 +328,32 @@ void benchmark_comparison() {
         }
         double avg_optimized_ms = total_optimized / n_runs;
         
-        double speedup = avg_perstep_ms / avg_optimized_ms;
+        // --- CUDA Graph API ---
+        // First call captures graph (warmup)
+        svpf_initialize(state, &params, 42);
+        svpf_run_sequence_graph(state, d_y, T, &params, d_loglik, d_vol);
         
-        printf("%-8d | %-12.2f %-12.0f | %-12.2f %-12.0f | %-8.1fx\n",
+        double total_graph = 0.0;
+        for (int run = 0; run < n_runs; run++) {
+            svpf_initialize(state, &params, 42 + run);
+            cudaDeviceSynchronize();
+            clock_t start = clock();
+            
+            svpf_run_sequence_graph(state, d_y, T, &params, d_loglik, d_vol);
+            
+            cudaDeviceSynchronize();
+            clock_t end = clock();
+            total_graph += (double)(end - start) / CLOCKS_PER_SEC * 1000.0;
+        }
+        double avg_graph_ms = total_graph / n_runs;
+        
+        double speedup = avg_perstep_ms / avg_graph_ms;
+        
+        printf("%-6d | %-10.1f %-10.0f | %-10.1f %-10.0f | %-10.1f %-10.0f | %-8.1fx\n",
                N,
                avg_perstep_ms, T / (avg_perstep_ms / 1000.0),
                avg_optimized_ms, T / (avg_optimized_ms / 1000.0),
+               avg_graph_ms, T / (avg_graph_ms / 1000.0),
                speedup);
         
         svpf_destroy(state);
@@ -350,12 +368,12 @@ void benchmark_comparison() {
 }
 
 // =============================================================================
-// BENCHMARK: Scaling with N
+// BENCHMARK: Scaling with N (CUDA Graph)
 // =============================================================================
 
 void benchmark_scaling() {
     printf("\n========================================\n");
-    printf("BENCHMARK: Optimized API Scaling\n");
+    printf("BENCHMARK: CUDA Graph Scaling\n");
     printf("========================================\n");
     
     int T = 1000;
@@ -373,7 +391,7 @@ void benchmark_scaling() {
     cudaMalloc(&d_vol, T * sizeof(float));
     cudaMemcpy(d_y, y, T * sizeof(float), cudaMemcpyHostToDevice);
     
-    printf("T=%d, Optimized API only\n\n", T);
+    printf("T=%d, CUDA Graph API\n\n", T);
     printf("%-8s %-12s %-15s %-12s %-15s\n",
            "N", "Time(ms)", "Per-step(μs)", "Steps/sec", "O(N²) ops/step");
     printf("%-8s %-12s %-15s %-12s %-15s\n",
@@ -387,9 +405,9 @@ void benchmark_scaling() {
         SVPFState* state = svpf_create(N, 5, 5.0f, NULL);
         svpf_optimized_init(N);
         
-        // Warmup
+        // Warmup (captures graph)
         svpf_initialize(state, &params, 42);
-        svpf_run_sequence_optimized(state, d_y, T, &params, d_loglik, d_vol);
+        svpf_run_sequence_graph(state, d_y, T, &params, d_loglik, d_vol);
         
         double total_time = 0.0;
         for (int run = 0; run < n_runs; run++) {
@@ -397,7 +415,7 @@ void benchmark_scaling() {
             cudaDeviceSynchronize();
             clock_t start = clock();
             
-            svpf_run_sequence_optimized(state, d_y, T, &params, d_loglik, d_vol);
+            svpf_run_sequence_graph(state, d_y, T, &params, d_loglik, d_vol);
             
             cudaDeviceSynchronize();
             clock_t end = clock();

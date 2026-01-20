@@ -83,9 +83,20 @@ __device__ float block_reduce_sum(float val) {
 }
 
 // =============================================================================
+// Kernel 0: Increment timestep (for CUDA Graph path)
+// =============================================================================
+
+__global__ void svpf_increment_timestep_kernel(int* d_timestep) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        (*d_timestep)++;
+    }
+}
+
+// =============================================================================
 // Kernel 1: Predict (Run ONCE per timestep - samples process noise)
 // =============================================================================
 
+// Version with explicit t (for non-graph path)
 __global__ void svpf_predict_kernel(
     float* __restrict__ h,
     float* __restrict__ h_prev,
@@ -99,11 +110,37 @@ __global__ void svpf_predict_kernel(
     if (i >= n) return;
     
     float h_i = h[i];
-    h_prev[i] = h_i;  // Store for gradient computation
+    h_prev[i] = h_i;
     
     float y_prev = (t > 0) ? d_y[t - 1] : 0.0f;
     
-    // Sample noise ONCE here - Stein iterations are deterministic after this
+    float noise = curand_normal(&rng[i]);
+    float vol_prev = safe_exp(h_i / 2.0f);
+    float leverage = gamma * y_prev / (vol_prev + 1e-8f);
+    
+    h[i] = clamp_logvol(mu + rho * (h_i - mu) + sigma_z * noise + leverage);
+}
+
+// Version reading t from device memory (for CUDA Graph path)
+__global__ void svpf_predict_kernel_graph(
+    float* __restrict__ h,
+    float* __restrict__ h_prev,
+    curandStatePhilox4_32_10_t* __restrict__ rng,
+    const float* __restrict__ d_y,
+    const int* __restrict__ d_timestep,
+    float rho, float sigma_z, float mu, float gamma,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    
+    int t = *d_timestep;
+    
+    float h_i = h[i];
+    h_prev[i] = h_i;
+    
+    float y_prev = (t > 0) ? d_y[t - 1] : 0.0f;
+    
     float noise = curand_normal(&rng[i]);
     float vol_prev = safe_exp(h_i / 2.0f);
     float leverage = gamma * y_prev / (vol_prev + 1e-8f);
@@ -148,27 +185,56 @@ __global__ void svpf_likelihood_grad_kernel(
     grad[i] = fminf(fmaxf(grad_prior + grad_lik, -10.0f), 10.0f);
 }
 
+// Graph version - reads t from device memory
+__global__ void svpf_likelihood_grad_kernel_graph(
+    const float* __restrict__ h,
+    const float* __restrict__ h_prev,
+    float* __restrict__ grad,
+    float* __restrict__ log_w,
+    const float* __restrict__ d_y,
+    const int* __restrict__ d_timestep,
+    float rho, float sigma_z, float mu, float nu, float student_t_const,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    
+    int t = *d_timestep;
+    float h_i = h[i];
+    float h_prev_i = h_prev[i];
+    float y_t = d_y[t];
+    
+    float vol = safe_exp(h_i);
+    float scaled_y_sq = (y_t * y_t) / (vol + 1e-8f);
+    log_w[i] = student_t_const - 0.5f * h_i
+             - (nu + 1.0f) / 2.0f * log1pf(fmaxf(scaled_y_sq / nu, -0.999f));
+    
+    float mu_prior = mu + rho * (h_prev_i - mu);
+    float sigma_z_sq = sigma_z * sigma_z + 1e-8f;
+    float grad_prior = -(h_i - mu_prior) / sigma_z_sq;
+    float grad_lik = 0.5f * ((nu + 1.0f) * scaled_y_sq / (nu + scaled_y_sq + 1e-8f) - 1.0f);
+    
+    grad[i] = fminf(fmaxf(grad_prior + grad_lik, -10.0f), 10.0f);
+}
+
 // =============================================================================
 // Kernel 3: Log-Sum-Exp (computes loglik, all on device)
 // =============================================================================
 
 __global__ void svpf_logsumexp_kernel(
     const float* __restrict__ log_w,
-    float* __restrict__ d_loglik,       // Single scalar output
-    float* __restrict__ d_max_log_w,    // Stores max for exp kernel
-    int t,                               // Timestep (for indexing d_loglik)
+    float* __restrict__ d_loglik,
+    float* __restrict__ d_max_log_w,
+    int t,
     int n
 ) {
-    // Single block kernel for moderate N
     __shared__ float warp_vals[BLOCK_SIZE / WARP_SIZE];
     
-    // Pass 1: Find max
     float local_max = -1e10f;
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
         local_max = fmaxf(local_max, log_w[i]);
     }
     
-    // Warp reduction for max
     int lane = threadIdx.x % WARP_SIZE;
     int wid = threadIdx.x / WARP_SIZE;
     local_max = warp_reduce_max(local_max);
@@ -183,7 +249,49 @@ __global__ void svpf_logsumexp_kernel(
     __syncthreads();
     local_max = s_max;
     
-    // Pass 2: Sum exp(log_w - max)
+    float local_sum = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        local_sum += expf(log_w[i] - local_max);
+    }
+    local_sum = block_reduce_sum(local_sum);
+    
+    if (threadIdx.x == 0) {
+        d_loglik[t] = local_max + logf(local_sum / (float)n + 1e-10f);
+        *d_max_log_w = local_max;
+    }
+}
+
+// Graph version - reads t from device memory
+__global__ void svpf_logsumexp_kernel_graph(
+    const float* __restrict__ log_w,
+    float* __restrict__ d_loglik,
+    float* __restrict__ d_max_log_w,
+    const int* __restrict__ d_timestep,
+    int n
+) {
+    __shared__ float warp_vals[BLOCK_SIZE / WARP_SIZE];
+    
+    int t = *d_timestep;
+    
+    float local_max = -1e10f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        local_max = fmaxf(local_max, log_w[i]);
+    }
+    
+    int lane = threadIdx.x % WARP_SIZE;
+    int wid = threadIdx.x / WARP_SIZE;
+    local_max = warp_reduce_max(local_max);
+    if (lane == 0) warp_vals[wid] = local_max;
+    __syncthreads();
+    
+    local_max = (threadIdx.x < BLOCK_SIZE / WARP_SIZE) ? warp_vals[threadIdx.x] : -1e10f;
+    if (wid == 0) local_max = warp_reduce_max(local_max);
+    
+    __shared__ float s_max;
+    if (threadIdx.x == 0) s_max = local_max;
+    __syncthreads();
+    local_max = s_max;
+    
     float local_sum = 0.0f;
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
         local_sum += expf(log_w[i] - local_max);
@@ -429,8 +537,28 @@ __global__ void svpf_vol_mean_opt_kernel(
     }
 }
 
+// Graph version - reads t from device memory
+__global__ void svpf_vol_mean_opt_kernel_graph(
+    const float* __restrict__ h,
+    float* __restrict__ d_vol,
+    const int* __restrict__ d_timestep,
+    int n
+) {
+    int t = *d_timestep;
+    
+    float local_sum = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        local_sum += safe_exp(h[i] / 2.0f);
+    }
+    local_sum = block_reduce_sum(local_sum);
+    
+    if (threadIdx.x == 0) {
+        d_vol[t] = local_sum / (float)n;
+    }
+}
+
 // =============================================================================
-// Host State (CUB temp storage, device scalars)
+// Host State (CUB temp storage, device scalars, CUDA Graph)
 // =============================================================================
 
 struct SVPFOptimizedState {
@@ -444,9 +572,18 @@ struct SVPFOptimizedState {
     float* d_bandwidth;
     float* d_bandwidth_sq;
     
+    // Device timestep counter (for CUDA Graph path)
+    int* d_timestep;
+    
     // Buffers
     float* d_exp_w;
     float* d_phi;
+    
+    // CUDA Graph (captured once, replayed T times)
+    cudaGraph_t graph;
+    cudaGraphExec_t graphExec;
+    bool graph_captured;
+    int graph_n;  // N for which graph was captured
     
     bool initialized;
 };
@@ -478,6 +615,9 @@ void svpf_optimized_init(int n) {
     cudaMalloc(&g_opt.d_bandwidth, sizeof(float));
     cudaMalloc(&g_opt.d_bandwidth_sq, sizeof(float));
     
+    // Device timestep counter
+    cudaMalloc(&g_opt.d_timestep, sizeof(int));
+    
     // Initialize bandwidth_sq to 0 (triggers fresh computation on first step)
     float zero = 0.0f;
     cudaMemcpy(g_opt.d_bandwidth_sq, &zero, sizeof(float), cudaMemcpyHostToDevice);
@@ -485,6 +625,10 @@ void svpf_optimized_init(int n) {
     // Buffers
     cudaMalloc(&g_opt.d_exp_w, n * sizeof(float));
     cudaMalloc(&g_opt.d_phi, n * sizeof(float));
+    
+    // Graph not yet captured
+    g_opt.graph_captured = false;
+    g_opt.graph_n = 0;
     
     g_opt.initialized = true;
 }
@@ -497,8 +641,16 @@ void svpf_optimized_cleanup(void) {
     cudaFree(g_opt.d_sum_exp);
     cudaFree(g_opt.d_bandwidth);
     cudaFree(g_opt.d_bandwidth_sq);
+    cudaFree(g_opt.d_timestep);
     cudaFree(g_opt.d_exp_w);
     cudaFree(g_opt.d_phi);
+    
+    // Destroy CUDA Graph if captured
+    if (g_opt.graph_captured) {
+        cudaGraphExecDestroy(g_opt.graphExec);
+        cudaGraphDestroy(g_opt.graph);
+        g_opt.graph_captured = false;
+    }
     
     g_opt.initialized = false;
 }
@@ -648,6 +800,169 @@ void svpf_run_sequence_optimized(
     }
     
     // Single sync at end
+    cudaStreamSynchronize(stream);
+}
+
+// =============================================================================
+// Host API: CUDA Graph Sequence Runner (Fastest - minimal launch overhead)
+// =============================================================================
+
+/**
+ * Captures one timestep as a CUDA Graph, then replays it T times.
+ * Kernels read timestep from device memory (d_timestep), which gets
+ * incremented at the end of each iteration.
+ * 
+ * Expected: ~5-10μs per step vs ~65μs for non-graph version
+ */
+void svpf_run_sequence_graph(
+    SVPFState* state,
+    const float* d_observations,
+    int T,
+    const SVPFParams* params,
+    float* d_loglik_out,
+    float* d_vol_out
+) {
+    int n = state->n_particles;
+    int n_stein = state->n_stein_steps;
+    cudaStream_t stream = state->stream;
+    
+    svpf_optimized_init(n);
+    
+    // Pre-compute constant
+    float student_t_const = lgammaf((state->nu + 1.0f) / 2.0f)
+                          - lgammaf(state->nu / 2.0f)
+                          - 0.5f * logf((float)M_PI * state->nu);
+    
+    // Kernel configs
+    int n_blocks_1d = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    
+    bool use_small_n = (n <= SMALL_N_THRESHOLD);
+    
+    int device;
+    cudaGetDevice(&device);
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, device);
+    int num_sms = prop.multiProcessorCount;
+    
+    int persistent_blocks = min(num_sms, n);
+    size_t persistent_smem = (2 * n + BLOCK_SIZE / WARP_SIZE) * sizeof(float);
+    
+    if (persistent_smem > prop.sharedMemPerBlockOptin) {
+        use_small_n = false;
+    }
+    
+    if (use_small_n) {
+        cudaFuncSetAttribute(svpf_stein_persistent_kernel,
+                            cudaFuncAttributeMaxDynamicSharedMemorySize,
+                            persistent_smem);
+    }
+    
+    float bw_alpha = 0.3f;
+    
+    // Reset timestep counter
+    int zero = 0;
+    cudaMemcpyAsync(g_opt.d_timestep, &zero, sizeof(int), cudaMemcpyHostToDevice, stream);
+    
+    // Reset bandwidth for fresh start
+    float zero_f = 0.0f;
+    cudaMemcpyAsync(g_opt.d_bandwidth_sq, &zero_f, sizeof(float), cudaMemcpyHostToDevice, stream);
+    cudaStreamSynchronize(stream);
+    
+    // Check if we need to capture a new graph
+    bool need_capture = !g_opt.graph_captured || (g_opt.graph_n != n);
+    
+    if (need_capture) {
+        // Destroy old graph if exists
+        if (g_opt.graph_captured) {
+            cudaGraphExecDestroy(g_opt.graphExec);
+            cudaGraphDestroy(g_opt.graph);
+        }
+        
+        // Begin stream capture
+        cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+        
+        // === Capture one timestep ===
+        
+        // 1. Predict
+        svpf_predict_kernel_graph<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
+            state->h, state->h_prev, state->rng_states,
+            d_observations, g_opt.d_timestep,
+            params->rho, params->sigma_z, params->mu, params->gamma,
+            n
+        );
+        
+        // 2. Likelihood + Gradient
+        svpf_likelihood_grad_kernel_graph<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
+            state->h, state->h_prev, state->grad_log_p, state->log_weights,
+            d_observations, g_opt.d_timestep,
+            params->rho, params->sigma_z, params->mu, state->nu, student_t_const,
+            n
+        );
+        
+        // 3. Log-Sum-Exp
+        svpf_logsumexp_kernel_graph<<<1, BLOCK_SIZE, 0, stream>>>(
+            state->log_weights, d_loglik_out, g_opt.d_max_log_w, g_opt.d_timestep, n
+        );
+        
+        // 4. Bandwidth (run every step in graph - simpler than conditional)
+        svpf_bandwidth_kernel<<<1, BLOCK_SIZE, 0, stream>>>(
+            state->h, g_opt.d_bandwidth, g_opt.d_bandwidth_sq, bw_alpha, n
+        );
+        
+        // 5. Stein iterations
+        for (int s = 0; s < n_stein; s++) {
+            if (use_small_n) {
+                svpf_stein_persistent_kernel<<<persistent_blocks, BLOCK_SIZE, persistent_smem, stream>>>(
+                    state->h, state->grad_log_p,
+                    g_opt.d_bandwidth, SVPF_STEIN_STEP_SIZE, n
+                );
+            } else {
+                cudaMemsetAsync(g_opt.d_phi, 0, n * sizeof(float), stream);
+                
+                int num_tiles = (n + TILE_J - 1) / TILE_J;
+                dim3 grid_2d(n, num_tiles);
+                svpf_stein_2d_kernel<<<grid_2d, BLOCK_SIZE, 0, stream>>>(
+                    state->h, state->grad_log_p, g_opt.d_phi, g_opt.d_bandwidth, n
+                );
+                
+                svpf_apply_transport_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
+                    state->h, g_opt.d_phi, SVPF_STEIN_STEP_SIZE, n
+                );
+            }
+            
+            if (s < n_stein - 1) {
+                svpf_likelihood_grad_kernel_graph<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
+                    state->h, state->h_prev, state->grad_log_p, state->log_weights,
+                    d_observations, g_opt.d_timestep,
+                    params->rho, params->sigma_z, params->mu, state->nu, student_t_const,
+                    n
+                );
+            }
+        }
+        
+        // 6. Volatility mean
+        if (d_vol_out) {
+            svpf_vol_mean_opt_kernel_graph<<<1, BLOCK_SIZE, 0, stream>>>(
+                state->h, d_vol_out, g_opt.d_timestep, n
+            );
+        }
+        
+        // 7. Increment timestep counter
+        svpf_increment_timestep_kernel<<<1, 1, 0, stream>>>(g_opt.d_timestep);
+        
+        // End capture
+        cudaStreamEndCapture(stream, &g_opt.graph);
+        cudaGraphInstantiate(&g_opt.graphExec, g_opt.graph, NULL, NULL, 0);
+        
+        g_opt.graph_captured = true;
+        g_opt.graph_n = n;
+    }
+    
+    // Launch graph T times
+    for (int t = 0; t < T; t++) {
+        cudaGraphLaunch(g_opt.graphExec, stream);
+    }
+    
     cudaStreamSynchronize(stream);
 }
 

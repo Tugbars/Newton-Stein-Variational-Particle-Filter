@@ -277,6 +277,30 @@ void svpf_step_optimized(
     float* h_vol_out
 );
 
+/**
+ * @brief CUDA GRAPH: Fastest sequence runner (minimal launch overhead)
+ * 
+ * Captures one timestep as a CUDA Graph, then replays it T times.
+ * Reduces per-step overhead from ~65μs to ~5-10μs.
+ * 
+ * Note: Graph is cached and reused. First call has capture overhead.
+ * 
+ * @param state SVPF state
+ * @param d_observations Device array [T]
+ * @param T Number of observations
+ * @param params Model parameters
+ * @param d_loglik_out Device array [T] for log-likelihoods
+ * @param d_vol_out Device array [T] for volatilities (can be NULL)
+ */
+void svpf_run_sequence_graph(
+    SVPFState* state,
+    const float* d_observations,
+    int T,
+    const SVPFParams* params,
+    float* d_loglik_out,
+    float* d_vol_out
+);
+
 // =============================================================================
 // API: Diagnostics
 // =============================================================================
