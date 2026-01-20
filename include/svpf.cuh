@@ -109,6 +109,7 @@ typedef struct {
     float* d_scalar_sum;       // [1] Sum for reductions  
     float* d_scalar_mean;      // [1] Mean for bandwidth computation
     float* d_scalar_bandwidth; // [1] Computed bandwidth (stays on GPU)
+    float* d_y_prev;           // [1] Previous observation (for batch leverage)
     
     // Result buffer - stays on GPU until user calls svpf_get_result()
     float* d_result_loglik;    // [1] Log-likelihood increment
@@ -203,6 +204,54 @@ void svpf_step(SVPFState* state, float y_t, const SVPFParams* params, SVPFResult
  */
 void svpf_step_seeded(SVPFState* state, float y_t, const SVPFParams* params,
                       unsigned long long rng_seed, SVPFResult* result);
+
+// =============================================================================
+// API: Batch Processing (Maximum Throughput - Single Sync for Full Sequence)
+// =============================================================================
+
+/**
+ * @brief Process entire observation sequence with minimal sync overhead
+ * 
+ * Runs T timesteps with only ONE synchronization at the end.
+ * ~10x faster than calling svpf_step T times.
+ * 
+ * @param state SVPF state
+ * @param h_observations Host array [T] of observations
+ * @param T Number of observations
+ * @param params Model parameters
+ * @param h_loglik_out Host array [T] for log-likelihood outputs
+ * @param h_vol_out Host array [T] for volatility outputs (can be NULL)
+ */
+void svpf_run_sequence(
+    SVPFState* state,
+    const float* h_observations,
+    int T,
+    const SVPFParams* params,
+    float* h_loglik_out,
+    float* h_vol_out
+);
+
+/**
+ * @brief Process sequence with data already on GPU
+ * 
+ * For when observations are pre-loaded to device memory.
+ * Avoids H2D copy of observations.
+ * 
+ * @param state SVPF state
+ * @param d_observations Device array [T] of observations
+ * @param T Number of observations
+ * @param params Model parameters
+ * @param d_loglik_out Device array [T] for outputs (pre-allocated)
+ * @param d_vol_out Device array [T] for outputs (can be NULL, pre-allocated)
+ */
+void svpf_run_sequence_device(
+    SVPFState* state,
+    const float* d_observations,
+    int T,
+    const SVPFParams* params,
+    float* d_loglik_out,
+    float* d_vol_out
+);
 
 // =============================================================================
 // API: Diagnostics

@@ -389,6 +389,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     cudaMalloc(&state->d_scalar_sum, sizeof(float));
     cudaMalloc(&state->d_scalar_mean, sizeof(float));
     cudaMalloc(&state->d_scalar_bandwidth, sizeof(float));
+    cudaMalloc(&state->d_y_prev, sizeof(float));  // For batch mode leverage
     cudaMalloc(&state->d_result_loglik, sizeof(float));
     cudaMalloc(&state->d_result_vol_mean, sizeof(float));
     cudaMalloc(&state->d_result_h_mean, sizeof(float));
@@ -422,6 +423,7 @@ void svpf_destroy(SVPFState* state) {
     cudaFree(state->d_scalar_sum);
     cudaFree(state->d_scalar_mean);
     cudaFree(state->d_scalar_bandwidth);
+    cudaFree(state->d_y_prev);
     cudaFree(state->d_result_loglik);
     cudaFree(state->d_result_vol_mean);
     cudaFree(state->d_result_h_mean);
@@ -439,6 +441,10 @@ void svpf_initialize(SVPFState* state, const SVPFParams* params, unsigned long l
     
     state->timestep = 0;
     state->y_prev = 0.0f;
+    
+    // Initialize device y_prev to 0 (for batch mode)
+    float zero = 0.0f;
+    cudaMemcpyAsync(state->d_y_prev, &zero, sizeof(float), cudaMemcpyHostToDevice, state->stream);
     
     svpf_init_rng_kernel<<<grid, SVPF_BLOCK_SIZE, 0, state->stream>>>(
         state->rng_states, n, seed
@@ -461,10 +467,114 @@ void svpf_initialize(SVPFState* state, const SVPFParams* params, unsigned long l
 }
 
 // =============================================================================
-// HOST API: Step (Fully Asynchronous - NO sync until svpf_get_result)
+// KERNEL: Record scalar to history array
 // =============================================================================
 
-void svpf_step(SVPFState* state, float y_t, const SVPFParams* params, SVPFResult* result) {
+__global__ void svpf_record_scalar_kernel(
+    const float* d_src,
+    float* d_history,
+    int index
+) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        d_history[index] = *d_src;
+    }
+}
+
+// =============================================================================
+// KERNELS: Batch-mode versions (accept observation array + index)
+// =============================================================================
+
+// Batch predict kernel - reads y_prev from device memory
+__global__ void svpf_predict_batch_kernel(
+    const float* h_prev,
+    float* h_pred,
+    curandStatePhilox4_32_10_t* rng_states,
+    float rho,
+    float sigma_z,
+    float mu,
+    float gamma,
+    const float* d_y_prev,  // Device pointer to previous observation
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float noise = curand_normal(&rng_states[idx]);
+        float h_prev_i = h_prev[idx];
+        float y_prev = *d_y_prev;
+        
+        float vol_prev = safe_exp(h_prev_i / 2.0f);
+        float leverage = gamma * y_prev / (vol_prev + 1e-8f);
+        
+        float h_new = mu + rho * (h_prev_i - mu) + sigma_z * noise + leverage;
+        h_pred[idx] = clamp_h(h_new);
+    }
+}
+
+__global__ void svpf_obs_loglik_batch_kernel(
+    const float* h,
+    float* log_weights,
+    const float* d_observations,  // Full observation array
+    int obs_index,                 // Which observation to use
+    float nu,
+    float student_t_const,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float y_t = d_observations[obs_index];
+        float h_i = h[idx];
+        float vol = safe_exp(h_i);
+        float scaled_y_sq = (y_t * y_t) / (vol + 1e-8f);
+        
+        float log_w = student_t_const - 0.5f * h_i
+                    - (nu + 1.0f) / 2.0f * log1pf_safe(scaled_y_sq / nu);
+        
+        log_weights[idx] = log_w;
+    }
+}
+
+__global__ void svpf_grad_log_posterior_batch_kernel(
+    const float* h,
+    const float* h_prev,
+    float* grad_log_p,
+    const float* d_observations,
+    int obs_index,
+    float rho,
+    float sigma_z,
+    float mu,
+    float nu,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float y_t = d_observations[obs_index];
+        float h_i = h[idx];
+        float h_prev_i = h_prev[idx];
+        
+        float mu_prior = mu + rho * (h_prev_i - mu);
+        float sigma_z_sq = sigma_z * sigma_z + 1e-8f;
+        float grad_prior = -(h_i - mu_prior) / sigma_z_sq;
+        
+        float vol = safe_exp(h_i);
+        float scaled_y_sq = (y_t * y_t) / (vol + 1e-8f);
+        float grad_lik = 0.5f * ((nu + 1.0f) * scaled_y_sq / (nu + scaled_y_sq + 1e-8f) - 1.0f);
+        
+        float grad = grad_prior + grad_lik;
+        grad_log_p[idx] = fminf(fmaxf(grad, -10.0f), 10.0f);
+    }
+}
+
+// =============================================================================
+// INTERNAL: Step for batch mode (no y_t argument - uses device array)
+// FULLY ASYNC - no CPU sync during step
+// =============================================================================
+
+static void svpf_step_batch_internal(
+    SVPFState* state,
+    const float* d_observations,
+    int obs_index,
+    const SVPFParams* params
+) {
     int n = state->n_particles;
     int grid = (n + SVPF_BLOCK_SIZE - 1) / SVPF_BLOCK_SIZE;
     size_t shared_mem = 2 * SVPF_BLOCK_SIZE * sizeof(float);
@@ -474,34 +584,30 @@ void svpf_step(SVPFState* state, float y_t, const SVPFParams* params, SVPFResult
         state->h, state->h_prev, n
     );
     
-    // 2. Predict with leverage
-    svpf_predict_kernel<<<grid, SVPF_BLOCK_SIZE, 0, state->stream>>>(
+    // 2. Predict - reads y_prev from device memory (d_y_prev)
+    svpf_predict_batch_kernel<<<grid, SVPF_BLOCK_SIZE, 0, state->stream>>>(
         state->h_prev, state->h_pred, state->rng_states,
         params->rho, params->sigma_z, params->mu,
-        params->gamma, state->y_prev, n
+        params->gamma, state->d_y_prev, n
     );
     
-    // 3. Observation likelihood
-    svpf_obs_loglik_kernel<<<grid, SVPF_BLOCK_SIZE, 0, state->stream>>>(
-        state->h_pred, state->log_weights, y_t,
+    // 3. Observation likelihood (batch version - reads y from device array)
+    svpf_obs_loglik_batch_kernel<<<grid, SVPF_BLOCK_SIZE, 0, state->stream>>>(
+        state->h_pred, state->log_weights, d_observations, obs_index,
         state->nu, state->student_t_const, n
     );
     
-    // 4. Log-sum-exp (FULLY ON GPU - no D2H transfers)
-    // 4a. Max -> d_scalar_max
+    // 4. Log-sum-exp
     cub::DeviceReduce::Max(state->d_cub_temp, state->cub_temp_bytes,
         state->log_weights, state->d_scalar_max, n, state->stream);
     
-    // 4b. Exp(w - max) using device pointer
     svpf_exp_weights_kernel<<<grid, SVPF_BLOCK_SIZE, 0, state->stream>>>(
         state->log_weights, state->d_temp, state->d_scalar_max, n
     );
     
-    // 4c. Sum -> d_scalar_sum
     cub::DeviceReduce::Sum(state->d_cub_temp, state->cub_temp_bytes,
         state->d_temp, state->d_scalar_sum, n, state->stream);
     
-    // 4d. Compute final log-lik (on GPU)
     glue_compute_loglik_kernel<<<1, 1, 0, state->stream>>>(
         state->d_scalar_max, state->d_scalar_sum, state->d_result_loglik, n
     );
@@ -511,8 +617,7 @@ void svpf_step(SVPFState* state, float y_t, const SVPFParams* params, SVPFResult
         state->h_pred, state->h, n
     );
     
-    // 6. Stein transport (bandwidth computed ONCE, not per iteration)
-    // 6a. Compute bandwidth
+    // 6. Stein transport
     cub::DeviceReduce::Sum(state->d_cub_temp, state->cub_temp_bytes,
         state->h, state->d_scalar_sum, n, state->stream);
     glue_compute_mean_kernel<<<1, 1, 0, state->stream>>>(
@@ -527,7 +632,127 @@ void svpf_step(SVPFState* state, float y_t, const SVPFParams* params, SVPFResult
         state->d_scalar_sum, state->d_scalar_bandwidth, n
     );
     
-    // 6b. Stein iterations (use pre-computed bandwidth)
+    for (int s = 0; s < state->n_stein_steps; s++) {
+        svpf_grad_log_posterior_batch_kernel<<<grid, SVPF_BLOCK_SIZE, 0, state->stream>>>(
+            state->h, state->h_prev, state->grad_log_p, d_observations, obs_index,
+            params->rho, params->sigma_z, params->mu, state->nu, n
+        );
+        
+        svpf_rbf_kernel_shared<<<grid, SVPF_BLOCK_SIZE, shared_mem, state->stream>>>(
+            state->h, state->grad_log_p,
+            state->kernel_sum, state->grad_kernel_sum,
+            state->d_scalar_bandwidth, n
+        );
+        
+        svpf_stein_update_kernel<<<grid, SVPF_BLOCK_SIZE, 0, state->stream>>>(
+            state->h, state->kernel_sum, state->grad_kernel_sum,
+            SVPF_STEIN_STEP_SIZE, n
+        );
+    }
+    
+    // 7. Compute output statistics
+    svpf_compute_vol_kernel<<<grid, SVPF_BLOCK_SIZE, 0, state->stream>>>(
+        state->h, state->d_temp, n
+    );
+    cub::DeviceReduce::Sum(state->d_cub_temp, state->cub_temp_bytes,
+        state->d_temp, state->d_scalar_sum, n, state->stream);
+    glue_compute_mean_kernel<<<1, 1, 0, state->stream>>>(
+        state->d_scalar_sum, state->d_result_vol_mean, n
+    );
+    
+    // 8. Update y_prev using a glue kernel (stays on GPU!)
+    // We need a kernel to copy d_observations[obs_index] to a scalar
+    state->timestep++;
+}
+
+// Kernel to update y_prev from device array
+__global__ void svpf_update_y_prev_kernel(
+    float* d_y_prev,
+    const float* d_observations,
+    int obs_index
+) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        *d_y_prev = d_observations[obs_index];
+    }
+}
+
+// =============================================================================
+// INTERNAL: Shared step logic for single-observation API
+// =============================================================================
+
+static void svpf_step_internal(
+    SVPFState* state,
+    float y_t,
+    const SVPFParams* params,
+    bool use_seeded_rng,
+    unsigned long long rng_seed
+) {
+    int n = state->n_particles;
+    int grid = (n + SVPF_BLOCK_SIZE - 1) / SVPF_BLOCK_SIZE;
+    size_t shared_mem = 2 * SVPF_BLOCK_SIZE * sizeof(float);
+    
+    // 1. Copy h -> h_prev
+    svpf_copy_kernel<<<grid, SVPF_BLOCK_SIZE, 0, state->stream>>>(
+        state->h, state->h_prev, n
+    );
+    
+    // 2. Predict with leverage
+    if (use_seeded_rng) {
+        svpf_predict_seeded_kernel<<<grid, SVPF_BLOCK_SIZE, 0, state->stream>>>(
+            state->h_prev, state->h_pred,
+            params->rho, params->sigma_z, params->mu,
+            params->gamma, state->y_prev,
+            rng_seed, state->timestep, n
+        );
+    } else {
+        svpf_predict_kernel<<<grid, SVPF_BLOCK_SIZE, 0, state->stream>>>(
+            state->h_prev, state->h_pred, state->rng_states,
+            params->rho, params->sigma_z, params->mu,
+            params->gamma, state->y_prev, n
+        );
+    }
+    
+    // 3. Observation likelihood
+    svpf_obs_loglik_kernel<<<grid, SVPF_BLOCK_SIZE, 0, state->stream>>>(
+        state->h_pred, state->log_weights, y_t,
+        state->nu, state->student_t_const, n
+    );
+    
+    // 4. Log-sum-exp (FULLY ON GPU)
+    cub::DeviceReduce::Max(state->d_cub_temp, state->cub_temp_bytes,
+        state->log_weights, state->d_scalar_max, n, state->stream);
+    
+    svpf_exp_weights_kernel<<<grid, SVPF_BLOCK_SIZE, 0, state->stream>>>(
+        state->log_weights, state->d_temp, state->d_scalar_max, n
+    );
+    
+    cub::DeviceReduce::Sum(state->d_cub_temp, state->cub_temp_bytes,
+        state->d_temp, state->d_scalar_sum, n, state->stream);
+    
+    glue_compute_loglik_kernel<<<1, 1, 0, state->stream>>>(
+        state->d_scalar_max, state->d_scalar_sum, state->d_result_loglik, n
+    );
+    
+    // 5. Copy predicted -> current
+    svpf_copy_kernel<<<grid, SVPF_BLOCK_SIZE, 0, state->stream>>>(
+        state->h_pred, state->h, n
+    );
+    
+    // 6. Stein transport (bandwidth computed ONCE)
+    cub::DeviceReduce::Sum(state->d_cub_temp, state->cub_temp_bytes,
+        state->h, state->d_scalar_sum, n, state->stream);
+    glue_compute_mean_kernel<<<1, 1, 0, state->stream>>>(
+        state->d_scalar_sum, state->d_scalar_mean, n
+    );
+    svpf_center_kernel<<<grid, SVPF_BLOCK_SIZE, 0, state->stream>>>(
+        state->h, state->d_h_centered, state->d_scalar_mean, n
+    );
+    cub::DeviceReduce::Sum(state->d_cub_temp, state->cub_temp_bytes,
+        state->d_h_centered, state->d_scalar_sum, n, state->stream);
+    glue_compute_bandwidth_kernel<<<1, 1, 0, state->stream>>>(
+        state->d_scalar_sum, state->d_scalar_bandwidth, n
+    );
+    
     for (int s = 0; s < state->n_stein_steps; s++) {
         svpf_grad_log_posterior_kernel<<<grid, SVPF_BLOCK_SIZE, 0, state->stream>>>(
             state->h, state->h_prev, state->grad_log_p,
@@ -565,12 +790,16 @@ void svpf_step(SVPFState* state, float y_t, const SVPFParams* params, SVPFResult
     // 8. Update state
     state->y_prev = y_t;
     state->timestep++;
+}
+
+// =============================================================================
+// HOST API: Step (Fully Asynchronous - NO sync until svpf_get_result)
+// =============================================================================
+
+void svpf_step(SVPFState* state, float y_t, const SVPFParams* params, SVPFResult* result) {
+    svpf_step_internal(state, y_t, params, false, 0);
     
-    // =========================================================================
-    // SYNC AND COPY RESULTS BACK TO HOST
-    // For maximum throughput, you could skip this and batch-retrieve later.
-    // But for API compatibility, we sync here.
-    // =========================================================================
+    // Sync and copy results back to host
     cudaStreamSynchronize(state->stream);
     
     cudaMemcpy(&result->log_lik_increment, state->d_result_loglik, sizeof(float), cudaMemcpyDeviceToHost);
@@ -585,92 +814,118 @@ void svpf_step(SVPFState* state, float y_t, const SVPFParams* params, SVPFResult
 
 void svpf_step_seeded(SVPFState* state, float y_t, const SVPFParams* params,
                       unsigned long long rng_seed, SVPFResult* result) {
-    int n = state->n_particles;
-    int grid = (n + SVPF_BLOCK_SIZE - 1) / SVPF_BLOCK_SIZE;
-    size_t shared_mem = 2 * SVPF_BLOCK_SIZE * sizeof(float);
+    svpf_step_internal(state, y_t, params, true, rng_seed);
     
-    // 1. Copy h -> h_prev
-    svpf_copy_kernel<<<grid, SVPF_BLOCK_SIZE, 0, state->stream>>>(
-        state->h, state->h_prev, n
-    );
-    
-    // 2. Predict with SEEDED RNG
-    svpf_predict_seeded_kernel<<<grid, SVPF_BLOCK_SIZE, 0, state->stream>>>(
-        state->h_prev, state->h_pred,
-        params->rho, params->sigma_z, params->mu,
-        params->gamma, state->y_prev,
-        rng_seed, state->timestep, n
-    );
-    
-    // 3-8: Same as svpf_step (copy-paste for now, could factor out)
-    svpf_obs_loglik_kernel<<<grid, SVPF_BLOCK_SIZE, 0, state->stream>>>(
-        state->h_pred, state->log_weights, y_t,
-        state->nu, state->student_t_const, n
-    );
-    
-    cub::DeviceReduce::Max(state->d_cub_temp, state->cub_temp_bytes,
-        state->log_weights, state->d_scalar_max, n, state->stream);
-    svpf_exp_weights_kernel<<<grid, SVPF_BLOCK_SIZE, 0, state->stream>>>(
-        state->log_weights, state->d_temp, state->d_scalar_max, n
-    );
-    cub::DeviceReduce::Sum(state->d_cub_temp, state->cub_temp_bytes,
-        state->d_temp, state->d_scalar_sum, n, state->stream);
-    glue_compute_loglik_kernel<<<1, 1, 0, state->stream>>>(
-        state->d_scalar_max, state->d_scalar_sum, state->d_result_loglik, n
-    );
-    
-    svpf_copy_kernel<<<grid, SVPF_BLOCK_SIZE, 0, state->stream>>>(
-        state->h_pred, state->h, n
-    );
-    
-    // Bandwidth
-    cub::DeviceReduce::Sum(state->d_cub_temp, state->cub_temp_bytes,
-        state->h, state->d_scalar_sum, n, state->stream);
-    glue_compute_mean_kernel<<<1, 1, 0, state->stream>>>(
-        state->d_scalar_sum, state->d_scalar_mean, n
-    );
-    svpf_center_kernel<<<grid, SVPF_BLOCK_SIZE, 0, state->stream>>>(
-        state->h, state->d_h_centered, state->d_scalar_mean, n
-    );
-    cub::DeviceReduce::Sum(state->d_cub_temp, state->cub_temp_bytes,
-        state->d_h_centered, state->d_scalar_sum, n, state->stream);
-    glue_compute_bandwidth_kernel<<<1, 1, 0, state->stream>>>(
-        state->d_scalar_sum, state->d_scalar_bandwidth, n
-    );
-    
-    for (int s = 0; s < state->n_stein_steps; s++) {
-        svpf_grad_log_posterior_kernel<<<grid, SVPF_BLOCK_SIZE, 0, state->stream>>>(
-            state->h, state->h_prev, state->grad_log_p,
-            y_t, params->rho, params->sigma_z, params->mu, state->nu, n
-        );
-        svpf_rbf_kernel_shared<<<grid, SVPF_BLOCK_SIZE, shared_mem, state->stream>>>(
-            state->h, state->grad_log_p,
-            state->kernel_sum, state->grad_kernel_sum,
-            state->d_scalar_bandwidth, n
-        );
-        svpf_stein_update_kernel<<<grid, SVPF_BLOCK_SIZE, 0, state->stream>>>(
-            state->h, state->kernel_sum, state->grad_kernel_sum,
-            SVPF_STEIN_STEP_SIZE, n
-        );
-    }
-    
-    svpf_compute_vol_kernel<<<grid, SVPF_BLOCK_SIZE, 0, state->stream>>>(
-        state->h, state->d_temp, n
-    );
-    cub::DeviceReduce::Sum(state->d_cub_temp, state->cub_temp_bytes,
-        state->d_temp, state->d_scalar_sum, n, state->stream);
-    glue_compute_mean_kernel<<<1, 1, 0, state->stream>>>(
-        state->d_scalar_sum, state->d_result_vol_mean, n
-    );
-    
-    state->y_prev = y_t;
-    state->timestep++;
-    
+    // Sync and copy results back to host
     cudaStreamSynchronize(state->stream);
+    
     cudaMemcpy(&result->log_lik_increment, state->d_result_loglik, sizeof(float), cudaMemcpyDeviceToHost);
     cudaMemcpy(&result->vol_mean, state->d_result_vol_mean, sizeof(float), cudaMemcpyDeviceToHost);
-    result->h_mean = 0.0f;
+    cudaMemcpy(&result->h_mean, state->d_result_h_mean, sizeof(float), cudaMemcpyDeviceToHost);
     result->vol_std = 0.0f;
+}
+
+// =============================================================================
+// HOST API: Run Sequence (ZERO mid-sequence syncs - maximum throughput)
+// =============================================================================
+
+void svpf_run_sequence(
+    SVPFState* state,
+    const float* h_observations,  // Host array [T]
+    int T,
+    const SVPFParams* params,
+    float* h_loglik_out,          // Host array [T] - output log-likelihoods
+    float* h_vol_out              // Host array [T] - output volatilities (can be NULL)
+) {
+    // Allocate device buffers for observations and results
+    float* d_observations;
+    float* d_loglik_history;
+    float* d_vol_history = NULL;
+    
+    cudaMalloc(&d_observations, T * sizeof(float));
+    cudaMalloc(&d_loglik_history, T * sizeof(float));
+    if (h_vol_out) {
+        cudaMalloc(&d_vol_history, T * sizeof(float));
+    }
+    
+    // Copy observations to device (single H2D transfer)
+    cudaMemcpyAsync(d_observations, h_observations, T * sizeof(float), 
+                    cudaMemcpyHostToDevice, state->stream);
+    
+    // Run sequence with ZERO mid-loop syncs (fully pipelined GPU execution)
+    for (int t = 0; t < T; t++) {
+        // Run step using batch internal (reads y from device array)
+        svpf_step_batch_internal(state, d_observations, t, params);
+        
+        // Record results to history (stays on GPU)
+        svpf_record_scalar_kernel<<<1, 1, 0, state->stream>>>(
+            state->d_result_loglik, d_loglik_history, t
+        );
+        if (h_vol_out) {
+            svpf_record_scalar_kernel<<<1, 1, 0, state->stream>>>(
+                state->d_result_vol_mean, d_vol_history, t
+            );
+        }
+        
+        // Update d_y_prev for next step's leverage calculation (on GPU)
+        svpf_update_y_prev_kernel<<<1, 1, 0, state->stream>>>(
+            state->d_y_prev, d_observations, t
+        );
+        
+        state->timestep++;
+    }
+    
+    // Single sync after all T steps
+    cudaStreamSynchronize(state->stream);
+    
+    // Copy results back (single D2H transfer)
+    cudaMemcpy(h_loglik_out, d_loglik_history, T * sizeof(float), cudaMemcpyDeviceToHost);
+    if (h_vol_out) {
+        cudaMemcpy(h_vol_out, d_vol_history, T * sizeof(float), cudaMemcpyDeviceToHost);
+    }
+    
+    // Cleanup
+    cudaFree(d_observations);
+    cudaFree(d_loglik_history);
+    if (h_vol_out) {
+        cudaFree(d_vol_history);
+    }
+}
+
+// =============================================================================
+// HOST API: Run Sequence (Device arrays - for when data is already on GPU)
+// =============================================================================
+
+void svpf_run_sequence_device(
+    SVPFState* state,
+    const float* d_observations,  // Device array [T]
+    int T,
+    const SVPFParams* params,
+    float* d_loglik_out,          // Device array [T] - pre-allocated
+    float* d_vol_out              // Device array [T] - pre-allocated (can be NULL)
+) {
+    // Run sequence with ZERO syncs (fully pipelined)
+    for (int t = 0; t < T; t++) {
+        svpf_step_batch_internal(state, d_observations, t, params);
+        
+        svpf_record_scalar_kernel<<<1, 1, 0, state->stream>>>(
+            state->d_result_loglik, d_loglik_out, t
+        );
+        if (d_vol_out) {
+            svpf_record_scalar_kernel<<<1, 1, 0, state->stream>>>(
+                state->d_result_vol_mean, d_vol_out, t
+            );
+        }
+        
+        // Update d_y_prev for next step
+        svpf_update_y_prev_kernel<<<1, 1, 0, state->stream>>>(
+            state->d_y_prev, d_observations, t
+        );
+        
+        state->timestep++;
+    }
+    
+    cudaStreamSynchronize(state->stream);
 }
 
 // =============================================================================
