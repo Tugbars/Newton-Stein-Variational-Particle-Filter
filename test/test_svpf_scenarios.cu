@@ -511,13 +511,13 @@ int main(int argc, char** argv) {
     filter->use_svld = use_adaptive ? 1 : 0;       // 1 = SVLD with Langevin noise
     filter->use_annealing = use_adaptive ? 1 : 0;
     filter->n_anneal_steps = 3;
-    filter->temperature = 0.4f;    // 0=SVGD, 1=SVLD, >1=extra exploration
+    filter->temperature = 0.3f;    // 0=SVGD, 1=SVLD, >1=extra exploration
     filter->rmsprop_rho = 0.9f;
     filter->rmsprop_eps = 1e-6f;
     
     /* Mixture Innovation Model (MIM) */
     filter->use_mim = use_adaptive ? 1 : 0;
-    filter->mim_jump_prob = 0.10f;   // 5% of particles get large innovation
+    filter->mim_jump_prob = 0.15f;   // 5% of particles get large innovation
     filter->mim_jump_scale = 5.0f;   // 5x std dev for jump component
     
     /* Asymmetric persistence (vol spikes fast, decays slow) */
@@ -525,14 +525,21 @@ int main(int argc, char** argv) {
     filter->rho_up = 0.98f;    // Higher persistence when vol increasing
     filter->rho_down = 0.91f;  // Lower persistence when vol decreasing
     
+    /* EKF Guide Density (coarse positioning before Stein) */
+    filter->use_guide = use_adaptive ? 1 : 0;
+    filter->guide_strength = 0.1f;  // How much to pull toward guide (0.1-0.3)
+    
     printf("  Filter initialized.\n");
-    printf("  Mode: %s\n", use_adaptive ? "SVLD + MIM + Asym-ρ" : "VANILLA SVGD");
+    printf("  Mode: %s\n", use_adaptive ? "SVLD + MIM + Asym-ρ + Guide" : "VANILLA SVGD");
     printf("  Temperature: %.2f\n", filter->temperature);
     if (filter->use_mim) {
         printf("  MIM: %.0f%% @ %.1fx scale\n", filter->mim_jump_prob * 100, filter->mim_jump_scale);
     }
     if (filter->use_asymmetric_rho) {
         printf("  Asymmetric ρ: up=%.2f, down=%.2f\n", filter->rho_up, filter->rho_down);
+    }
+    if (filter->use_guide) {
+        printf("  EKF Guide: strength=%.2f\n", filter->guide_strength);
     }
     printf("\n");
     

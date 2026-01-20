@@ -420,6 +420,14 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     state->rho_up = 0.98f;          // Higher persistence when vol increasing
     state->rho_down = 0.93f;        // Lower persistence when vol decreasing
     
+    // === Guide density (EKF) defaults ===
+    state->use_guide = 1;           // Enable by default
+    state->guide_strength = 0.2f;   // Moderate pull toward guide
+    state->guide_mean = 0.0f;
+    state->guide_var = 0.0f;
+    state->guide_K = 0.0f;
+    state->guide_initialized = 0;
+    
     // Device scalars (the key to async execution)
     cudaMalloc(&state->d_scalar_max, sizeof(float));
     cudaMalloc(&state->d_scalar_sum, sizeof(float));

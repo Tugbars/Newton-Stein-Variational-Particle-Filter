@@ -199,6 +199,14 @@ typedef struct {
     float rho_up;           // Persistence when vol increasing (e.g., 0.98)
     float rho_down;         // Persistence when vol decreasing (e.g., 0.93)
     
+    // Guide density (EKF) config
+    int use_guide;          // Enable EKF guide density
+    float guide_strength;   // How much to pull particles toward guide (0.1-0.3)
+    float guide_mean;       // EKF posterior mean (m_t)
+    float guide_var;        // EKF posterior variance (P_t)
+    float guide_K;          // Kalman gain (for debugging)
+    int guide_initialized;  // Whether guide has been initialized
+    
     // Optimized backend (embedded for thread safety)
     SVPFOptimizedState opt_backend;
     

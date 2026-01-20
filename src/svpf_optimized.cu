@@ -667,6 +667,29 @@ __global__ void svpf_apply_transport_svld_kernel(
 }
 
 // -----------------------------------------------------------------------------
+// Kernel A1b: Apply Guide Density (Affine Re-centering)
+//
+// Shifts particles toward EKF guide mean without destroying diversity.
+// Called once per timestep, right after predict, before Stein iterations.
+//
+// h[i] = h[i] + strength * (guide_mean - h[i])
+//      = (1 - strength) * h[i] + strength * guide_mean
+// -----------------------------------------------------------------------------
+
+__global__ void svpf_apply_guide_kernel(
+    float* __restrict__ h,
+    float guide_mean,
+    float guide_strength,   // 0.1-0.3 recommended
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    
+    float delta = guide_mean - h[i];
+    h[i] = clamp_logvol(h[i] + guide_strength * delta);
+}
+
+// -----------------------------------------------------------------------------
 // Kernel A2: Adaptive Bandwidth Scaling (Improvement #1)
 //
 // Detects high-vol regime via particle spread and scales bandwidth α:
@@ -1466,12 +1489,69 @@ void svpf_step_optimized(
 }
 
 // =============================================================================
-// ADAPTIVE SVPF STEP - All three improvements combined
+// EKF Guide Update (Host-side, ~20 FLOPs)
+//
+// Uses LOG-SQUARED observation model for stability:
+//   State:   h_t = μ + ρ(h_{t-1} - μ) + σ_z ε
+//   Obs:     log(y_t²) ≈ h_t + log(η²)
+//
+// This linearizes the observation (H=1) and handles negative returns.
+// E[log(η²)] ≈ -1.27 (for χ²₁), Var ≈ 4.93
+// =============================================================================
+
+static void svpf_ekf_update(
+    SVPFState* state,
+    float y_t,
+    const SVPFParams* p
+) {
+    // Initialize on first call
+    if (!state->guide_initialized) {
+        state->guide_mean = p->mu;
+        // Stationary variance: σ² / (1 - ρ²)
+        state->guide_var = p->sigma_z * p->sigma_z / (1.0f - p->rho * p->rho);
+        state->guide_initialized = 1;
+    }
+    
+    // Predict
+    float m_pred = p->mu + p->rho * (state->guide_mean - p->mu);
+    float P_pred = p->rho * p->rho * state->guide_var + p->sigma_z * p->sigma_z;
+    
+    // Log-squared observation model (linearizes the problem!)
+    // Model: log(y²) = h + log(η²)
+    // E[log(η²)] ≈ -1.27 for χ²₁, Var[log(η²)] ≈ 4.93
+    // For Student-t, inflate variance slightly
+    float log_y2 = logf(y_t * y_t + 1e-8f);
+    float obs_offset = -1.27f;
+    float obs_var = 4.93f + 2.0f;  // Inflated for Student-t robustness
+    
+    // With log-squared transform: H = 1 (linear relationship!)
+    float H = 1.0f;
+    float R = obs_var;
+    
+    // Kalman gain
+    float S = H * H * P_pred + R;
+    float K = P_pred * H / (S + 1e-8f);
+    
+    // Innovation: log(y²) - predicted log(y²)
+    float y_pred = m_pred + obs_offset;
+    float innovation = log_y2 - y_pred;
+    
+    // Update
+    state->guide_mean = m_pred + K * innovation;
+    state->guide_var = (1.0f - K * H) * P_pred;
+    state->guide_K = K;
+}
+
+// =============================================================================
+// ADAPTIVE SVPF STEP - All improvements combined
 // 
 // Improvements:
-//   1. Adaptive bandwidth α scaling based on regime detection
-//   2. Annealed Stein updates (β schedule: 0.3 → 0.65 → 1.0)
-//   3. Per-particle Adam momentum for stable transport
+//   1. Mixture Innovation Model (MIM) - fat-tailed predict
+//   2. Asymmetric ρ - vol spikes fast, decays slow
+//   3. EKF Guide Density - coarse positioning before Stein
+//   4. Adaptive bandwidth α scaling based on regime detection
+//   5. Annealed Stein updates (β schedule: 0.3 → 0.65 → 1.0)
+//   6. Fused RMSProp + Langevin (SVLD) for stable transport
 // =============================================================================
 
 void svpf_step_adaptive(
@@ -1533,6 +1613,19 @@ void svpf_step_adaptive(
         svpf_predict_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
             state->h, state->h_prev, state->rng_states,
             opt->d_y_single, 1, p.rho, p.sigma_z, p.mu, p.gamma, n
+        );
+    }
+    
+    // =========================================================================
+    // EKF GUIDE DENSITY (coarse positioning before Stein refinement)
+    // =========================================================================
+    if (state->use_guide) {
+        // Update EKF (host-side, ~20 FLOPs)
+        svpf_ekf_update(state, y_t, &p);
+        
+        // Pull particles toward guide mean
+        svpf_apply_guide_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
+            state->h, state->guide_mean, state->guide_strength, n
         );
     }
     
@@ -1608,11 +1701,17 @@ void svpf_step_adaptive(
             float temp = state->use_svld ? state->temperature : 0.0f;
             float beta_factor = sqrtf(beta);  // Scale step by sqrt(beta) during annealing
             
+            // Reduce step size when guide handles transport (supervisor recommendation)
+            float step_size = SVPF_STEIN_STEP_SIZE;
+            if (state->use_guide) {
+                step_size *= 0.5f;  // Guide handles transport, Stein handles geometry
+            }
+            
             svpf_apply_transport_svld_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
                 state->h, opt->d_phi,
                 state->d_grad_v,             // RMSProp state
                 state->rng_states,           // For Langevin noise
-                SVPF_STEIN_STEP_SIZE,
+                step_size,
                 beta_factor,                 // Annealing factor
                 temp,                        // Temperature (0=SVGD, 1=SVLD)
                 state->rmsprop_rho,
