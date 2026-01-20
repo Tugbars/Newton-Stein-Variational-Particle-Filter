@@ -388,10 +388,8 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     cudaMalloc(&state->d_reduce_buf, n * sizeof(float));
     cudaMalloc(&state->d_temp, n * sizeof(float));
     
-    // === ADAPTIVE SVPF: Per-particle Adam momentum ===
-    cudaMalloc(&state->d_grad_m, n * sizeof(float));
+    // === ADAPTIVE SVPF: Per-particle RMSProp state ===
     cudaMalloc(&state->d_grad_v, n * sizeof(float));
-    cudaMemset(state->d_grad_m, 0, n * sizeof(float));
     cudaMemset(state->d_grad_v, 0, n * sizeof(float));
     
     // === ADAPTIVE SVPF: Regime detection scalars ===
@@ -405,12 +403,22 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     cudaMemcpy(state->d_bw_alpha, &init_alpha, sizeof(float), cudaMemcpyHostToDevice);
     
     // === ADAPTIVE SVPF: Configuration defaults ===
-    state->use_adam = 1;         // Enable Adam by default
+    state->use_svld = 1;         // Enable SVLD by default
     state->use_annealing = 1;    // Enable annealing by default
     state->n_anneal_steps = 3;   // β = 0.3, 0.65, 1.0
-    state->adam_beta1 = 0.9f;
-    state->adam_beta2 = 0.999f;
-    state->adam_eps = 1e-8f;
+    state->temperature = 1.0f;   // Full SVLD (set to 0 for deterministic SVGD)
+    state->rmsprop_rho = 0.9f;   // RMSProp decay
+    state->rmsprop_eps = 1e-6f;  // RMSProp epsilon
+    
+    // === Mixture Innovation Model defaults ===
+    state->use_mim = 1;          // Enable MIM by default
+    state->mim_jump_prob = 0.05f;   // 5% of particles get large innovation
+    state->mim_jump_scale = 5.0f;   // 5x std dev for jump component
+    
+    // === Asymmetric persistence defaults ===
+    state->use_asymmetric_rho = 1;  // Enable by default
+    state->rho_up = 0.98f;          // Higher persistence when vol increasing
+    state->rho_down = 0.93f;        // Lower persistence when vol decreasing
     
     // Device scalars (the key to async execution)
     cudaMalloc(&state->d_scalar_max, sizeof(float));
@@ -451,7 +459,6 @@ void svpf_destroy(SVPFState* state) {
     cudaFree(state->d_cub_temp);
     
     // Adaptive SVPF arrays
-    cudaFree(state->d_grad_m);
     cudaFree(state->d_grad_v);
     cudaFree(state->d_return_ema);
     cudaFree(state->d_return_var);

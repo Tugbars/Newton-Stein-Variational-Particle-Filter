@@ -428,9 +428,9 @@ int main(int argc, char** argv) {
     printf("║          SVPF CUDA TEST - Continuous SV (SVPF-Favorable DGP)                ║\n");
     printf("╚══════════════════════════════════════════════════════════════════════════════╝\n\n");
     
-    int seed = 12345;
-    int n_particles = 512;
-    int n_stein = 5;
+    int seed = 42;
+    int n_particles = 1024;
+    int n_stein = 10;
     float nu = 5.0f;
     int use_adaptive = 1;  /* Default: use adaptive improvements */
     
@@ -508,15 +508,32 @@ int main(int argc, char** argv) {
     svpf_initialize(filter, &params, seed);
     
     /* Configure adaptive SVPF settings */
-    filter->use_adam = use_adaptive ? 1 : 0;
+    filter->use_svld = use_adaptive ? 1 : 0;       // 1 = SVLD with Langevin noise
     filter->use_annealing = use_adaptive ? 1 : 0;
     filter->n_anneal_steps = 3;
-    filter->adam_beta1 = 0.9f;
-    filter->adam_beta2 = 0.999f;
-    filter->adam_eps = 1e-8f;
+    filter->temperature = 0.4f;    // 0=SVGD, 1=SVLD, >1=extra exploration
+    filter->rmsprop_rho = 0.9f;
+    filter->rmsprop_eps = 1e-6f;
+    
+    /* Mixture Innovation Model (MIM) */
+    filter->use_mim = use_adaptive ? 1 : 0;
+    filter->mim_jump_prob = 0.10f;   // 5% of particles get large innovation
+    filter->mim_jump_scale = 5.0f;   // 5x std dev for jump component
+    
+    /* Asymmetric persistence (vol spikes fast, decays slow) */
+    filter->use_asymmetric_rho = use_adaptive ? 1 : 0;
+    filter->rho_up = 0.98f;    // Higher persistence when vol increasing
+    filter->rho_down = 0.91f;  // Lower persistence when vol decreasing
     
     printf("  Filter initialized.\n");
-    printf("  Mode: %s\n", use_adaptive ? "ADAPTIVE (bandwidth + annealing + Adam)" : "VANILLA");
+    printf("  Mode: %s\n", use_adaptive ? "SVLD + MIM + Asym-ρ" : "VANILLA SVGD");
+    printf("  Temperature: %.2f\n", filter->temperature);
+    if (filter->use_mim) {
+        printf("  MIM: %.0f%% @ %.1fx scale\n", filter->mim_jump_prob * 100, filter->mim_jump_scale);
+    }
+    if (filter->use_asymmetric_rho) {
+        printf("  Asymmetric ρ: up=%.2f, down=%.2f\n", filter->rho_up, filter->rho_down);
+    }
     printf("\n");
     
     /*═══════════════════════════════════════════════════════════════════════

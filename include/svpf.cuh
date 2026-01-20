@@ -142,11 +142,10 @@ typedef struct {
     float* d_h_centered;  // [N] Centered particles for variance computation
     
     // === ADAPTIVE SVPF ADDITIONS ===
-    // Per-particle Adam momentum (improvement #3)
-    float* d_grad_m;       // [N] First moment (mean of gradients)
+    // Per-particle RMSProp momentum (for SVLD)
     float* d_grad_v;       // [N] Second moment (uncentered variance)
     
-    // Regime detection for bandwidth scaling (improvement #1)
+    // Regime detection for bandwidth scaling
     float* d_return_ema;   // Scalar: EMA of |returns|
     float* d_return_var;   // Scalar: EMA of return variance
     float* d_bw_alpha;     // Scalar: adaptive bandwidth alpha
@@ -183,12 +182,22 @@ typedef struct {
     cudaStream_t stream;
     
     // Adaptive SVPF config
-    int use_adam;           // Enable per-particle Adam
+    int use_svld;           // Enable SVLD (Langevin noise) - 0=SVGD, 1=SVLD
     int use_annealing;      // Enable annealed Stein
     int n_anneal_steps;     // Number of annealing steps (2-3)
-    float adam_beta1;       // Adam first moment decay (0.9)
-    float adam_beta2;       // Adam second moment decay (0.999)
-    float adam_eps;         // Adam epsilon (1e-8)
+    float temperature;      // Langevin temperature: 0=SVGD, 1=SVLD, >1=exploration
+    float rmsprop_rho;      // RMSProp decay (0.9-0.99)
+    float rmsprop_eps;      // RMSProp epsilon (1e-6)
+    
+    // Mixture Innovation Model (MIM) config
+    int use_mim;            // Enable MIM predict (vs standard Gaussian)
+    float mim_jump_prob;    // Probability of jump component (e.g., 0.05)
+    float mim_jump_scale;   // Scale factor for jump component std (e.g., 5.0)
+    
+    // Asymmetric persistence config
+    int use_asymmetric_rho; // Enable asymmetric rho (vol spikes fast, decays slow)
+    float rho_up;           // Persistence when vol increasing (e.g., 0.98)
+    float rho_down;         // Persistence when vol decreasing (e.g., 0.93)
     
     // Optimized backend (embedded for thread safety)
     SVPFOptimizedState opt_backend;
@@ -342,16 +351,23 @@ void svpf_step_optimized(
 /**
  * @brief ADAPTIVE SVPF: Single step with all improvements
  * 
- * Improvements enabled:
- *   1. Adaptive bandwidth α scaling (tighter kernel during high vol)
- *   2. Annealed Stein updates (β schedule: 0.3 → 0.65 → 1.0)
- *   3. Per-particle Adam momentum (stable transport, no explosion)
+ * Implements Preconditioned Stein Variational Langevin Descent:
+ *   1. Mixture Innovation Model (MIM) - fat-tailed predict for scout particles
+ *   2. Asymmetric ρ - vol spikes fast (ρ_up), decays slow (ρ_down)
+ *   3. Adaptive bandwidth α scaling (tighter kernel during high vol)
+ *   4. Annealed Stein updates (β schedule: 0.3 → 0.65 → 1.0)
+ *   5. Fused RMSProp + Langevin diffusion (SVLD for diversity)
  * 
  * Configure via SVPFState fields:
- *   - use_adam: Enable/disable Adam (default: 1)
+ *   - use_mim: Enable Mixture Innovation (default: 1)
+ *   - mim_jump_prob: Probability of jump component (default: 0.05)
+ *   - mim_jump_scale: Scale factor for jump std (default: 5.0)
+ *   - use_asymmetric_rho: Enable asymmetric persistence (default: 1)
+ *   - rho_up: Persistence when vol increasing (default: 0.98)
+ *   - rho_down: Persistence when vol decreasing (default: 0.93)
+ *   - use_svld: Enable SVLD noise (default: 1)
  *   - use_annealing: Enable/disable annealing (default: 1)
- *   - n_anneal_steps: Number of β levels (default: 3)
- *   - adam_beta1/beta2/eps: Adam hyperparameters
+ *   - temperature: 0=SVGD, 1=SVLD, >1=extra exploration
  * 
  * @param state SVPF state
  * @param y_t Current observation

@@ -159,6 +159,60 @@ __global__ void svpf_predict_kernel(
     h[i] = clamp_logvol(mu + rho * (h_i - mu) + sigma_z * noise + leverage);
 }
 
+// =============================================================================
+// Kernel 1b: Predict with Mixture Innovation Model (MIM) + Asymmetric ρ
+//
+// Innovation is a mixture of Gaussians:
+//   (1-p) * N(0, σ²) + p * N(0, (jump_scale*σ)²)
+//
+// Asymmetric persistence:
+//   ρ_eff = ρ_up   if h > h_prev  (vol increasing - persists longer)
+//   ρ_eff = ρ_down if h ≤ h_prev  (vol decreasing - mean-reverts faster)
+//
+// Captures empirical fact: volatility spikes fast, decays slow
+// =============================================================================
+
+__global__ void svpf_predict_mim_kernel(
+    float* __restrict__ h,
+    float* __restrict__ h_prev,
+    curandStatePhilox4_32_10_t* __restrict__ rng,
+    const float* __restrict__ d_y,
+    int t,
+    float rho_up,         // Persistence when vol increasing (e.g., 0.98)
+    float rho_down,       // Persistence when vol decreasing (e.g., 0.93)
+    float sigma_z, float mu, float gamma,
+    float jump_prob,      // e.g., 0.05 (5% of particles get large innovation)
+    float jump_scale,     // e.g., 5.0 (5x std dev for jump component)
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    float h_i = h[i];
+    float h_prev_i = h_prev[i];
+    h_prev[i] = h_i;  // Store for next step
+
+    // Sample innovation noise
+    float noise = curand_normal(&rng[i]);
+    float selector = curand_uniform(&rng[i]);
+
+    // Branchless mixture selection (compiles to CMOV, no divergence)
+    float scale = (selector < jump_prob) ? jump_scale : 1.0f;
+
+    // Asymmetric persistence: vol spikes fast, decays slow
+    // Compare current h to previous h (not h_prev which we just overwrote)
+    float rho = (h_i > h_prev_i) ? rho_up : rho_down;
+
+    // Leverage effect
+    float y_prev = (t > 0) ? d_y[t - 1] : 0.0f;
+    float vol_prev = safe_exp(h_i / 2.0f);
+    float leverage = gamma * y_prev / (vol_prev + 1e-8f);
+
+    // Evolve state with scaled innovation
+    float prior_mean = mu + rho * (h_i - mu) + leverage;
+    h[i] = clamp_logvol(prior_mean + sigma_z * scale * noise);
+}
+
 // Version reading t from device memory (for CUDA Graph path)
 __global__ void svpf_predict_kernel_graph(
     float* __restrict__ h,
@@ -543,7 +597,7 @@ __global__ void svpf_stein_persistent_kernel(
 }
 
 // =============================================================================
-// Kernel 6: Apply Transport (for 2D kernel path)
+// Kernel 6: Apply Transport (for 2D kernel path) - Basic version
 // =============================================================================
 
 __global__ void svpf_apply_transport_kernel(
@@ -562,49 +616,54 @@ __global__ void svpf_apply_transport_kernel(
 // =============================================================================
 
 // -----------------------------------------------------------------------------
-// Kernel A1: Apply Transport with Adam Momentum (Improvement #3)
-// 
-// Adam update per particle:
-//   m = β1*m + (1-β1)*g
-//   v = β2*v + (1-β2)*g²
-//   g_hat = m / sqrt(v + ε)
-//   h = h + step_size * g_hat
+// Kernel A1: Fused SVLD + RMSProp Transport (Preconditioned SVLD)
+//
+// Implements Preconditioned Stein Variational Langevin Descent:
+//   1. RMSProp: v = ρ*v + (1-ρ)*φ²  (adaptive learning rate)
+//   2. Drift:   h += ε*β*φ/√(v+eps)  (preconditioned gradient)
+//   3. Diffusion: h += √(2*ε*β*T)*η  (Langevin noise for diversity)
+//
+// temperature = 0 → deterministic SVGD (no noise)
+// temperature = 1 → full SVLD (theoretically correct)
+// temperature > 1 → extra exploration (useful early, anneal down)
 // -----------------------------------------------------------------------------
 
-__global__ void svpf_apply_transport_adam_kernel(
+__global__ void svpf_apply_transport_svld_kernel(
     float* __restrict__ h,
-    const float* __restrict__ phi,        // Raw gradient direction
-    float* __restrict__ adam_m,           // First moment [N]
-    float* __restrict__ adam_v,           // Second moment [N]
-    float step_size,
-    float beta1,                          // First moment decay (0.9)
-    float beta2,                          // Second moment decay (0.999)
-    float eps,                            // Stability (1e-8)
-    int t,                                // Timestep for bias correction
+    const float* __restrict__ phi,
+    float* __restrict__ v,                              // RMSProp state [N]
+    curandStatePhilox4_32_10_t* __restrict__ rng_states,// RNG states [N]
+    float base_step_size,
+    float beta_anneal_factor,    // Scales step during annealing (sqrt(beta) or beta)
+    float temperature,           // 0.0 = SVGD, 1.0 = SVLD, >1 = extra exploration
+    float rho_rmsprop,           // RMSProp decay (0.9-0.99)
+    float epsilon,               // Stability (1e-6)
     int n
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    
-    float g = phi[i];
-    
-    // Update biased first moment
-    float m = beta1 * adam_m[i] + (1.0f - beta1) * g;
-    adam_m[i] = m;
-    
-    // Update biased second moment
-    float v = beta2 * adam_v[i] + (1.0f - beta2) * g * g;
-    adam_v[i] = v;
-    
-    // Bias correction
-    float t_f = (float)(t + 1);  // t is 0-indexed
-    float m_hat = m / (1.0f - powf(beta1, t_f));
-    float v_hat = v / (1.0f - powf(beta2, t_f));
-    
-    // Adam-normalized update
-    float update = m_hat / (sqrtf(v_hat) + eps);
-    
-    h[i] = clamp_logvol(h[i] + step_size * update);
+
+    float phi_i = phi[i];
+    float v_prev = v[i];
+
+    // 1. Update RMSProp (Second Moment)
+    float v_new = rho_rmsprop * v_prev + (1.0f - rho_rmsprop) * phi_i * phi_i;
+    v[i] = v_new;
+
+    // 2. Calculate Deterministic Update (Drift)
+    float effective_step = base_step_size * beta_anneal_factor;
+    float preconditioner = rsqrtf(v_new + epsilon);  // 1/sqrt(v)
+    float drift = effective_step * phi_i * preconditioner;
+
+    // 3. Calculate Stochastic Update (Diffusion) - Langevin noise
+    float diffusion = 0.0f;
+    if (temperature > 1e-6f) {
+        float noise = curand_normal(&rng_states[i]);
+        diffusion = sqrtf(2.0f * effective_step * temperature) * noise;
+    }
+
+    // 4. Apply & Clamp
+    h[i] = clamp_logvol(h[i] + drift + diffusion);
 }
 
 // -----------------------------------------------------------------------------
@@ -1456,12 +1515,26 @@ void svpf_step_adaptive(
     }
     
     // =========================================================================
-    // PREDICT
+    // PREDICT (with optional Mixture Innovation Model + Asymmetric ρ)
     // =========================================================================
-    svpf_predict_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
-        state->h, state->h_prev, state->rng_states,
-        opt->d_y_single, 1, p.rho, p.sigma_z, p.mu, p.gamma, n
-    );
+    if (state->use_mim) {
+        // MIM kernel supports asymmetric rho directly
+        float rho_up = state->use_asymmetric_rho ? state->rho_up : p.rho;
+        float rho_down = state->use_asymmetric_rho ? state->rho_down : p.rho;
+        
+        svpf_predict_mim_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
+            state->h, state->h_prev, state->rng_states,
+            opt->d_y_single, 1, 
+            rho_up, rho_down,  // Asymmetric persistence
+            p.sigma_z, p.mu, p.gamma,
+            state->mim_jump_prob, state->mim_jump_scale, n
+        );
+    } else {
+        svpf_predict_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
+            state->h, state->h_prev, state->rng_states,
+            opt->d_y_single, 1, p.rho, p.sigma_z, p.mu, p.gamma, n
+        );
+    }
     
     // =========================================================================
     // BANDWIDTH with adaptive scaling (Improvement #1)
@@ -1530,20 +1603,22 @@ void svpf_step_adaptive(
                 );
             }
             
-            // Apply transport with Adam momentum (Improvement #3)
-            if (state->use_adam) {
-                svpf_apply_transport_adam_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
-                    state->h, opt->d_phi,
-                    state->d_grad_m, state->d_grad_v,
-                    SVPF_STEIN_STEP_SIZE,
-                    state->adam_beta1, state->adam_beta2, state->adam_eps,
-                    t, n
-                );
-            } else {
-                svpf_apply_transport_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
-                    state->h, opt->d_phi, SVPF_STEIN_STEP_SIZE, n
-                );
-            }
+            // Apply transport with fused SVLD (RMSProp + Langevin noise)
+            // Temperature control: 0 = SVGD (deterministic), 1 = SVLD (diffusion)
+            float temp = state->use_svld ? state->temperature : 0.0f;
+            float beta_factor = sqrtf(beta);  // Scale step by sqrt(beta) during annealing
+            
+            svpf_apply_transport_svld_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
+                state->h, opt->d_phi,
+                state->d_grad_v,             // RMSProp state
+                state->rng_states,           // For Langevin noise
+                SVPF_STEIN_STEP_SIZE,
+                beta_factor,                 // Annealing factor
+                temp,                        // Temperature (0=SVGD, 1=SVLD)
+                state->rmsprop_rho,
+                state->rmsprop_eps,
+                n
+            );
             
             // Recompute gradient if more iterations remain
             if (s < stein_iters - 1) {
