@@ -253,6 +253,32 @@ void svpf_run_sequence_device(
     float* d_vol_out
 );
 
+/**
+ * @brief Ultra-fast sequence runner (for N <= 1024)
+ * 
+ * Uses single-block kernels with warp-shuffle reductions.
+ * ~4x fewer kernel launches than standard version.
+ * 
+ * Kernel count per step:
+ * - Standard: ~31 kernels
+ * - Fast: 8 kernels (1 forward + 1 bandwidth + 5 Stein + 1 vol)
+ * 
+ * @param state SVPF state (must have n_particles <= 1024)
+ * @param d_observations Device array [T]
+ * @param T Number of observations  
+ * @param params Model parameters
+ * @param d_loglik_out Device array [T] for log-likelihoods
+ * @param d_vol_out Device array [T] for volatilities (can be NULL)
+ */
+void svpf_run_sequence_fast(
+    SVPFState* state,
+    const float* d_observations,
+    int T,
+    const SVPFParams* params,
+    float* d_loglik_out,
+    float* d_vol_out
+);
+
 // =============================================================================
 // API: Diagnostics
 // =============================================================================

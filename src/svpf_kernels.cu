@@ -481,10 +481,10 @@ __global__ void svpf_record_scalar_kernel(
 }
 
 // =============================================================================
-// KERNELS: Batch-mode versions (accept observation array + index)
+// KERNELS: Batch-mode versions (read y directly from array - ZERO copies)
 // =============================================================================
 
-// Batch predict kernel - reads y_prev from device memory
+// Batch predict: reads y_prev from d_y[t-1] directly
 __global__ void svpf_predict_batch_kernel(
     const float* h_prev,
     float* h_pred,
@@ -493,14 +493,17 @@ __global__ void svpf_predict_batch_kernel(
     float sigma_z,
     float mu,
     float gamma,
-    const float* d_y_prev,  // Device pointer to previous observation
+    const float* d_y,  // Full observation array
+    int t,             // Current timestep (use t-1 for y_prev)
     int n
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
         float noise = curand_normal(&rng_states[idx]);
         float h_prev_i = h_prev[idx];
-        float y_prev = *d_y_prev;
+        
+        // Read y_prev directly from array (no copy needed)
+        float y_prev = (t > 0) ? d_y[t - 1] : 0.0f;
         
         float vol_prev = safe_exp(h_prev_i / 2.0f);
         float leverage = gamma * y_prev / (vol_prev + 1e-8f);
@@ -510,18 +513,19 @@ __global__ void svpf_predict_batch_kernel(
     }
 }
 
+// Batch obs likelihood: reads y_t from d_y[t] directly
 __global__ void svpf_obs_loglik_batch_kernel(
     const float* h,
     float* log_weights,
-    const float* d_observations,  // Full observation array
-    int obs_index,                 // Which observation to use
+    const float* d_y,
+    int t,
     float nu,
     float student_t_const,
     int n
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
-        float y_t = d_observations[obs_index];
+        float y_t = d_y[t];  // Direct read
         float h_i = h[idx];
         float vol = safe_exp(h_i);
         float scaled_y_sq = (y_t * y_t) / (vol + 1e-8f);
@@ -533,12 +537,13 @@ __global__ void svpf_obs_loglik_batch_kernel(
     }
 }
 
+// Batch gradient: reads y_t from d_y[t] directly  
 __global__ void svpf_grad_log_posterior_batch_kernel(
     const float* h,
     const float* h_prev,
     float* grad_log_p,
-    const float* d_observations,
-    int obs_index,
+    const float* d_y,
+    int t,
     float rho,
     float sigma_z,
     float mu,
@@ -547,7 +552,7 @@ __global__ void svpf_grad_log_posterior_batch_kernel(
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
-        float y_t = d_observations[obs_index];
+        float y_t = d_y[t];  // Direct read
         float h_i = h[idx];
         float h_prev_i = h_prev[idx];
         
@@ -561,6 +566,20 @@ __global__ void svpf_grad_log_posterior_batch_kernel(
         
         float grad = grad_prior + grad_lik;
         grad_log_p[idx] = fminf(fmaxf(grad, -10.0f), 10.0f);
+    }
+}
+
+// Combined record kernel (reduces kernel launch overhead)
+__global__ void svpf_record_stats_kernel(
+    const float* d_scalar_loglik,
+    const float* d_scalar_vol,
+    float* d_loglik_history,
+    float* d_vol_history,
+    int t
+) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        if (d_loglik_history) d_loglik_history[t] = *d_scalar_loglik;
+        if (d_vol_history)    d_vol_history[t]    = *d_scalar_vol;
     }
 }
 
@@ -584,11 +603,11 @@ static void svpf_step_batch_internal(
         state->h, state->h_prev, n
     );
     
-    // 2. Predict - reads y_prev from device memory (d_y_prev)
+    // 2. Predict - reads y_prev from d_observations[obs_index-1]
     svpf_predict_batch_kernel<<<grid, SVPF_BLOCK_SIZE, 0, state->stream>>>(
         state->h_prev, state->h_pred, state->rng_states,
         params->rho, params->sigma_z, params->mu,
-        params->gamma, state->d_y_prev, n
+        params->gamma, d_observations, obs_index, n
     );
     
     // 3. Observation likelihood (batch version - reads y from device array)
@@ -663,17 +682,6 @@ static void svpf_step_batch_internal(
     // 8. Update y_prev using a glue kernel (stays on GPU!)
     // We need a kernel to copy d_observations[obs_index] to a scalar
     state->timestep++;
-}
-
-// Kernel to update y_prev from device array
-__global__ void svpf_update_y_prev_kernel(
-    float* d_y_prev,
-    const float* d_observations,
-    int obs_index
-) {
-    if (threadIdx.x == 0 && blockIdx.x == 0) {
-        *d_y_prev = d_observations[obs_index];
-    }
 }
 
 // =============================================================================
@@ -867,11 +875,6 @@ void svpf_run_sequence(
             );
         }
         
-        // Update d_y_prev for next step's leverage calculation (on GPU)
-        svpf_update_y_prev_kernel<<<1, 1, 0, state->stream>>>(
-            state->d_y_prev, d_observations, t
-        );
-        
         state->timestep++;
     }
     
@@ -916,11 +919,6 @@ void svpf_run_sequence_device(
                 state->d_result_vol_mean, d_vol_out, t
             );
         }
-        
-        // Update d_y_prev for next step
-        svpf_update_y_prev_kernel<<<1, 1, 0, state->stream>>>(
-            state->d_y_prev, d_observations, t
-        );
         
         state->timestep++;
     }

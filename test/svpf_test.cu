@@ -254,6 +254,130 @@ void benchmark() {
 }
 
 // =============================================================================
+// BENCHMARK: Batch API vs Per-Step vs Fast
+// =============================================================================
+
+void benchmark_batch() {
+    printf("\n========================================\n");
+    printf("BENCHMARK: Per-Step vs Batch vs Fast\n");
+    printf("========================================\n");
+    
+    int T = 1000;
+    int N = 512;
+    int n_runs = 3;
+    
+    float* y = (float*)malloc(T * sizeof(float));
+    float* h_true = (float*)malloc(T * sizeof(float));
+    float* loglik_out = (float*)malloc(T * sizeof(float));
+    float* vol_out = (float*)malloc(T * sizeof(float));
+    
+    generate_synthetic_data(y, h_true, T, 0.95f, 0.20f, -5.0f, 42);
+    
+    // Allocate device arrays for fast version
+    float *d_y, *d_loglik, *d_vol;
+    cudaMalloc(&d_y, T * sizeof(float));
+    cudaMalloc(&d_loglik, T * sizeof(float));
+    cudaMalloc(&d_vol, T * sizeof(float));
+    cudaMemcpy(d_y, y, T * sizeof(float), cudaMemcpyHostToDevice);
+    
+    SVPFState* state = svpf_create(N, 5, 5.0f, NULL);
+    SVPFParams params = {0.95f, 0.20f, -5.0f, 0.0f};
+    SVPFResult result;
+    
+    printf("N=%d, T=%d, %d runs each\n\n", N, T, n_runs);
+    
+    // --- Per-step API ---
+    double total_per_step = 0.0;
+    for (int run = 0; run < n_runs; run++) {
+        svpf_initialize(state, &params, 42 + run);
+        cudaDeviceSynchronize();
+        clock_t start = clock();
+        
+        for (int t = 0; t < T; t++) {
+            svpf_step(state, y[t], &params, &result);
+        }
+        
+        cudaDeviceSynchronize();
+        clock_t end = clock();
+        total_per_step += (double)(end - start) / CLOCKS_PER_SEC * 1000.0;
+    }
+    double avg_per_step_ms = total_per_step / n_runs;
+    
+    // --- Batch API ---
+    double total_batch = 0.0;
+    for (int run = 0; run < n_runs; run++) {
+        svpf_initialize(state, &params, 42 + run);
+        cudaDeviceSynchronize();
+        clock_t start = clock();
+        
+        svpf_run_sequence(state, y, T, &params, loglik_out, vol_out);
+        
+        cudaDeviceSynchronize();
+        clock_t end = clock();
+        total_batch += (double)(end - start) / CLOCKS_PER_SEC * 1000.0;
+    }
+    double avg_batch_ms = total_batch / n_runs;
+    
+    // --- Fast API (device arrays) ---
+    double total_fast = 0.0;
+    for (int run = 0; run < n_runs; run++) {
+        svpf_initialize(state, &params, 42 + run);
+        cudaDeviceSynchronize();
+        clock_t start = clock();
+        
+        svpf_run_sequence_fast(state, d_y, T, &params, d_loglik, d_vol);
+        
+        cudaDeviceSynchronize();
+        clock_t end = clock();
+        total_fast += (double)(end - start) / CLOCKS_PER_SEC * 1000.0;
+    }
+    double avg_fast_ms = total_fast / n_runs;
+    
+    printf("%-15s %10s %15s %12s\n", "Method", "Total(ms)", "Per-step(μs)", "Steps/sec");
+    printf("%-15s %10s %15s %12s\n", "------", "--------", "-----------", "---------");
+    printf("%-15s %10.2f %15.1f %12.0f\n", "Per-step API", 
+           avg_per_step_ms, avg_per_step_ms * 1000.0 / T, T / (avg_per_step_ms / 1000.0));
+    printf("%-15s %10.2f %15.1f %12.0f\n", "Batch API",
+           avg_batch_ms, avg_batch_ms * 1000.0 / T, T / (avg_batch_ms / 1000.0));
+    printf("%-15s %10.2f %15.1f %12.0f\n", "Fast API",
+           avg_fast_ms, avg_fast_ms * 1000.0 / T, T / (avg_fast_ms / 1000.0));
+    
+    printf("\nSpeedup vs per-step:\n");
+    printf("  Batch: %.1fx\n", avg_per_step_ms / avg_batch_ms);
+    printf("  Fast:  %.1fx\n", avg_per_step_ms / avg_fast_ms);
+    
+    // Verify correctness
+    svpf_initialize(state, &params, 42);
+    float total_ll_step = 0.0f;
+    for (int t = 0; t < T; t++) {
+        svpf_step(state, y[t], &params, &result);
+        total_ll_step += result.log_lik_increment;
+    }
+    
+    svpf_initialize(state, &params, 42);
+    svpf_run_sequence_fast(state, d_y, T, &params, d_loglik, d_vol);
+    cudaMemcpy(loglik_out, d_loglik, T * sizeof(float), cudaMemcpyDeviceToHost);
+    float total_ll_fast = 0.0f;
+    for (int t = 0; t < T; t++) {
+        total_ll_fast += loglik_out[t];
+    }
+    
+    printf("\nCorrectness check:\n");
+    printf("  Per-step total LL: %.4f\n", total_ll_step);
+    printf("  Fast total LL:     %.4f\n", total_ll_fast);
+    printf("  Difference:        %.6f\n", fabsf(total_ll_step - total_ll_fast));
+    
+    svpf_destroy(state);
+    cudaFree(d_y);
+    cudaFree(d_loglik);
+    cudaFree(d_vol);
+    free(y);
+    free(h_true);
+    free(loglik_out);
+    free(vol_out);
+}
+
+// =============================================================================
 // TEST 4: Seeded Step (CRN verification)
 // =============================================================================
 
@@ -335,6 +459,7 @@ int main() {
     passed += test_crn();
     
     benchmark();
+    benchmark_batch();
     
     printf("\n========================================\n");
     printf("SUMMARY: %d/%d tests passed\n", passed, total - 1);  // -1 for benchmark
