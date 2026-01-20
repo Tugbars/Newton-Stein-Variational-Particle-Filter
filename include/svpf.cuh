@@ -53,19 +53,27 @@ extern "C" {
 /**
  * @brief SV model parameters
  * 
- * AR(1) log-volatility: h_t = mu + rho*(h_{t-1} - mu) + sigma_z*eps_t
+ * AR(1) log-volatility with leverage effect:
+ *   h_t = mu + rho*(h_{t-1} - mu) + sigma_z*eps_t + gamma*y_{t-1}/exp(h_{t-1}/2)
+ * 
  * Observation: y_t = exp(h_t/2) * eta_t, eta_t ~ Student-t(nu)
+ * 
+ * Leverage: gamma < 0 means negative returns increase volatility (typical for equities)
  */
 typedef struct {
     float rho;      // Persistence (0 < rho < 1, typically 0.9-0.99)
     float sigma_z;  // Vol-of-vol (typically 0.1-0.3)
     float mu;       // Long-run mean log-volatility (typically -5 to -3)
+    float gamma;    // Leverage effect (typically -0.5 to 0 for equities, 0 for crypto)
 } SVPFParams;
 
 /**
  * @brief SVPF filter state (SoA layout for GPU)
  * 
  * All arrays have length n_particles, allocated on device.
+ * 
+ * OPTIMIZATION: All intermediate scalars live in device memory.
+ * No D2H transfers during step execution - fully async pipeline.
  */
 typedef struct {
     // Particle states
@@ -81,12 +89,31 @@ typedef struct {
     // Likelihood computation
     float* log_weights; // [N] Log importance weights
     
-    // RNG states
-    curandState* rng_states;  // [N] CURAND states
+    // Bandwidth computation (variance-based, O(N) not O(N²))
+    float* d_h_centered;  // [N] Centered particles for variance computation
     
-    // Reduction workspace
-    float* d_reduce_buf;    // Workspace for parallel reduction
-    float* d_temp;          // Temp storage for CUB
+    // RNG states (Philox for fast CRN)
+    curandStatePhilox4_32_10_t* rng_states;  // [N] CURAND Philox states
+    
+    // Reduction workspace (pre-allocated for CUB)
+    float* d_reduce_buf;    // [N] Workspace for parallel reduction
+    float* d_temp;          // [N] Temp buffer for intermediate results
+    void* d_cub_temp;       // Pre-allocated CUB temp storage
+    size_t cub_temp_bytes;  // Size of CUB temp storage
+    
+    // =========================================================================
+    // DEVICE SCALARS - Eliminates PCIe roundtrips during step execution
+    // These stay on GPU; kernels read/write via pointers, not D2H copies
+    // =========================================================================
+    float* d_scalar_max;       // [1] Max log-weight for log-sum-exp
+    float* d_scalar_sum;       // [1] Sum for reductions  
+    float* d_scalar_mean;      // [1] Mean for bandwidth computation
+    float* d_scalar_bandwidth; // [1] Computed bandwidth (stays on GPU)
+    
+    // Result buffer - stays on GPU until user calls svpf_get_result()
+    float* d_result_loglik;    // [1] Log-likelihood increment
+    float* d_result_vol_mean;  // [1] Volatility mean
+    float* d_result_h_mean;    // [1] Log-vol mean
     
     // Configuration
     int n_particles;
@@ -95,6 +122,10 @@ typedef struct {
     
     // Pre-computed Student-t constant
     float student_t_const;
+    
+    // State for seeded stepping (CRN reproducibility)
+    int timestep;           // Current timestep (reset in initialize)
+    float y_prev;           // Previous observation (for leverage effect)
     
     // Stream for async execution
     cudaStream_t stream;

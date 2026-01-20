@@ -63,7 +63,7 @@ int test_basic_functionality() {
     printf("✓ Created SVPF state (N=%d, Stein steps=%d)\n", 512, 5);
     
     // Initialize
-    SVPFParams params = {0.95f, 0.20f, -5.0f};
+    SVPFParams params = {0.95f, 0.20f, -5.0f, 0.0f};  // rho, sigma_z, mu, gamma (no leverage)
     svpf_initialize(state, &params, 42);
     printf("✓ Initialized particles\n");
     
@@ -137,7 +137,7 @@ int test_volatility_tracking() {
     
     // Create and run filter
     SVPFState* state = svpf_create(512, 5, 5.0f, NULL);
-    SVPFParams params = {true_rho, true_sigma, true_mu};
+    SVPFParams params = {true_rho, true_sigma, true_mu, 0.0f};  // No leverage for basic test
     svpf_initialize(state, &params, 123);
     
     float* vol_est = (float*)malloc(T * sizeof(float));
@@ -212,7 +212,7 @@ void benchmark() {
         int N = particle_counts[c];
         
         SVPFState* state = svpf_create(N, 5, 5.0f, NULL);
-        SVPFParams params = {0.95f, 0.20f, -5.0f};
+        SVPFParams params = {0.95f, 0.20f, -5.0f, 0.0f};
         SVPFResult result;
         
         // Warmup
@@ -265,8 +265,8 @@ int test_crn() {
     SVPFState* state1 = svpf_create(256, 3, 5.0f, NULL);
     SVPFState* state2 = svpf_create(256, 3, 5.0f, NULL);
     
-    SVPFParams params1 = {0.95f, 0.20f, -5.0f};
-    SVPFParams params2 = {0.96f, 0.21f, -5.1f};  // Slightly perturbed
+    SVPFParams params1 = {0.95f, 0.20f, -5.0f, 0.0f};
+    SVPFParams params2 = {0.96f, 0.21f, -5.1f, 0.0f};  // Slightly perturbed
     
     // Initialize both with same seed
     svpf_initialize(state1, &params1, 42);

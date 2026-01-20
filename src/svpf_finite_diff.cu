@@ -154,6 +154,7 @@ float svpf_finite_diff_gradient(SVPFFiniteDiff* fd, const float* observations, i
     for (int i = 0; i < 6; i++) {
         unconstrained_to_constrained(perturbed[i][0], perturbed[i][1], perturbed[i][2],
                                       &params[i].rho, &params[i].sigma_z, &params[i].mu);
+        params[i].gamma = 0.0f;  // Leverage not learned via finite diff (yet)
         svpf_initialize(fd->filters[i], &params[i], fd->base_seed);
     }
     
