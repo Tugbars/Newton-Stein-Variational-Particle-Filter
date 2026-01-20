@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include <time.h>
+#include <chrono>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -304,11 +305,11 @@ void benchmark_comparison() {
             svpf_initialize(state, &params, 42 + run);
             cudaDeviceSynchronize();
             
-            cudaEventRecord(start);
+            cudaEventRecord(start, 0);  // Explicit stream 0
             for (int t = 0; t < T; t++) {
                 svpf_step(state, y[t], &params, &result);
             }
-            cudaEventRecord(stop);
+            cudaEventRecord(stop, 0);
             cudaEventSynchronize(stop);
             
             float ms = 0;
@@ -326,9 +327,9 @@ void benchmark_comparison() {
             svpf_initialize(state, &params, 42 + run);
             cudaDeviceSynchronize();
             
-            cudaEventRecord(start);
+            cudaEventRecord(start, 0);  // Explicit stream 0
             svpf_run_sequence_optimized(state, d_y, T, &params, d_loglik, d_vol);
-            cudaEventRecord(stop);
+            cudaEventRecord(stop, 0);
             cudaEventSynchronize(stop);
             
             float ms = 0;
@@ -338,8 +339,9 @@ void benchmark_comparison() {
         float avg_optimized_ms = total_optimized / n_runs;
         
         // --- CUDA Graph API ---
-        // First call captures graph (warmup)
+        // First call captures graph (warmup) - NO events around this
         svpf_initialize(state, &params, 42);
+        cudaDeviceSynchronize();  // Make sure everything is done
         svpf_run_sequence_graph(state, d_y, T, &params, d_loglik, d_vol);
         
         // Verify output is valid
@@ -349,18 +351,19 @@ void benchmark_comparison() {
             printf("WARNING: Graph output invalid (loglik=%f)\n", first_loglik);
         }
         
+        // For graph timing, use chrono since the graph manages its own stream
+        // and events on the default stream might interfere
         float total_graph = 0.0f;
         for (int run = 0; run < n_runs; run++) {
             svpf_initialize(state, &params, 42 + run);
-            cudaDeviceSynchronize();
+            cudaDeviceSynchronize();  // Ensure clean state
             
-            cudaEventRecord(start);
+            auto t1 = std::chrono::high_resolution_clock::now();
             svpf_run_sequence_graph(state, d_y, T, &params, d_loglik, d_vol);
-            cudaEventRecord(stop);
-            cudaEventSynchronize(stop);
+            // svpf_run_sequence_graph already calls cudaStreamSynchronize internally
+            auto t2 = std::chrono::high_resolution_clock::now();
             
-            float ms = 0;
-            cudaEventElapsedTime(&ms, start, stop);
+            float ms = std::chrono::duration<float, std::milli>(t2 - t1).count();
             total_graph += ms;
         }
         float avg_graph_ms = total_graph / n_runs;
@@ -411,10 +414,6 @@ void benchmark_scaling() {
     cudaMalloc(&d_vol, T * sizeof(float));
     cudaMemcpy(d_y, y, T * sizeof(float), cudaMemcpyHostToDevice);
     
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-    
     printf("T=%d, CUDA Graph API\n\n", T);
     printf("%-8s %-12s %-15s %-12s %-15s\n",
            "N", "Time(ms)", "Per-step(μs)", "Steps/sec", "O(N²) ops/step");
@@ -431,6 +430,7 @@ void benchmark_scaling() {
         
         // Warmup (captures graph)
         svpf_initialize(state, &params, 42);
+        cudaDeviceSynchronize();
         svpf_run_sequence_graph(state, d_y, T, &params, d_loglik, d_vol);
         
         float total_time = 0.0f;
@@ -438,13 +438,11 @@ void benchmark_scaling() {
             svpf_initialize(state, &params, 42 + run);
             cudaDeviceSynchronize();
             
-            cudaEventRecord(start);
+            auto t1 = std::chrono::high_resolution_clock::now();
             svpf_run_sequence_graph(state, d_y, T, &params, d_loglik, d_vol);
-            cudaEventRecord(stop);
-            cudaEventSynchronize(stop);
+            auto t2 = std::chrono::high_resolution_clock::now();
             
-            float ms = 0;
-            cudaEventElapsedTime(&ms, start, stop);
+            float ms = std::chrono::duration<float, std::milli>(t2 - t1).count();
             total_time += ms;
         }
         float avg_ms = total_time / n_runs;
@@ -457,8 +455,6 @@ void benchmark_scaling() {
         svpf_optimized_cleanup();
     }
     
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
     cudaFree(d_y);
     cudaFree(d_loglik);
     cudaFree(d_vol);

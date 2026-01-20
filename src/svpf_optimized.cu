@@ -587,12 +587,16 @@ struct SVPFOptimizedState {
     float* d_vol_staging;      // Volatility output staging
     int staging_T;             // Current staging buffer size
     
+    // Dedicated stream for graph capture (NULL/default stream doesn't work)
+    cudaStream_t graph_stream;
+    bool owns_stream;          // True if we created the stream
+    
     // CUDA Graph (captured once, replayed T times)
     cudaGraph_t graph;
     cudaGraphExec_t graphExec;
     bool graph_captured;
-    int graph_n;  // N for which graph was captured
-    int graph_T;  // T for which graph was captured
+    int graph_n;       // N for which graph was captured
+    int graph_T;       // n_stein for which graph was captured (for invalidation)
     
     bool initialized;
 };
@@ -641,6 +645,17 @@ void svpf_optimized_init(int n) {
     cudaMalloc(&g_opt.d_vol_staging, MAX_T_SIZE * sizeof(float));
     g_opt.staging_T = MAX_T_SIZE;
     
+    // Create dedicated stream for graph capture with non-blocking flag
+    // (avoids implicit sync with default stream)
+    cudaError_t streamErr = cudaStreamCreateWithFlags(&g_opt.graph_stream, cudaStreamNonBlocking);
+    if (streamErr != cudaSuccess) {
+        fprintf(stderr, "ERROR: Failed to create graph_stream: %s\n", cudaGetErrorString(streamErr));
+        g_opt.graph_stream = NULL;
+    } else {
+        printf("  [Created graph_stream successfully]\n");
+    }
+    g_opt.owns_stream = true;
+    
     // Graph not yet captured
     g_opt.graph_captured = false;
     g_opt.graph_n = 0;
@@ -663,6 +678,12 @@ void svpf_optimized_cleanup(void) {
     cudaFree(g_opt.d_obs_staging);
     cudaFree(g_opt.d_loglik_staging);
     cudaFree(g_opt.d_vol_staging);
+    
+    // Destroy dedicated stream
+    if (g_opt.owns_stream && g_opt.graph_stream) {
+        cudaStreamDestroy(g_opt.graph_stream);
+        g_opt.graph_stream = NULL;
+    }
     
     // Destroy CUDA Graph if captured
     if (g_opt.graph_captured) {
@@ -827,14 +848,16 @@ void svpf_run_sequence_optimized(
 // =============================================================================
 
 /**
- * Captures one timestep as a CUDA Graph, then replays it T times.
- * Kernels read timestep from device memory (d_timestep), which gets
- * incremented at the end of each iteration.
+ * CUDA Graph-accelerated sequence runner.
  * 
- * IMPORTANT: Uses staging buffers so the graph captures fixed addresses.
- * User data is copied to/from staging buffers before/after execution.
+ * Captures one timestep as a graph, then replays T times.
+ * Uses staging buffers so graph captures fixed addresses.
  * 
- * Expected: ~5-10μs per step vs ~65μs for non-graph version
+ * Key fixes:
+ * - Passthrough: If stream is already capturing, fall back to optimized path
+ * - Strict sync before capture
+ * - Check n_stein in invalidation
+ * - Emergency fallback on capture failure
  */
 void svpf_run_sequence_graph(
     SVPFState* state,
@@ -846,30 +869,60 @@ void svpf_run_sequence_graph(
 ) {
     int n = state->n_particles;
     int n_stein = state->n_stein_steps;
-    cudaStream_t stream = state->stream;
     
     // Sanity check T
     if (T > MAX_T_SIZE) {
-        fprintf(stderr, "Error: T=%d exceeds MAX_T_SIZE=%d\n", T, MAX_T_SIZE);
+        fprintf(stderr, "Error: T=%d exceeds MAX_T_SIZE=%d, falling back\n", T, MAX_T_SIZE);
+        svpf_run_sequence_optimized(state, d_observations, T, params, d_loglik_out, d_vol_out);
         return;
     }
     
     svpf_optimized_init(n);
     
-    // Check stream capture status and abort if stuck
-    cudaStreamCaptureStatus captureStatus;
-    cudaStreamIsCapturing(stream, &captureStatus);
-    if (captureStatus == cudaStreamCaptureStatusActive) {
-        // Stream stuck in capture mode - abort it
-        cudaGraph_t dummyGraph;
-        cudaStreamEndCapture(stream, &dummyGraph);
-        if (dummyGraph) cudaGraphDestroy(dummyGraph);
-        fprintf(stderr, "Warning: Aborted stuck stream capture\n");
+    // Use dedicated graph stream (default/NULL stream doesn't support graph capture)
+    cudaStream_t stream = g_opt.graph_stream;
+    
+    // DEBUG: Check if stream is valid
+    if (stream == NULL) {
+        fprintf(stderr, "ERROR: graph_stream is NULL!\n");
+        svpf_run_sequence_optimized(state, d_observations, T, params, d_loglik_out, d_vol_out);
+        return;
     }
     
-    // Copy observations to staging buffer (fixed address for graph)
+    // Sync with state's stream to ensure particle arrays are ready
+    // (in case previous operations were on a different stream)
+    if (state->stream != stream) {
+        cudaStreamSynchronize(state->stream);
+    }
+    
+    // === PASSTHROUGH CHECK ===
+    // If the stream is already capturing (shouldn't happen with dedicated stream), fall back
+    cudaStreamCaptureStatus captureStatus;
+    cudaError_t queryErr = cudaStreamIsCapturing(stream, &captureStatus);
+    
+    if (queryErr != cudaSuccess) {
+        fprintf(stderr, "ERROR: cudaStreamIsCapturing failed: %s\n", cudaGetErrorString(queryErr));
+        svpf_run_sequence_optimized(state, d_observations, T, params, d_loglik_out, d_vol_out);
+        return;
+    }
+    
+    if (captureStatus != cudaStreamCaptureStatusNone) {
+        // Stream is already capturing - fall back to optimized path
+        printf("  [Graph: stream busy (status=%d), using optimized fallback]\n", (int)captureStatus);
+        svpf_run_sequence_optimized(state, d_observations, T, params, d_loglik_out, d_vol_out);
+        return;
+    }
+    
+    // === STAGING SETUP ===
+    // Copy observations to fixed staging address that graph will use
     cudaMemcpyAsync(g_opt.d_obs_staging, d_observations, T * sizeof(float), 
                     cudaMemcpyDeviceToDevice, stream);
+    
+    // Reset counters
+    int zero = 0;
+    float zero_f = 0.0f;
+    cudaMemcpyAsync(g_opt.d_timestep, &zero, sizeof(int), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(g_opt.d_bandwidth_sq, &zero_f, sizeof(float), cudaMemcpyHostToDevice, stream);
     
     // Pre-compute constant
     float student_t_const = lgammaf((state->nu + 1.0f) / 2.0f)
@@ -902,41 +955,48 @@ void svpf_run_sequence_graph(
     
     float bw_alpha = 0.3f;
     
-    // Reset timestep counter (synchronous, before capture)
-    int zero = 0;
-    cudaMemcpy(g_opt.d_timestep, &zero, sizeof(int), cudaMemcpyHostToDevice);
-    
-    // Reset bandwidth for fresh start
-    float zero_f = 0.0f;
-    cudaMemcpy(g_opt.d_bandwidth_sq, &zero_f, sizeof(float), cudaMemcpyHostToDevice);
-    
-    // Sync before capture
-    cudaStreamSynchronize(stream);
-    
-    // Check if we need to capture a new graph
-    bool need_capture = !g_opt.graph_captured || (g_opt.graph_n != n);
+    // === GRAPH CAPTURE LOGIC ===
+    // Invalidation: Check n AND n_stein
+    bool need_capture = !g_opt.graph_captured || 
+                        (g_opt.graph_n != n) || 
+                        (g_opt.graph_T != n_stein);  // Reuse graph_T for n_stein tracking
     
     if (need_capture) {
-        // Destroy old graph if exists
+        // Cleanup old graph
         if (g_opt.graph_captured) {
             cudaGraphExecDestroy(g_opt.graphExec);
             cudaGraphDestroy(g_opt.graph);
             g_opt.graph_captured = false;
         }
         
-        // Begin stream capture
-        cudaError_t err = cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
-        if (err != cudaSuccess) {
-            fprintf(stderr, "Graph capture begin failed: %s\n", cudaGetErrorString(err));
+        // STRICT SYNC: Stream must be completely idle before capture
+        cudaStreamSynchronize(stream);
+        
+        // Double-check capture status after sync
+        cudaStreamIsCapturing(stream, &captureStatus);
+        if (captureStatus != cudaStreamCaptureStatusNone) {
+            fprintf(stderr, "ERROR: Stream still capturing after sync! status=%d\n", (int)captureStatus);
+            svpf_run_sequence_optimized(state, d_observations, T, params, d_loglik_out, d_vol_out);
             return;
         }
         
-        // === Capture one timestep using STAGING BUFFERS ===
+        // Begin capture
+        cudaError_t err = cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "Graph capture begin failed: %s, falling back\n", cudaGetErrorString(err));
+            // Check what went wrong
+            cudaStreamIsCapturing(stream, &captureStatus);
+            fprintf(stderr, "  After failed begin, capture status=%d\n", (int)captureStatus);
+            svpf_run_sequence_optimized(state, d_observations, T, params, d_loglik_out, d_vol_out);
+            return;
+        }
         
-        // 1. Predict - use staging buffer for observations
+        // === KERNEL RECORDING START ===
+        
+        // 1. Predict - use staging buffer
         svpf_predict_kernel_graph<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
             state->h, state->h_prev, state->rng_states,
-            g_opt.d_obs_staging, g_opt.d_timestep,  // Use staging buffer!
+            g_opt.d_obs_staging, g_opt.d_timestep,
             params->rho, params->sigma_z, params->mu, params->gamma,
             n
         );
@@ -944,18 +1004,18 @@ void svpf_run_sequence_graph(
         // 2. Likelihood + Gradient - use staging buffer
         svpf_likelihood_grad_kernel_graph<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
             state->h, state->h_prev, state->grad_log_p, state->log_weights,
-            g_opt.d_obs_staging, g_opt.d_timestep,  // Use staging buffer!
+            g_opt.d_obs_staging, g_opt.d_timestep,
             params->rho, params->sigma_z, params->mu, state->nu, student_t_const,
             n
         );
         
-        // 3. Log-Sum-Exp - output to staging buffer
+        // 3. Log-Sum-Exp - output to staging
         svpf_logsumexp_kernel_graph<<<1, BLOCK_SIZE, 0, stream>>>(
             state->log_weights, g_opt.d_loglik_staging, g_opt.d_max_log_w, 
-            g_opt.d_timestep, n  // Output to staging!
+            g_opt.d_timestep, n
         );
         
-        // 4. Bandwidth (run every step in graph - simpler than conditional)
+        // 4. Bandwidth
         svpf_bandwidth_kernel<<<1, BLOCK_SIZE, 0, stream>>>(
             state->h, g_opt.d_bandwidth, g_opt.d_bandwidth_sq, bw_alpha, n
         );
@@ -984,59 +1044,66 @@ void svpf_run_sequence_graph(
             if (s < n_stein - 1) {
                 svpf_likelihood_grad_kernel_graph<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
                     state->h, state->h_prev, state->grad_log_p, state->log_weights,
-                    g_opt.d_obs_staging, g_opt.d_timestep,  // Use staging buffer!
+                    g_opt.d_obs_staging, g_opt.d_timestep,
                     params->rho, params->sigma_z, params->mu, state->nu, student_t_const,
                     n
                 );
             }
         }
         
-        // 6. Volatility mean - output to staging buffer
+        // 6. Volatility mean - output to staging
         svpf_vol_mean_opt_kernel_graph<<<1, BLOCK_SIZE, 0, stream>>>(
-            state->h, g_opt.d_vol_staging, g_opt.d_timestep, n  // Output to staging!
+            state->h, g_opt.d_vol_staging, g_opt.d_timestep, n
         );
         
         // 7. Increment timestep counter
         svpf_increment_timestep_kernel<<<1, 1, 0, stream>>>(g_opt.d_timestep);
         
+        // === KERNEL RECORDING END ===
+        
         // End capture
         err = cudaStreamEndCapture(stream, &g_opt.graph);
         if (err != cudaSuccess) {
-            fprintf(stderr, "Graph capture end failed: %s\n", cudaGetErrorString(err));
+            fprintf(stderr, "Graph capture end failed: %s, falling back\n", cudaGetErrorString(err));
             g_opt.graph = NULL;
+            svpf_run_sequence_optimized(state, d_observations, T, params, d_loglik_out, d_vol_out);
             return;
         }
         
-        // Check graph node count
+        // Validation: Verify we captured something
         size_t numNodes = 0;
         cudaGraphGetNodes(g_opt.graph, NULL, &numNodes);
-        printf("  [Graph captured: %zu nodes for N=%d]\n", numNodes, n);
+        printf("  [Graph captured: %zu nodes for N=%d, stein=%d]\n", numNodes, n, n_stein);
         
-        if (numNodes == 0) {
-            fprintf(stderr, "WARNING: Graph has 0 nodes!\n");
+        if (numNodes < 5) {
+            fprintf(stderr, "WARNING: Graph has only %zu nodes - likely broken!\n", numNodes);
             cudaGraphDestroy(g_opt.graph);
             g_opt.graph = NULL;
+            svpf_run_sequence_optimized(state, d_observations, T, params, d_loglik_out, d_vol_out);
             return;
         }
         
         err = cudaGraphInstantiate(&g_opt.graphExec, g_opt.graph, NULL, NULL, 0);
         if (err != cudaSuccess) {
-            fprintf(stderr, "Graph instantiate failed: %s\n", cudaGetErrorString(err));
+            fprintf(stderr, "Graph instantiate failed: %s, falling back\n", cudaGetErrorString(err));
             cudaGraphDestroy(g_opt.graph);
             g_opt.graph = NULL;
+            svpf_run_sequence_optimized(state, d_observations, T, params, d_loglik_out, d_vol_out);
             return;
         }
         
         g_opt.graph_captured = true;
         g_opt.graph_n = n;
+        g_opt.graph_T = n_stein;  // Track n_stein for invalidation
     }
+    // Note: d_timestep already reset above via cudaMemcpyAsync
     
-    // Launch graph T times
+    // === LAUNCH ===
     for (int t = 0; t < T; t++) {
         cudaGraphLaunch(g_opt.graphExec, stream);
     }
     
-    // Copy outputs from staging buffers to user buffers
+    // === COPY OUTPUTS ===
     cudaMemcpyAsync(d_loglik_out, g_opt.d_loglik_staging, T * sizeof(float),
                     cudaMemcpyDeviceToDevice, stream);
     if (d_vol_out) {
