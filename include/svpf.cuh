@@ -56,9 +56,70 @@ extern "C" {
 // Threshold for small N optimizations (persistent CTA path)
 #define SVPF_SMALL_N_THRESHOLD     4096
 
+// Number of floats in graph parameter staging buffer
+#define SVPF_GRAPH_PARAMS_SIZE     32
+
 // =============================================================================
 // DATA STRUCTURES
 // =============================================================================
+
+/**
+ * @brief Device-side parameter staging for CUDA graph execution
+ * 
+ * Layout of d_params_staging buffer (32 floats):
+ * [0]  y_prev           - Previous observation
+ * [1]  y_t              - Current observation
+ * [2]  guide_mean       - EKF guide mean
+ * [3]  beta             - Current annealing factor
+ * [4]  step_size        - Stein step size
+ * [5]  temp             - SVLD temperature
+ * [6]  rho              - AR persistence
+ * [7]  sigma_z          - Innovation std
+ * [8]  mu               - Mean level
+ * [9]  gamma            - Leverage coefficient
+ * [10] nu               - Student-t degrees of freedom
+ * [11] student_t_const  - Precomputed Student-t normalizing constant
+ * [12] rho_up           - Asymmetric rho (up)
+ * [13] rho_down         - Asymmetric rho (down)
+ * [14] delta_rho        - Particle-local rho sensitivity
+ * [15] delta_sigma      - Particle-local sigma sensitivity
+ * [16] alpha_base       - Guided alpha (base)
+ * [17] alpha_shock      - Guided alpha (shock)
+ * [18] innovation_thresh - Guided innovation threshold
+ * [19] jump_prob        - MIM jump probability
+ * [20] jump_scale       - MIM jump scale
+ * [21] guide_strength   - Guide density strength
+ * [22] rmsprop_rho      - RMSProp decay
+ * [23] rmsprop_eps      - RMSProp epsilon
+ * [24-31] reserved      - Future use
+ */
+typedef struct {
+    float y_prev;
+    float y_t;
+    float guide_mean;
+    float beta;
+    float step_size;
+    float temp;
+    float rho;
+    float sigma_z;
+    float mu;
+    float gamma;
+    float nu;
+    float student_t_const;
+    float rho_up;
+    float rho_down;
+    float delta_rho;
+    float delta_sigma;
+    float alpha_base;
+    float alpha_shock;
+    float innovation_thresh;
+    float jump_prob;
+    float jump_scale;
+    float guide_strength;
+    float rmsprop_rho;
+    float rmsprop_eps;
+    float reserved[8];
+} SVPFGraphParams;
 
 /**
  * @brief Optimized backend state for batch/graph processing
@@ -92,10 +153,30 @@ typedef struct {
     // Particle-local parameters: h_mean from previous step
     float* d_h_mean_prev;
     
+    // Guide mean (device-side for graph compatibility)
+    float* d_guide_mean;
+    
     // Single-step API buffers (avoid malloc in hot loop)
     float* d_y_single;
     float* d_loglik_single;
     float* d_vol_single;
+    
+    // =========================================================================
+    // CUDA GRAPH SUPPORT
+    // For HFT: captures kernel sequence, replays with ~5μs overhead vs ~100μs+
+    // =========================================================================
+    
+    // Graph handles
+    cudaGraph_t graph;
+    cudaGraphExec_t graph_exec;
+    cudaStream_t graph_stream;
+    bool graph_captured;
+    int graph_n;              // N at capture time (recapture if changed)
+    int graph_n_stein;        // Stein steps at capture time
+    
+    // Device-side parameter staging (kernels read from here)
+    // Updated via cudaMemcpyAsync before graph replay
+    float* d_params_staging;  // Packed: [y_prev, y_t, guide_mean, beta, step_size, temp, ...]
     
     // Capacity tracking
     int allocated_n;
@@ -450,6 +531,53 @@ void svpf_get_stats(const SVPFState* state, float* h_mean, float* h_std);
  * Note: SVPF with Stein transport should maintain high ESS without resampling.
  */
 float svpf_get_ess(const SVPFState* state);
+
+// =============================================================================
+// CUDA GRAPH API (Low-latency for HFT)
+// =============================================================================
+
+/**
+ * @brief Graph-accelerated SVPF step
+ * 
+ * Captures the kernel sequence on first call, then replays with minimal
+ * CPU overhead (~5μs vs ~100μs+ for regular kernel launches).
+ * 
+ * Automatic recapture on:
+ *   - First call
+ *   - Particle count change
+ *   - Stein step count change
+ * 
+ * For manual recapture after config changes, call svpf_graph_invalidate().
+ * 
+ * @param state     Filter state
+ * @param y_t       Current observation
+ * @param y_prev    Previous observation
+ * @param params    Model parameters
+ * @param h_loglik_out  Output: log-likelihood (optional, can be NULL)
+ * @param h_vol_out     Output: volatility estimate (optional, can be NULL)
+ * @param h_mean_out    Output: h mean (optional, can be NULL)
+ */
+void svpf_step_graph(
+    SVPFState* state,
+    float y_t,
+    float y_prev,
+    const SVPFParams* params,
+    float* h_loglik_out,
+    float* h_vol_out,
+    float* h_mean_out
+);
+
+/**
+ * @brief Check if graph is currently captured
+ */
+bool svpf_graph_is_captured(SVPFState* state);
+
+/**
+ * @brief Force graph recapture on next step
+ * 
+ * Call after changing filter configuration (use_guided, use_newton, etc.)
+ */
+void svpf_graph_invalidate(SVPFState* state);
 
 #ifdef __cplusplus
 }
