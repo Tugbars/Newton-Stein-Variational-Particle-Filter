@@ -507,21 +507,31 @@ static Metrics run_svpf_on_scenario(
         filter->mim_jump_scale = 5.0f;
         
         filter->use_asymmetric_rho = 1;
-        filter->rho_up = 0.98f;
-        filter->rho_down = 0.92f;
+        filter->rho_up = 0.99f;
+        filter->rho_down = 0.91f;
         
         // Particle-local parameters
         // Key insight: DGP has θ(z), σ(z) — params depend on latent z
         // We use h deviation as proxy: high h → likely high z → different dynamics
         filter->use_local_params = 1;
-        filter->delta_rho = 0.05f;    // ±2% rho variation based on h deviation
-        filter->delta_sigma = 0.15f;   // ±10% sigma variation
+        filter->delta_rho = 0.02f;    // ±2% rho variation based on h deviation
+        filter->delta_sigma = 0.1f;   // ±10% sigma variation
         
         // Newton-Stein (Hessian preconditioning)
         // Adaptive step size based on local curvature: H^{-1} * grad
         filter->use_newton = 1;
         
+        // Guided Prediction with INNOVATION GATING (FIXED)
+        // - Bottom clamp prevents zero-return trap (log(0) → -inf)
+        // - Asymmetric gating only activates on UPWARD shocks (spikes)
+        filter->use_guided = 1;
+        filter->guided_alpha_base = 0.0f;             // 0% when model fits
+        filter->guided_alpha_shock = 0.5f;            // 50% when model fails
+        filter->guided_innovation_threshold = 1.5f;   // 1.5σ = "surprised"
+        
+        // EKF Guide density
         filter->use_guide = 1;
+        filter->use_guide_preserving = 1;  // Variance-preserving shift (not contraction)
         filter->guide_strength = 0.05f;
     } else {
         filter->use_svld = 0;
@@ -530,7 +540,12 @@ static Metrics run_svpf_on_scenario(
         filter->use_asymmetric_rho = 0;
         filter->use_local_params = 0;
         filter->use_newton = 0;
+        filter->use_guided = 0;
+        filter->guided_alpha_base = 0.0f;
+        filter->guided_alpha_shock = 0.0f;
+        filter->guided_innovation_threshold = 1.5f;
         filter->use_guide = 0;
+        filter->use_guide_preserving = 0;
     }
     
     /* Run filter */

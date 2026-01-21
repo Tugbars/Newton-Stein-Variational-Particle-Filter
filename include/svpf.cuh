@@ -230,8 +230,23 @@ typedef struct {
     // Benefits: adaptive step size based on local curvature
     int use_newton;         // Enable Newton-Stein (0=standard SVGD, 1=Newton)
     
+    // Guided Prediction config (Lookahead / APF-style)
+    // Standard predict is REACTIVE: scatters blindly, then corrects.
+    // Guided predict is PROACTIVE: peeks at y_t to know where to go.
+    // Proposal: h ~ N((1-α)μ_prior + α·μ_implied, σ²)
+    // where μ_implied = log(y_t²) + 1.27 (instantaneous implied vol)
+    //
+    // INNOVATION GATING: Only activate when model is SURPRISED
+    // - Model fits well: innovation low → α ≈ 0 → trust prior
+    // - Model lags: innovation high → α > 0 → use guidance
+    int use_guided;              // Enable guided predict (0=standard, 1=lookahead)
+    float guided_alpha_base;     // Alpha when model fits (e.g., 0.0 - trust prior)
+    float guided_alpha_shock;    // Alpha when model fails (e.g., 0.5 - trust observation)
+    float guided_innovation_threshold; // z-score threshold for "surprise" (e.g., 1.5)
+    
     // Guide density (EKF) config
     int use_guide;          // Enable EKF guide density
+    int use_guide_preserving; // Use variance-preserving guide (vs contraction)
     float guide_strength;   // How much to pull particles toward guide (0.1-0.3)
     float guide_mean;       // EKF posterior mean (m_t)
     float guide_var;        // EKF posterior variance (P_t)
