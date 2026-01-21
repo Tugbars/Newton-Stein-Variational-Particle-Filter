@@ -23,6 +23,29 @@
  *   6. Wrong-Model     - Fast mean-reversion (stress test)
  */
 
+/*═══════════════════════════════════════════════════════════════════════════
+ * BUILD CONFIGURATION
+ *═══════════════════════════════════════════════════════════════════════════*/
+
+/**
+ * SVPF Step Mode:
+ *   0 = svpf_step_adaptive  (Regular kernel launches, ~100-150μs CPU overhead)
+ *   1 = svpf_step_graph     (CUDA Graph replay, ~10-15μs CPU overhead)
+ *
+ * Graph mode captures the kernel sequence on first call, then replays
+ * with minimal CPU overhead. Best for HFT where latency matters.
+ */
+#define USE_CUDA_GRAPH 1
+
+/**
+ * Latency Benchmarking:
+ *   0 = Disabled (only total time reported)
+ *   1 = Enabled  (per-step latency histogram + percentiles)
+ */
+#define BENCHMARK_LATENCY 0
+
+/*═══════════════════════════════════════════════════════════════════════════*/
+
 #include "svpf.cuh"
 #include <stdio.h>
 #include <stdlib.h>
@@ -48,6 +71,19 @@ static double get_time_us(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec * 1e6 + (double)ts.tv_nsec / 1000.0;
+}
+#endif
+
+/*═══════════════════════════════════════════════════════════════════════════
+ * LATENCY BENCHMARK HELPERS
+ *═══════════════════════════════════════════════════════════════════════════*/
+
+#if BENCHMARK_LATENCY
+// Comparison function for qsort (latency percentiles)
+int compare_double_for_qsort(const void* a, const void* b) {
+    double da = *(const double*)a;
+    double db = *(const double*)b;
+    return (da > db) - (da < db);
 }
 #endif
 
@@ -551,13 +587,28 @@ static Metrics run_svpf_on_scenario(
     /* Run filter */
     double t_start = get_time_us();
     
+#if BENCHMARK_LATENCY
+    double* step_latencies = (double*)malloc(n * sizeof(double));
+#endif
+    
     float y_prev = 0.0f;
     for (int t = 0; t < n; t++) {
         float y_t = h_returns[t];
         
+#if BENCHMARK_LATENCY
+        double step_start = get_time_us();
+#endif
+        
         if (use_adaptive) {
+#if USE_CUDA_GRAPH
+            // CUDA Graph mode: captures on first call, replays thereafter
+            svpf_step_graph(filter, y_t, y_prev, &params,
+                           &h_loglik[t], &h_vol[t], &h_logvol[t]);
+#else
+            // Regular mode: launches kernels directly each step
             svpf_step_adaptive(filter, y_t, y_prev, &params,
                               &h_loglik[t], &h_vol[t], &h_logvol[t]);
+#endif
         } else {
             SVPFResult result;
             svpf_step(filter, y_t, &params, &result);
@@ -566,11 +617,34 @@ static Metrics run_svpf_on_scenario(
             h_logvol[t] = result.h_mean;
         }
         
+#if BENCHMARK_LATENCY
+        step_latencies[t] = get_time_us() - step_start;
+#endif
+        
         y_prev = y_t;
     }
     
     double t_end = get_time_us();
     *elapsed_ms_out = (t_end - t_start) / 1000.0;
+    
+#if BENCHMARK_LATENCY
+    // Skip warmup (first 100 steps) for percentile calculation
+    int warmup = 100;
+    int effective_n = n - warmup;
+    double* sorted_latencies = step_latencies + warmup;
+    
+    qsort(sorted_latencies, effective_n, sizeof(double), compare_double_for_qsort);
+    
+    double p50 = sorted_latencies[effective_n / 2];
+    double p90 = sorted_latencies[(int)(effective_n * 0.90)];
+    double p99 = sorted_latencies[(int)(effective_n * 0.99)];
+    double p999 = sorted_latencies[(int)(effective_n * 0.999)];
+    
+    printf("  Latency (μs): P50=%.1f, P90=%.1f, P99=%.1f, P99.9=%.1f\n",
+           p50, p90, p99, p999);
+    
+    free(step_latencies);
+#endif
     
     /* Compute metrics */
     Metrics m = compute_metrics(data, h_logvol);
@@ -626,6 +700,14 @@ int main(int argc, char** argv) {
     printf("  Stein steps: %d\n", n_stein);
     printf("  Student-t ν: %.1f\n", nu);
     printf("  Mode:        %s\n", use_adaptive ? "ADAPTIVE" : "VANILLA");
+#if USE_CUDA_GRAPH
+    printf("  Execution:   CUDA GRAPH (low-latency)\n");
+#else
+    printf("  Execution:   STANDARD (kernel launches)\n");
+#endif
+#if BENCHMARK_LATENCY
+    printf("  Latency:     BENCHMARKING ENABLED\n");
+#endif
     printf("\n");
     
     printf("DGP: HCRBPF's z → SV parameter mapping\n");

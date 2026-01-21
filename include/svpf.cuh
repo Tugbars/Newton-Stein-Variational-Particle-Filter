@@ -547,12 +547,17 @@ float svpf_get_ess(const SVPFState* state);
  *   - Particle count change
  *   - Stein step count change
  * 
- * For manual recapture after config changes, call svpf_graph_invalidate().
+ * IMPORTANT: Model parameters (rho, sigma_z, mu, gamma) are "burned in" at
+ * capture time. If you change SVPFParams, you MUST call svpf_graph_invalidate()
+ * before the next step, or the graph will run with stale parameters!
+ * 
+ * Filter configuration flags (use_guided, use_newton, etc.) are also burned in.
+ * Call svpf_graph_invalidate() after changing any configuration.
  * 
  * @param state     Filter state
- * @param y_t       Current observation
- * @param y_prev    Previous observation
- * @param params    Model parameters
+ * @param y_t       Current observation (staged to device before graph launch)
+ * @param y_prev    Previous observation (staged to device before graph launch)
+ * @param params    Model parameters (BURNED IN at capture - invalidate if changed!)
  * @param h_loglik_out  Output: log-likelihood (optional, can be NULL)
  * @param h_vol_out     Output: volatility estimate (optional, can be NULL)
  * @param h_mean_out    Output: h mean (optional, can be NULL)
@@ -575,7 +580,12 @@ bool svpf_graph_is_captured(SVPFState* state);
 /**
  * @brief Force graph recapture on next step
  * 
- * Call after changing filter configuration (use_guided, use_newton, etc.)
+ * Call after changing:
+ *   - SVPFParams (rho, sigma_z, mu, gamma)
+ *   - Filter configuration (use_guided, use_newton, use_mim, etc.)
+ *   - Any other filter settings
+ * 
+ * The next svpf_step_graph() call will recapture with new parameters.
  */
 void svpf_graph_invalidate(SVPFState* state);
 

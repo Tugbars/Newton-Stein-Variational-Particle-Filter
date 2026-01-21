@@ -1253,6 +1253,69 @@ __global__ void svpf_adaptive_bandwidth_kernel(
     }
 }
 
+// Graph-compatible version: reads y_t from device pointer (not burned-in scalar)
+__global__ void svpf_adaptive_bandwidth_kernel_graph(
+    const float* __restrict__ h,
+    float* __restrict__ d_bandwidth,
+    float* __restrict__ d_return_ema,
+    float* __restrict__ d_return_var,
+    const float* __restrict__ d_y,    // Device pointer to y array
+    int y_idx,                         // Index to read (usually 1 for y_t)
+    float ema_alpha,
+    int n
+) {
+    // Compute particle spread (single block)
+    float local_min = 1e10f, local_max = -1e10f;
+    float local_sum = 0.0f;
+    
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float val = h[i];
+        local_min = fminf(local_min, val);
+        local_max = fmaxf(local_max, val);
+        local_sum += val;
+    }
+    
+    // Reduce to get min/max/mean
+    local_min = block_reduce_min(local_min);
+    __syncthreads();
+    local_max = block_reduce_max(local_max);
+    __syncthreads();
+    local_sum = block_reduce_sum(local_sum);
+    
+    if (threadIdx.x == 0) {
+        float spread = local_max - local_min;
+        
+        // READ y_t FROM DEVICE POINTER (not burned-in scalar!)
+        float new_return = d_y[y_idx];
+        
+        // Update return EMA for regime detection
+        float abs_ret = fabsf(new_return);
+        float ret_ema = *d_return_ema;
+        float ret_var = *d_return_var;
+        
+        ret_ema = (ret_ema > 0.0f) 
+                ? ema_alpha * abs_ret + (1.0f - ema_alpha) * ret_ema 
+                : abs_ret;
+        ret_var = (ret_var > 0.0f)
+                ? ema_alpha * abs_ret * abs_ret + (1.0f - ema_alpha) * ret_var
+                : abs_ret * abs_ret;
+        
+        *d_return_ema = ret_ema;
+        *d_return_var = ret_var;
+        
+        // Compute adaptive alpha based on regime
+        float vol_ratio = abs_ret / fmaxf(ret_ema, 1e-8f);
+        float spread_factor = fminf(spread / 2.0f, 2.0f);
+        float combined_signal = fmaxf(vol_ratio, spread_factor);
+        
+        float alpha = 1.0f - 0.25f * fminf(combined_signal - 1.0f, 2.0f);
+        alpha = fmaxf(fminf(alpha, 1.0f), 0.5f);
+        
+        float bw = *d_bandwidth;
+        *d_bandwidth = bw * alpha;
+    }
+}
+
 // =============================================================================
 // Kernel 7: Volatility Mean
 // =============================================================================
@@ -1992,10 +2055,13 @@ static void svpf_graph_capture_internal(
         state->h, opt->d_bandwidth, opt->d_bandwidth_sq, 0.3f, n
     );
     
-    svpf_adaptive_bandwidth_kernel<<<1, BLOCK_SIZE, 0, capture_stream>>>(
+    // Use GRAPH-COMPATIBLE version that reads y_t from device pointer
+    // (scalar params are "burned in" at capture time, so we must read from ptr)
+    svpf_adaptive_bandwidth_kernel_graph<<<1, BLOCK_SIZE, 0, capture_stream>>>(
         state->h, opt->d_bandwidth,
         state->d_return_ema, state->d_return_var,
-        0.0f,  // y_t placeholder - kernel reads y from staged d_y_single
+        opt->d_y_single,  // Device pointer (staged before graph launch)
+        1,                 // Index: y_t is at index 1
         0.05f, n
     );
     
