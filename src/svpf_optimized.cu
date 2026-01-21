@@ -262,17 +262,22 @@ __global__ void svpf_likelihood_grad_kernel(
     float h_prev_i = h_prev[i];
     float y_t = d_y[t];
     
-    // Likelihood (Student-t)
+    // WEIGHTS: Exact Student-t (unbiased IS)
     float vol = safe_exp(h_i);
     float scaled_y_sq = (y_t * y_t) / (vol + 1e-8f);
     log_w[i] = student_t_const - 0.5f * h_i
              - (nu + 1.0f) / 2.0f * log1pf(fmaxf(scaled_y_sq / nu, -0.999f));
     
-    // Gradient
+    // GRADIENT: Prior (per-particle, not mixture - legacy)
     float mu_prior = mu + rho * (h_prev_i - mu);
     float sigma_z_sq = sigma_z * sigma_z + 1e-8f;
     float grad_prior = -(h_i - mu_prior) / sigma_z_sq;
-    float grad_lik = 0.5f * ((nu + 1.0f) * scaled_y_sq / (nu + scaled_y_sq + 1e-8f) - 1.0f);
+    
+    // GRADIENT: Log-squared likelihood (linear restoring force)
+    float log_y2 = logf(y_t * y_t + 1e-10f);
+    float offset = -1.0f / nu;
+    float R_noise = 2.0f;
+    float grad_lik = (log_y2 - h_i - offset) / R_noise;
     
     grad[i] = fminf(fmaxf(grad_prior + grad_lik, -10.0f), 10.0f);
 }
@@ -296,15 +301,22 @@ __global__ void svpf_likelihood_grad_kernel_graph(
     float h_prev_i = h_prev[i];
     float y_t = d_y[t];
     
+    // WEIGHTS: Exact Student-t
     float vol = safe_exp(h_i);
     float scaled_y_sq = (y_t * y_t) / (vol + 1e-8f);
     log_w[i] = student_t_const - 0.5f * h_i
              - (nu + 1.0f) / 2.0f * log1pf(fmaxf(scaled_y_sq / nu, -0.999f));
     
+    // GRADIENT: Prior (legacy per-particle)
     float mu_prior = mu + rho * (h_prev_i - mu);
     float sigma_z_sq = sigma_z * sigma_z + 1e-8f;
     float grad_prior = -(h_i - mu_prior) / sigma_z_sq;
-    float grad_lik = 0.5f * ((nu + 1.0f) * scaled_y_sq / (nu + scaled_y_sq + 1e-8f) - 1.0f);
+    
+    // GRADIENT: Log-squared likelihood
+    float log_y2 = logf(y_t * y_t + 1e-10f);
+    float offset = -1.0f / nu;
+    float R_noise = 2.0f;
+    float grad_lik = (log_y2 - h_i - offset) / R_noise;
     
     grad[i] = fminf(fmaxf(grad_prior + grad_lik, -10.0f), 10.0f);
 }
@@ -472,15 +484,35 @@ __global__ void svpf_likelihood_only_kernel(
     float h_i = h[i];
     float y_t = d_y[t];
     
-    // Likelihood (Student-t)
+    // =========================================================================
+    // WEIGHTS: Exact Student-t (unbiased importance sampling)
+    // =========================================================================
     float vol = safe_exp(h_i);
     float scaled_y_sq = (y_t * y_t) / (vol + 1e-8f);
     
     log_w[i] = student_t_const - 0.5f * h_i
              - (nu + 1.0f) / 2.0f * log1pf(fmaxf(scaled_y_sq / nu, -0.999f));
     
-    // Likelihood gradient only
-    grad_lik[i] = 0.5f * ((nu + 1.0f) * scaled_y_sq / (nu + scaled_y_sq + 1e-8f) - 1.0f);
+    // =========================================================================
+    // GRADIENT: Log-squared approximation (linear restoring force)
+    // =========================================================================
+    // Model: log(y²) = h + log(η²), where η ~ t_ν
+    //
+    // Student-t gradient saturates at ν/2 for large deviations ("volcano").
+    // Log-squared gradient is LINEAR - particles far away feel proportional pull.
+    //
+    // offset = E[log(η²)] for η ~ t_ν ≈ -1/ν (simple approximation)
+    // R_noise = scaling factor ≈ var(log(η²)) ≈ 2.0 for ν=5
+    //
+    // Gradient: ∂/∂h [ -(log(y²) - h - offset)² / (2*R) ] = (log(y²) - h - offset) / R
+    // =========================================================================
+    
+    float log_y2 = logf(y_t * y_t + 1e-10f);
+    float offset = -1.0f / nu;    // E[log(η²)] approximation
+    float R_noise = 2.0f;         // Observation noise variance in log space
+    
+    // Linear gradient: pulls h toward log(y²) - offset
+    grad_lik[i] = (log_y2 - h_i - offset) / R_noise;
 }
 
 // Graph version - reads timestep from device memory
@@ -501,13 +533,19 @@ __global__ void svpf_likelihood_only_kernel_graph(
     float h_i = h[i];
     float y_t = d_y[t];
     
+    // WEIGHTS: Exact Student-t (unbiased IS)
     float vol = safe_exp(h_i);
     float scaled_y_sq = (y_t * y_t) / (vol + 1e-8f);
     
     log_w[i] = student_t_const - 0.5f * h_i
              - (nu + 1.0f) / 2.0f * log1pf(fmaxf(scaled_y_sq / nu, -0.999f));
     
-    grad_lik[i] = 0.5f * ((nu + 1.0f) * scaled_y_sq / (nu + scaled_y_sq + 1e-8f) - 1.0f);
+    // GRADIENT: Log-squared (linear restoring force)
+    float log_y2 = logf(y_t * y_t + 1e-10f);
+    float offset = -1.0f / nu;
+    float R_noise = 2.0f;
+    
+    grad_lik[i] = (log_y2 - h_i - offset) / R_noise;
 }
 
 // =============================================================================
