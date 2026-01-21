@@ -517,17 +517,17 @@ int main(int argc, char** argv) {
     
     /* Mixture Innovation Model (MIM) */
     filter->use_mim = use_adaptive ? 1 : 0;
-    filter->mim_jump_prob = 0.15f;   // 5% of particles get large innovation
+    filter->mim_jump_prob = 0.25f;   // 5% of particles get large innovation
     filter->mim_jump_scale = 5.0f;   // 5x std dev for jump component
     
     /* Asymmetric persistence (vol spikes fast, decays slow) */
     filter->use_asymmetric_rho = use_adaptive ? 1 : 0;
-    filter->rho_up = 0.98f;    // Higher persistence when vol increasing
+    filter->rho_up = 0.99f;    // Higher persistence when vol increasing
     filter->rho_down = 0.91f;  // Lower persistence when vol decreasing
     
     /* EKF Guide Density (coarse positioning before Stein) */
     filter->use_guide = use_adaptive ? 1 : 0;
-    filter->guide_strength = 0.1f;  // How much to pull toward guide (0.1-0.3)
+    filter->guide_strength = 0.05f;  // How much to pull toward guide (0.1-0.3)
     
     printf("  Filter initialized.\n");
     printf("  Mode: %s\n", use_adaptive ? "SVLD + MIM + Asym-ρ + Guide" : "VANILLA SVGD");

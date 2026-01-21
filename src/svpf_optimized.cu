@@ -310,6 +310,225 @@ __global__ void svpf_likelihood_grad_kernel_graph(
 }
 
 // =============================================================================
+// Kernel 2b: Mixture Prior Gradient (O(N²) - CORRECT per paper Eq. 6)
+//
+// The paper specifies the prior as a Gaussian mixture:
+//   p(h_{t+1} | Z_t) = (1/n) * Σᵢ p(h_{t+1} | h_t^i)
+//
+// where each component is: p(h | h_prev^i) = N(μᵢ, σ_z²)
+// with μᵢ = μ + ρ(h_prev^i - μ)
+//
+// The gradient is:
+//   ∇_h log p_prior(h) = Σᵢ rᵢ(h) * (-(h - μᵢ)/σ_z²)
+//
+// where rᵢ(h) = p(h|h_prev^i) / Σⱼ p(h|h_prev^j) is the responsibility
+//
+// This replaces the WRONG per-particle prior with the CORRECT mixture prior.
+// =============================================================================
+
+// Small N version: each thread handles one particle j, loops over all i
+__global__ void svpf_mixture_prior_grad_kernel(
+    const float* __restrict__ h,           // Current particles [N]
+    const float* __restrict__ h_prev,      // Previous particles [N]
+    float* __restrict__ grad_prior,        // Output: mixture prior gradient [N]
+    float rho,
+    float sigma_z,
+    float mu,
+    int n
+) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n) return;
+    
+    float h_j = h[j];
+    float sigma_z_sq = sigma_z * sigma_z + 1e-8f;
+    float inv_2sigma_sq = 1.0f / (2.0f * sigma_z_sq);
+    
+    // First pass: find max log-responsibility for numerical stability
+    float log_r_max = -1e10f;
+    for (int i = 0; i < n; i++) {
+        float mu_i = mu + rho * (h_prev[i] - mu);
+        float diff = h_j - mu_i;
+        float log_r_i = -diff * diff * inv_2sigma_sq;
+        log_r_max = fmaxf(log_r_max, log_r_i);
+    }
+    
+    // Second pass: compute weighted gradient with log-sum-exp stability
+    float sum_r = 0.0f;
+    float weighted_grad = 0.0f;
+    
+    for (int i = 0; i < n; i++) {
+        float mu_i = mu + rho * (h_prev[i] - mu);
+        float diff = h_j - mu_i;
+        float log_r_i = -diff * diff * inv_2sigma_sq;
+        float r_i = expf(log_r_i - log_r_max);  // Numerically stable
+        
+        sum_r += r_i;
+        weighted_grad += r_i * (-diff / sigma_z_sq);
+    }
+    
+    // Normalize
+    grad_prior[j] = weighted_grad / (sum_r + 1e-8f);
+}
+
+// Tiled version for large N: uses shared memory for h_prev tiles
+__global__ void svpf_mixture_prior_grad_tiled_kernel(
+    const float* __restrict__ h,           // Current particles [N]
+    const float* __restrict__ h_prev,      // Previous particles [N]
+    float* __restrict__ grad_prior,        // Output: mixture prior gradient [N]
+    float rho,
+    float sigma_z,
+    float mu,
+    int n
+) {
+    __shared__ float sh_h_prev[TILE_J];
+    __shared__ float sh_mu_i[TILE_J];
+    
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n) return;
+    
+    float h_j = h[j];
+    float sigma_z_sq = sigma_z * sigma_z + 1e-8f;
+    float inv_2sigma_sq = 1.0f / (2.0f * sigma_z_sq);
+    
+    // First pass: find max log-responsibility across all tiles
+    float log_r_max = -1e10f;
+    
+    for (int tile = 0; tile < (n + TILE_J - 1) / TILE_J; tile++) {
+        int tile_start = tile * TILE_J;
+        int tile_end = min(tile_start + TILE_J, n);
+        int tile_size = tile_end - tile_start;
+        
+        // Cooperative load of h_prev tile
+        __syncthreads();
+        for (int k = threadIdx.x; k < tile_size; k += blockDim.x) {
+            float hp = h_prev[tile_start + k];
+            sh_h_prev[k] = hp;
+            sh_mu_i[k] = mu + rho * (hp - mu);
+        }
+        __syncthreads();
+        
+        // Find max in this tile
+        for (int i = 0; i < tile_size; i++) {
+            float diff = h_j - sh_mu_i[i];
+            float log_r_i = -diff * diff * inv_2sigma_sq;
+            log_r_max = fmaxf(log_r_max, log_r_i);
+        }
+    }
+    
+    // Second pass: compute weighted gradient
+    float sum_r = 0.0f;
+    float weighted_grad = 0.0f;
+    
+    for (int tile = 0; tile < (n + TILE_J - 1) / TILE_J; tile++) {
+        int tile_start = tile * TILE_J;
+        int tile_end = min(tile_start + TILE_J, n);
+        int tile_size = tile_end - tile_start;
+        
+        // Cooperative load (already in smem from first pass if single tile,
+        // but need to reload for multi-tile case)
+        __syncthreads();
+        for (int k = threadIdx.x; k < tile_size; k += blockDim.x) {
+            float hp = h_prev[tile_start + k];
+            sh_h_prev[k] = hp;
+            sh_mu_i[k] = mu + rho * (hp - mu);
+        }
+        __syncthreads();
+        
+        // Accumulate weighted gradient
+        for (int i = 0; i < tile_size; i++) {
+            float diff = h_j - sh_mu_i[i];
+            float log_r_i = -diff * diff * inv_2sigma_sq;
+            float r_i = expf(log_r_i - log_r_max);
+            
+            sum_r += r_i;
+            weighted_grad += r_i * (-diff / sigma_z_sq);
+        }
+    }
+    
+    // Normalize
+    grad_prior[j] = weighted_grad / (sum_r + 1e-8f);
+}
+
+// =============================================================================
+// Kernel 2c: Likelihood-Only Gradient (O(N) - just the observation term)
+//
+// Computes only the likelihood gradient, to be combined with mixture prior.
+// Also computes log_weights for importance sampling.
+// =============================================================================
+
+__global__ void svpf_likelihood_only_kernel(
+    const float* __restrict__ h,
+    float* __restrict__ grad_lik,          // Output: likelihood gradient only [N]
+    float* __restrict__ log_w,             // Output: log weights [N]
+    const float* __restrict__ d_y,         // Observations array
+    int t,                                 // Current timestep
+    float nu,
+    float student_t_const,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    
+    float h_i = h[i];
+    float y_t = d_y[t];
+    
+    // Likelihood (Student-t)
+    float vol = safe_exp(h_i);
+    float scaled_y_sq = (y_t * y_t) / (vol + 1e-8f);
+    
+    log_w[i] = student_t_const - 0.5f * h_i
+             - (nu + 1.0f) / 2.0f * log1pf(fmaxf(scaled_y_sq / nu, -0.999f));
+    
+    // Likelihood gradient only
+    grad_lik[i] = 0.5f * ((nu + 1.0f) * scaled_y_sq / (nu + scaled_y_sq + 1e-8f) - 1.0f);
+}
+
+// Graph version - reads timestep from device memory
+__global__ void svpf_likelihood_only_kernel_graph(
+    const float* __restrict__ h,
+    float* __restrict__ grad_lik,
+    float* __restrict__ log_w,
+    const float* __restrict__ d_y,
+    const int* __restrict__ d_timestep,
+    float nu,
+    float student_t_const,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    
+    int t = *d_timestep;
+    float h_i = h[i];
+    float y_t = d_y[t];
+    
+    float vol = safe_exp(h_i);
+    float scaled_y_sq = (y_t * y_t) / (vol + 1e-8f);
+    
+    log_w[i] = student_t_const - 0.5f * h_i
+             - (nu + 1.0f) / 2.0f * log1pf(fmaxf(scaled_y_sq / nu, -0.999f));
+    
+    grad_lik[i] = 0.5f * ((nu + 1.0f) * scaled_y_sq / (nu + scaled_y_sq + 1e-8f) - 1.0f);
+}
+
+// =============================================================================
+// Kernel 2d: Combine Gradients (prior + likelihood)
+// =============================================================================
+
+__global__ void svpf_combine_gradients_kernel(
+    const float* __restrict__ grad_prior,  // Mixture prior gradient [N]
+    const float* __restrict__ grad_lik,    // Likelihood gradient [N]
+    float* __restrict__ grad,              // Output: combined gradient [N]
+    float beta,                            // Annealing factor (1.0 = full likelihood)
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    
+    float g = grad_prior[i] + beta * grad_lik[i];
+    grad[i] = fminf(fmaxf(g, -10.0f), 10.0f);
+}
+
+// =============================================================================
 // Kernel 3: Log-Sum-Exp (computes loglik, all on device)
 // =============================================================================
 
@@ -912,6 +1131,7 @@ void svpf_optimized_init(SVPFOptimizedState* opt, int n) {
     // Buffers
     cudaMalloc(&opt->d_exp_w, n * sizeof(float));
     cudaMalloc(&opt->d_phi, n * sizeof(float));
+    cudaMalloc(&opt->d_grad_lik, n * sizeof(float));  // For mixture prior fix
     
     // Staging buffers for CUDA Graph
     cudaMalloc(&opt->d_obs_staging, MAX_T_SIZE * sizeof(float));
@@ -947,6 +1167,7 @@ void svpf_optimized_cleanup(SVPFOptimizedState* opt) {
     cudaFree(opt->d_timestep);
     cudaFree(opt->d_exp_w);
     cudaFree(opt->d_phi);
+    cudaFree(opt->d_grad_lik);
     cudaFree(opt->d_obs_staging);
     cudaFree(opt->d_loglik_staging);
     cudaFree(opt->d_vol_staging);
@@ -1045,15 +1266,34 @@ void svpf_run_sequence_optimized(
             n
         );
         
-        // === 2. Likelihood + Gradient ===
-        svpf_likelihood_grad_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
-            state->h, state->h_prev, state->grad_log_p, state->log_weights,
-            d_observations, t,
-            params->rho, params->sigma_z, params->mu, state->nu, student_t_const,
+        // === 2. Mixture Prior Gradient (O(N²) - CORRECT per paper Eq. 6) ===
+        // This is the key fix: prior is a Gaussian mixture over ALL h_prev particles
+        if (n <= SMALL_N_THRESHOLD) {
+            svpf_mixture_prior_grad_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
+                state->h, state->h_prev, state->grad_log_p,
+                params->rho, params->sigma_z, params->mu, n
+            );
+        } else {
+            svpf_mixture_prior_grad_tiled_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
+                state->h, state->h_prev, state->grad_log_p,
+                params->rho, params->sigma_z, params->mu, n
+            );
+        }
+        
+        // === 3. Likelihood Gradient + Log Weights ===
+        svpf_likelihood_only_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
+            state->h, opt->d_grad_lik, state->log_weights,
+            d_observations, t, state->nu, student_t_const, n
+        );
+        
+        // === 4. Combine Gradients: grad = grad_prior + grad_lik ===
+        svpf_combine_gradients_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
+            state->grad_log_p, opt->d_grad_lik, state->grad_log_p,
+            1.0f,  // beta = 1.0 (no annealing in this path)
             n
         );
         
-        // === 3. Log-Sum-Exp (all on device) ===
+        // === 5. Log-Sum-Exp (all on device) ===
         if (n <= 4096) {
             // Single block for small N
             svpf_logsumexp_kernel<<<1, BLOCK_SIZE, 0, stream>>>(
@@ -1076,14 +1316,14 @@ void svpf_run_sequence_optimized(
             );
         }
         
-        // === 4. Bandwidth (every few steps for stability) ===
+        // === 6. Bandwidth (every few steps for stability) ===
         if (t % BANDWIDTH_UPDATE_INTERVAL == 0) {
             svpf_bandwidth_kernel<<<1, BLOCK_SIZE, 0, stream>>>(
                 state->h, opt->d_bandwidth, opt->d_bandwidth_sq, bw_alpha, n
             );
         }
         
-        // === 5. Stein Transport Iterations ===
+        // === 7. Stein Transport Iterations ===
         for (int s = 0; s < n_stein; s++) {
             if (use_small_n) {
                 // Persistent CTA path - writes to phi, then apply transport
@@ -1113,16 +1353,34 @@ void svpf_run_sequence_optimized(
             
             // Re-compute gradients for next Stein iteration (deterministic, no noise)
             if (s < n_stein - 1) {
-                svpf_likelihood_grad_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
-                    state->h, state->h_prev, state->grad_log_p, state->log_weights,
-                    d_observations, t,
-                    params->rho, params->sigma_z, params->mu, state->nu, student_t_const,
-                    n
+                // Recompute mixture prior (particles moved)
+                if (n <= SMALL_N_THRESHOLD) {
+                    svpf_mixture_prior_grad_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
+                        state->h, state->h_prev, state->grad_log_p,
+                        params->rho, params->sigma_z, params->mu, n
+                    );
+                } else {
+                    svpf_mixture_prior_grad_tiled_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
+                        state->h, state->h_prev, state->grad_log_p,
+                        params->rho, params->sigma_z, params->mu, n
+                    );
+                }
+                
+                // Recompute likelihood gradient
+                svpf_likelihood_only_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
+                    state->h, opt->d_grad_lik, state->log_weights,
+                    d_observations, t, state->nu, student_t_const, n
+                );
+                
+                // Combine
+                svpf_combine_gradients_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
+                    state->grad_log_p, opt->d_grad_lik, state->grad_log_p,
+                    1.0f, n
                 );
             }
         }
         
-        // === 6. Volatility Mean ===
+        // === 8. Volatility Mean ===
         if (d_vol_out) {
             svpf_vol_mean_opt_kernel<<<1, BLOCK_SIZE, 0, stream>>>(
                 state->h, d_vol_out, t, n
@@ -1262,26 +1520,45 @@ void svpf_run_sequence_graph(
             n
         );
         
-        // 2. Likelihood + Gradient - use staging buffer
-        svpf_likelihood_grad_kernel_graph<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
-            state->h, state->h_prev, state->grad_log_p, state->log_weights,
+        // 2. Mixture Prior Gradient (O(N²) - CORRECT per paper Eq. 6)
+        // Note: This kernel doesn't need timestep - uses h and h_prev directly
+        if (n <= SMALL_N_THRESHOLD) {
+            svpf_mixture_prior_grad_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
+                state->h, state->h_prev, state->grad_log_p,
+                params->rho, params->sigma_z, params->mu, n
+            );
+        } else {
+            svpf_mixture_prior_grad_tiled_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
+                state->h, state->h_prev, state->grad_log_p,
+                params->rho, params->sigma_z, params->mu, n
+            );
+        }
+        
+        // 3. Likelihood Gradient + Log Weights - use staging buffer
+        svpf_likelihood_only_kernel_graph<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
+            state->h, opt->d_grad_lik, state->log_weights,
             opt->d_obs_staging, opt->d_timestep,
-            params->rho, params->sigma_z, params->mu, state->nu, student_t_const,
-            n
+            state->nu, student_t_const, n
         );
         
-        // 3. Log-Sum-Exp - output to staging
+        // 4. Combine Gradients: grad = grad_prior + grad_lik
+        svpf_combine_gradients_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
+            state->grad_log_p, opt->d_grad_lik, state->grad_log_p,
+            1.0f, n  // beta = 1.0 in graph path (no annealing)
+        );
+        
+        // 5. Log-Sum-Exp - output to staging
         svpf_logsumexp_kernel_graph<<<1, BLOCK_SIZE, 0, stream>>>(
             state->log_weights, opt->d_loglik_staging, opt->d_max_log_w, 
             opt->d_timestep, n
         );
         
-        // 4. Bandwidth
+        // 6. Bandwidth
         svpf_bandwidth_kernel<<<1, BLOCK_SIZE, 0, stream>>>(
             state->h, opt->d_bandwidth, opt->d_bandwidth_sq, bw_alpha, n
         );
         
-        // 5. Stein iterations
+        // 7. Stein iterations
         for (int s = 0; s < n_stein; s++) {
             if (use_small_n) {
                 // Persistent CTA path - writes to phi, then apply transport
@@ -1310,21 +1587,40 @@ void svpf_run_sequence_graph(
             }
             
             if (s < n_stein - 1) {
-                svpf_likelihood_grad_kernel_graph<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
-                    state->h, state->h_prev, state->grad_log_p, state->log_weights,
+                // Recompute mixture prior (particles moved)
+                if (n <= SMALL_N_THRESHOLD) {
+                    svpf_mixture_prior_grad_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
+                        state->h, state->h_prev, state->grad_log_p,
+                        params->rho, params->sigma_z, params->mu, n
+                    );
+                } else {
+                    svpf_mixture_prior_grad_tiled_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
+                        state->h, state->h_prev, state->grad_log_p,
+                        params->rho, params->sigma_z, params->mu, n
+                    );
+                }
+                
+                // Recompute likelihood gradient
+                svpf_likelihood_only_kernel_graph<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
+                    state->h, opt->d_grad_lik, state->log_weights,
                     opt->d_obs_staging, opt->d_timestep,
-                    params->rho, params->sigma_z, params->mu, state->nu, student_t_const,
-                    n
+                    state->nu, student_t_const, n
+                );
+                
+                // Combine
+                svpf_combine_gradients_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
+                    state->grad_log_p, opt->d_grad_lik, state->grad_log_p,
+                    1.0f, n
                 );
             }
         }
         
-        // 6. Volatility mean - output to staging
+        // 8. Volatility mean - output to staging
         svpf_vol_mean_opt_kernel_graph<<<1, BLOCK_SIZE, 0, stream>>>(
             state->h, opt->d_vol_staging, opt->d_timestep, n
         );
         
-        // 7. Increment timestep counter
+        // 9. Increment timestep counter
         svpf_increment_timestep_kernel<<<1, 1, 0, stream>>>(opt->d_timestep);
         
         // === KERNEL RECORDING END ===
@@ -1537,6 +1833,8 @@ void svpf_step_adaptive(
     //
     // β schedule: 0.3 → 0.65 → 1.0 (configurable via state)
     // This allows particles to explore before committing to likelihood
+    //
+    // CORRECTED: Now uses mixture prior gradient (O(N²)) per paper Eq. 6
     // =========================================================================
     
     int n_anneal = state->use_annealing ? state->n_anneal_steps : 1;
@@ -1547,20 +1845,31 @@ void svpf_step_adaptive(
                    ? beta_schedule[anneal_idx % 3]
                    : 1.0f;
         
-        // Compute gradient with annealing factor
-        svpf_gradient_annealed_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
-            state->h, state->h_prev, state->grad_log_p,
-            y_t, p.rho, p.sigma_z, p.mu, p.gamma,
-            state->nu, student_t_const, y_prev, beta, n
-        );
-        
-        // Also compute log-weights for final likelihood (β=1 only)
-        if (beta >= 1.0f - 1e-6f) {
-            svpf_likelihood_grad_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
-                state->h, state->h_prev, state->grad_log_p, state->log_weights,
-                opt->d_y_single, 1, p.rho, p.sigma_z, p.mu, state->nu, student_t_const, n
+        // === CORRECTED GRADIENT COMPUTATION ===
+        // Step 1: Mixture prior gradient (O(N²)) - does NOT depend on β
+        if (n <= SMALL_N_THRESHOLD) {
+            svpf_mixture_prior_grad_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
+                state->h, state->h_prev, state->grad_log_p,
+                p.rho, p.sigma_z, p.mu, n
+            );
+        } else {
+            svpf_mixture_prior_grad_tiled_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
+                state->h, state->h_prev, state->grad_log_p,
+                p.rho, p.sigma_z, p.mu, n
             );
         }
+        
+        // Step 2: Likelihood gradient (O(N))
+        svpf_likelihood_only_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
+            state->h, opt->d_grad_lik, state->log_weights,
+            opt->d_y_single, 1, state->nu, student_t_const, n
+        );
+        
+        // Step 3: Combine with annealing: grad = grad_prior + β * grad_lik
+        svpf_combine_gradients_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
+            state->grad_log_p, opt->d_grad_lik, state->grad_log_p,
+            beta, n
+        );
         
         // Stein iterations at this β level
         int stein_iters = state->n_stein_steps / n_anneal;
@@ -1610,10 +1919,29 @@ void svpf_step_adaptive(
             
             // Recompute gradient if more iterations remain
             if (s < stein_iters - 1) {
-                svpf_gradient_annealed_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
-                    state->h, state->h_prev, state->grad_log_p,
-                    y_t, p.rho, p.sigma_z, p.mu, p.gamma,
-                    state->nu, student_t_const, y_prev, beta, n
+                // Mixture prior (particles moved)
+                if (n <= SMALL_N_THRESHOLD) {
+                    svpf_mixture_prior_grad_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
+                        state->h, state->h_prev, state->grad_log_p,
+                        p.rho, p.sigma_z, p.mu, n
+                    );
+                } else {
+                    svpf_mixture_prior_grad_tiled_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
+                        state->h, state->h_prev, state->grad_log_p,
+                        p.rho, p.sigma_z, p.mu, n
+                    );
+                }
+                
+                // Likelihood gradient
+                svpf_likelihood_only_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
+                    state->h, opt->d_grad_lik, state->log_weights,
+                    opt->d_y_single, 1, state->nu, student_t_const, n
+                );
+                
+                // Combine with annealing
+                svpf_combine_gradients_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
+                    state->grad_log_p, opt->d_grad_lik, state->grad_log_p,
+                    beta, n
                 );
             }
         }

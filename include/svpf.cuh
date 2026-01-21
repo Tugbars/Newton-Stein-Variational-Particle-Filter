@@ -9,6 +9,12 @@
  * - Student-t likelihood handles tail events
  * - Fewer particles needed vs bootstrap PF (500 vs 3000)
  * 
+ * Algorithm (Fan et al. 2021, arXiv:2106.10568):
+ * - Prior is Gaussian MIXTURE over all particles: p(h_t|Z_{t-1}) = (1/N) Σ_i p(h_t|h_{t-1}^i)
+ * - This requires O(N²) gradient computation per Stein iteration
+ * - Weights use exact Student-t likelihood for unbiased importance sampling
+ * - Gradients use log-squared approximation for robust linear transport
+ * 
  * Usage:
  *   SVPFState* filter = svpf_create(512, 5, 5.0f, stream);
  *   svpf_initialize(filter, &params, seed);
@@ -27,7 +33,7 @@
  * 
  * References:
  * - Liu & Wang (2016): SVGD algorithm
- * - Fan et al. (2021): Stein Particle Filtering
+ * - Fan et al. (2021): Stein Particle Filtering (arXiv:2106.10568)
  */
 
 #ifndef SVPF_CUH
@@ -53,6 +59,9 @@ extern "C" {
 #define SVPF_H_MIN                 -15.0f
 #define SVPF_H_MAX                 5.0f
 #define SVPF_BLOCK_SIZE            256
+
+// Threshold for small N optimizations (persistent CTA path)
+#define SVPF_SMALL_N_THRESHOLD     4096
 
 // =============================================================================
 // DATA STRUCTURES
@@ -82,6 +91,10 @@ typedef struct {
     float* d_exp_w;
     float* d_phi;
     
+    // Mixture prior fix: separate likelihood gradient buffer
+    // Required for correct O(N²) mixture prior + O(N) likelihood decomposition
+    float* d_grad_lik;
+    
     // Staging buffers for CUDA Graph (fixed addresses)
     float* d_obs_staging;
     float* d_loglik_staging;
@@ -95,7 +108,7 @@ typedef struct {
     // CUDA Graph state
     cudaGraph_t graph;
     cudaGraphExec_t graphExec;
-    cudaStream_t graph_stream;  // Dedicated stream for graph capture (NULL/default doesn't work)
+    cudaStream_t graph_stream;  // Dedicated stream for graph capture
     bool graph_captured;
     int graph_n;        // N for which graph was captured
     int graph_n_stein;  // n_stein for which graph was captured
@@ -123,6 +136,29 @@ typedef struct {
 
 /**
  * @brief SVPF filter state (SoA layout for GPU)
+ * 
+ * Key implementation notes:
+ * 
+ * MIXTURE PRIOR (Fan et al. 2021, Eq. 6):
+ *   The prior at time t is a Gaussian mixture:
+ *     p(h_t | Z_{t-1}) = (1/N) Σ_i N(h_t; μ_i, σ_z²)
+ *   where μ_i = μ + ρ(h_{t-1}^i - μ)
+ * 
+ *   This means each particle j feels attraction from ALL prior means,
+ *   not just its own. The gradient is:
+ *     ∇_h log p_prior(h_j) = Σ_i r_i(h_j) * (-(h_j - μ_i)/σ_z²)
+ *   where r_i is the responsibility (soft assignment to component i).
+ * 
+ *   This requires O(N²) computation but is essential for correct filtering.
+ * 
+ * HYBRID LIKELIHOOD STRATEGY:
+ *   - Weights: Exact Student-t (unbiased importance sampling)
+ *   - Gradients: Log-squared approximation (robust linear transport)
+ *   
+ *   The log-squared gradient provides a "parabolic bowl" that always
+ *   pulls particles toward the observation, even from far away.
+ *   The Student-t gradient creates a "volcano" that saturates for
+ *   large deviations, causing particles to get stuck.
  */
 typedef struct {
     // Particle states
@@ -131,7 +167,7 @@ typedef struct {
     float* h_pred;      // [N] Predicted particles (before Stein)
     
     // Stein computation workspace
-    float* grad_log_p;  // [N] Gradient of log posterior
+    float* grad_log_p;  // [N] Gradient of log posterior (prior + likelihood)
     float* kernel_sum;  // [N] Sum of kernel weights (attraction)
     float* grad_kernel_sum; // [N] Sum of kernel gradients (repulsion)
     
@@ -175,8 +211,8 @@ typedef struct {
     // Configuration
     int n_particles;
     int n_stein_steps;
-    float nu;
-    float student_t_const;
+    float nu;               // Student-t degrees of freedom
+    float student_t_const;  // Precomputed: lgamma((nu+1)/2) - lgamma(nu/2) - 0.5*log(pi*nu)
     int timestep;
     float y_prev;
     cudaStream_t stream;
@@ -307,7 +343,12 @@ void svpf_run_sequence_device(
 // =============================================================================
 
 /**
- * @brief OPTIMIZED: Run full sequence with 2D tiled Stein kernel
+ * @brief OPTIMIZED: Run full sequence with correct mixture prior
+ * 
+ * Key algorithm features (per Fan et al. 2021):
+ * - O(N²) mixture prior gradient: each particle feels pull from ALL prior means
+ * - O(N²) Stein kernel: particle interactions for diversity
+ * - Hybrid likelihood: exact Student-t weights, log-squared gradients
  * 
  * Key optimizations:
  * - 2D tiled grid for O(N²) Stein: guarantees SM saturation for any N
@@ -359,12 +400,16 @@ void svpf_step_optimized(
 /**
  * @brief ADAPTIVE SVPF: Single step with all improvements
  * 
- * Implements Preconditioned Stein Variational Langevin Descent:
- *   1. Mixture Innovation Model (MIM) - fat-tailed predict for scout particles
- *   2. Asymmetric ρ - vol spikes fast (ρ_up), decays slow (ρ_down)
- *   3. Adaptive bandwidth α scaling (tighter kernel during high vol)
- *   4. Annealed Stein updates (β schedule: 0.3 → 0.65 → 1.0)
- *   5. Fused RMSProp + Langevin diffusion (SVLD for diversity)
+ * Implements Preconditioned Stein Variational Langevin Descent with
+ * CORRECT mixture prior (O(N²)) per Fan et al. 2021:
+ * 
+ *   1. Mixture Prior Gradient (O(N²)) - each particle feels pull from all prior means
+ *   2. Log-Squared Likelihood Gradient - robust linear transport (no volcano collapse)
+ *   3. Mixture Innovation Model (MIM) - fat-tailed predict for scout particles
+ *   4. Asymmetric ρ - vol spikes fast (ρ_up), decays slow (ρ_down)
+ *   5. Adaptive bandwidth α scaling (tighter kernel during high vol)
+ *   6. Annealed Stein updates (β schedule: 0.3 → 0.65 → 1.0)
+ *   7. Fused RMSProp + Langevin diffusion (SVLD for diversity)
  * 
  * Configure via SVPFState fields:
  *   - use_mim: Enable Mixture Innovation (default: 1)
@@ -401,7 +446,10 @@ void svpf_step_adaptive(
  * Captures one timestep as a CUDA Graph, then replays it T times.
  * Reduces per-step overhead from ~65μs to ~5-10μs.
  * 
+ * Uses correct O(N²) mixture prior gradient per Fan et al. 2021.
+ * 
  * Note: Graph is cached and reused. First call has capture overhead.
+ * Graph is invalidated if n_particles or n_stein_steps change.
  * 
  * @param state SVPF state
  * @param d_observations Device array [T]
@@ -418,6 +466,11 @@ void svpf_run_sequence_graph(
     float* d_loglik_out,
     float* d_vol_out
 );
+
+/**
+ * @brief Internal: Initialize optimized backend (called by svpf_create)
+ */
+void svpf_optimized_init(SVPFState* state);
 
 /**
  * @brief Internal: Cleanup optimized backend (called by svpf_destroy)
@@ -437,6 +490,17 @@ void svpf_get_particles(const SVPFState* state, float* h_out);
  * @brief Get current particle statistics
  */
 void svpf_get_stats(const SVPFState* state, float* h_mean, float* h_std);
+
+/**
+ * @brief Get effective sample size (ESS) of current particle weights
+ * 
+ * ESS = 1 / Σ w_i² where w_i are normalized weights.
+ * ESS close to N means particles are well-distributed.
+ * ESS close to 1 means particle degeneracy (one particle dominates).
+ * 
+ * Note: SVPF with Stein transport should maintain high ESS without resampling.
+ */
+float svpf_get_ess(const SVPFState* state);
 
 #ifdef __cplusplus
 }
