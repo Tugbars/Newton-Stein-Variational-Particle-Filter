@@ -7,6 +7,7 @@ set(SVPF_SOURCES
     svpf_finite_diff.cu
     svpf_optimized.cu
     svpf_optimized_graph.cu
+    svpf_opt_kernels.cu
 )
 
 # =============================================================================
