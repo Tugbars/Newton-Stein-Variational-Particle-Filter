@@ -527,7 +527,7 @@ int main(int argc, char** argv) {
     
     /* EKF Guide Density (coarse positioning before Stein) */
     filter->use_guide = use_adaptive ? 1 : 0;
-    filter->guide_strength = 0.05f;  // How much to pull toward guide (0.1-0.3)
+    filter->guide_strength = 0.10f;  // How much to pull toward guide (0.1-0.3)
     
     printf("  Filter initialized.\n");
     printf("  Mode: %s\n", use_adaptive ? "SVLD + MIM + Asym-ρ + Guide" : "VANILLA SVGD");

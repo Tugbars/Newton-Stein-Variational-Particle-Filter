@@ -509,7 +509,7 @@ __global__ void svpf_likelihood_only_kernel(
     
     float log_y2 = logf(y_t * y_t + 1e-10f);
     float offset = -1.0f / nu;    // E[log(η²)] approximation
-    float R_noise = 2.0f;         // Observation noise variance in log space
+    float R_noise = 1.4f;         // Observation noise variance in log space
     
     // Linear gradient: pulls h toward log(y²) - offset
     grad_lik[i] = (log_y2 - h_i - offset) / R_noise;
