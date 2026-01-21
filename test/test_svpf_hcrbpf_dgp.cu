@@ -497,18 +497,18 @@ static Metrics run_svpf_on_scenario(
     if (use_adaptive) {
         filter->use_svld = 1;
         filter->use_annealing = 1;
-        filter->n_anneal_steps = 3;
+        filter->n_anneal_steps = 5;
         filter->temperature = 0.3f;
         filter->rmsprop_rho = 0.9f;
         filter->rmsprop_eps = 1e-6f;
         
         filter->use_mim = 1;
-        filter->mim_jump_prob = 0.10f;
+        filter->mim_jump_prob = 0.15f;
         filter->mim_jump_scale = 5.0f;
         
         filter->use_asymmetric_rho = 1;
-        filter->rho_up = 0.99f;
-        filter->rho_down = 0.91f;
+        filter->rho_up = 0.98f;
+        filter->rho_down = 0.92f;
         
         filter->use_guide = 1;
         filter->guide_strength = 0.05f;
