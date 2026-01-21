@@ -443,6 +443,87 @@ __global__ void svpf_combine_gradients_kernel(
 }
 
 // =============================================================================
+// Kernel 2e: Hessian-Preconditioned Gradient (Newton-Stein)
+//
+// Standard SVGD performs gradient descent on KL divergence.
+// Newton-Stein performs Newton's method: move along H^{-1} * grad
+//
+// Benefits:
+// - Flat regions (small H): Step size increases, faster convergence
+// - Sharp peaks (large H): Step size decreases, prevents overshooting
+// - Solves "stiffness" dynamically per particle
+//
+// For 1D Student-t with vol = exp(h), A = y²/(nu*vol):
+//   Gradient:  -0.5 + 0.5*(nu+1)*A/(1+A)
+//   Hessian:   -0.5*(nu+1)*A/(1+A)²
+// =============================================================================
+
+__global__ void svpf_hessian_precond_kernel(
+    const float* __restrict__ h,
+    const float* __restrict__ grad_combined,   // Input: prior + beta*lik gradient
+    float* __restrict__ precond_grad,          // Output: H^{-1} * grad
+    float* __restrict__ inv_hessian,           // Output: H^{-1} (for kernel scaling)
+    const float* __restrict__ d_y,
+    int t,
+    float nu,
+    float sigma_z,                             // For prior Hessian
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    
+    float h_i = h[i];
+    float y = d_y[t];
+    float vol = safe_exp(h_i);
+    float y_sq = y * y;
+    
+    // =========================================================================
+    // Compute Exact Student-t Likelihood Hessian
+    // =========================================================================
+    // Let A = y² / (nu * exp(h))
+    float A = y_sq / (nu * vol + 1e-8f);
+    float one_plus_A = 1.0f + A;
+    
+    // Hessian of log-likelihood: d²/dh² log p(y|h)
+    // = -0.5 * (nu+1) * A / (1+A)²
+    // This is NEGATIVE (log-likelihood is concave)
+    float hess_lik = -0.5f * (nu + 1.0f) * (A / (one_plus_A * one_plus_A));
+    
+    // =========================================================================
+    // Prior Hessian (Gaussian: constant curvature)
+    // =========================================================================
+    // Prior: log p(h) = -0.5*(h - mu_prior)²/sigma_z²
+    // Hessian: -1/sigma_z²
+    float sigma_z_sq = sigma_z * sigma_z + 1e-8f;
+    float hess_prior = -1.0f / sigma_z_sq;
+    
+    // =========================================================================
+    // Total Curvature (negative of Hessian for convex optimization)
+    // =========================================================================
+    // We want positive definite approximation for Newton step
+    // Total Hessian is negative (concave log-posterior), so -H is positive
+    float total_hessian = hess_lik + hess_prior;  // Both negative
+    float curvature = -total_hessian;              // Make positive
+    
+    // Clip curvature to avoid numerical issues
+    // Too small: exploding steps. Too large: no effect.
+    curvature = fmaxf(curvature, 0.1f);   // Min curvature (max step scale = 10x)
+    curvature = fminf(curvature, 100.0f); // Max curvature (min step scale = 0.01x)
+    
+    // =========================================================================
+    // Newton Step: H^{-1} * gradient
+    // =========================================================================
+    float inv_H = 1.0f / curvature;
+    float grad_i = grad_combined[i];
+    
+    // Dampen Newton step for stability (pure Newton can overshoot)
+    float damping = 0.7f;
+    
+    precond_grad[i] = damping * grad_i * inv_H;
+    inv_hessian[i] = inv_H;
+}
+
+// =============================================================================
 // Kernel 3: Log-Sum-Exp (computes loglik, all on device)
 // =============================================================================
 
@@ -483,18 +564,6 @@ __global__ void svpf_logsumexp_kernel(
     if (threadIdx.x == 0) {
         d_loglik[t] = local_max + logf(local_sum / (float)n + 1e-10f);
         *d_max_log_w = local_max;
-    }
-}
-
-__global__ void svpf_finalize_loglik_kernel(
-    const float* __restrict__ d_max_log_w,
-    const float* __restrict__ d_sum_exp,
-    float* __restrict__ d_loglik,
-    int t,
-    int n
-) {
-    if (threadIdx.x == 0 && blockIdx.x == 0) {
-        d_loglik[t] = *d_max_log_w + logf(*d_sum_exp / (float)n + 1e-10f);
     }
 }
 
@@ -597,20 +666,233 @@ __global__ void svpf_stein_2d_kernel(
     }
 }
 
-
 // =============================================================================
-// Kernel 6: Apply Transport (for 2D kernel path) - Basic version
+// Kernel 5a-Newton: 2D Tiled Newton-Stein Kernel (Large N path)
 // =============================================================================
 
-__global__ void svpf_apply_transport_kernel(
-    float* __restrict__ h,
-    const float* __restrict__ phi,
-    float step_size,
+__global__ void svpf_stein_newton_2d_kernel(
+    const float* __restrict__ h,
+    const float* __restrict__ precond_grad,  // H^{-1} * grad
+    const float* __restrict__ inv_hessian,   // H^{-1}
+    float* __restrict__ phi,
+    const float* __restrict__ d_bandwidth,
     int n
 ) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    h[i] = clamp_logvol(h[i] + step_size * phi[i]);
+    int i = blockIdx.x;
+    int tile = blockIdx.y;
+    int tile_start = tile * TILE_J;
+    int tile_end = min(tile_start + TILE_J, n);
+    int tile_size = tile_end - tile_start;
+    
+    if (i >= n || tile_start >= n) return;
+    
+    __shared__ float sh_h[TILE_J];
+    __shared__ float sh_precond_grad[TILE_J];
+    __shared__ float sh_inv_hess[TILE_J];
+    
+    // Cooperative load
+    for (int j = threadIdx.x; j < tile_size; j += blockDim.x) {
+        sh_h[j] = h[tile_start + j];
+        sh_precond_grad[j] = precond_grad[tile_start + j];
+        sh_inv_hess[j] = inv_hessian[tile_start + j];
+    }
+    __syncthreads();
+    
+    float h_i = h[i];
+    float bw = *d_bandwidth;
+    float bw_sq = bw * bw;
+    
+    float k_sum = 0.0f;
+    float gk_sum = 0.0f;
+    
+    for (int j = threadIdx.x; j < tile_size; j += blockDim.x) {
+        float diff = h_i - sh_h[j];
+        float K = expf(-diff * diff / (2.0f * bw_sq));
+        float inv_H_j = sh_inv_hess[j];
+        
+        // Newton-scaled terms
+        k_sum += K * sh_precond_grad[j];
+        gk_sum += (-K * diff / bw_sq) * inv_H_j;
+    }
+    
+    // Block reduction
+    k_sum = block_reduce_sum(k_sum);
+    __syncthreads();
+    gk_sum = block_reduce_sum(gk_sum);
+    
+    if (threadIdx.x == 0) {
+        atomicAdd(&phi[i], (k_sum + gk_sum) / (float)n);
+    }
+}
+
+// =============================================================================
+// Kernel 5b: Persistent CTA Stein Kernel (Small N path)
+// =============================================================================
+
+/**
+ * Persistent CTA approach:
+ * - Launch one block per SM (or small multiple)
+ * - Each block loads ALL data once into SMEM
+ * - Grid-stride over i: block b handles particles b, b+gridDim.x, b+2*gridDim.x...
+ * - Within each i: threads cooperate on j summation
+ * 
+ * CRITICAL: Writes to phi[], NOT h[] - avoids race condition.
+ * Caller must apply transport separately with svpf_apply_transport_kernel.
+ */
+__global__ void svpf_stein_persistent_kernel(
+    const float* __restrict__ h,      // READ-ONLY
+    const float* __restrict__ grad,
+    float* __restrict__ phi,          // OUTPUT: transport direction
+    const float* __restrict__ d_bandwidth,
+    int n
+) {
+    extern __shared__ float smem[];
+    float* sh_h = smem;
+    float* sh_grad = smem + n;
+    float* sh_reduce = smem + 2 * n;  // Workspace for reduction
+    
+    // Load ALL data once (cooperative across threads)
+    for (int j = threadIdx.x; j < n; j += blockDim.x) {
+        sh_h[j] = h[j];
+        sh_grad[j] = grad[j];
+    }
+    __syncthreads();
+    
+    float bw = *d_bandwidth;
+    float bw_sq = bw * bw;
+    
+    // Grid-stride loop over particles
+    for (int i = blockIdx.x; i < n; i += gridDim.x) {
+        float h_i = sh_h[i];
+        
+        // Threads cooperate on j summation
+        float k_sum = 0.0f;
+        float gk_sum = 0.0f;
+        
+        for (int j = threadIdx.x; j < n; j += blockDim.x) {
+            float diff = h_i - sh_h[j];
+            float K = expf(-diff * diff / (2.0f * bw_sq));
+            k_sum += K * sh_grad[j];
+            gk_sum += -K * diff / bw_sq;
+        }
+        
+        // Block reduction for k_sum
+        k_sum = warp_reduce_sum(k_sum);
+        int lane = threadIdx.x % WARP_SIZE;
+        int wid = threadIdx.x / WARP_SIZE;
+        if (lane == 0) sh_reduce[wid] = k_sum;
+        __syncthreads();
+        
+        k_sum = (threadIdx.x < BLOCK_SIZE / WARP_SIZE) ? sh_reduce[threadIdx.x] : 0.0f;
+        if (wid == 0) k_sum = warp_reduce_sum(k_sum);
+        
+        // Block reduction for gk_sum
+        gk_sum = warp_reduce_sum(gk_sum);
+        if (lane == 0) sh_reduce[wid] = gk_sum;
+        __syncthreads();
+        
+        gk_sum = (threadIdx.x < BLOCK_SIZE / WARP_SIZE) ? sh_reduce[threadIdx.x] : 0.0f;
+        if (wid == 0) gk_sum = warp_reduce_sum(gk_sum);
+        
+        // Thread 0 writes transport direction to phi (NOT h)
+        if (threadIdx.x == 0) {
+            phi[i] = (k_sum + gk_sum) / (float)n;
+        }
+        __syncthreads();  // Ensure write completes before next iteration
+    }
+}
+
+// =============================================================================
+// Kernel 5b: Newton-Stein Persistent Kernel (Matrix-Valued Kernel)
+//
+// Generalizes Stein identity to use Hessian preconditioning:
+//   φ(x) = (1/n) Σ_j [ K(x,x_j) * H_j^{-1} * ∇log p(x_j) + ∇_x K(x,x_j) * H_j^{-1} ]
+//
+// The inverse Hessian scales both:
+// - The gradient term (Newton direction)
+// - The repulsive term (curvature-aware repulsion)
+//
+// Benefits:
+// - Particles in sharp peaks (high curvature) take smaller steps
+// - Particles in flat regions (low curvature) take larger steps
+// - Repulsion is weaker near sharp peaks (don't push away from good spots)
+// =============================================================================
+
+__global__ void svpf_stein_newton_persistent_kernel(
+    const float* __restrict__ h,
+    const float* __restrict__ precond_grad,  // H^{-1} * grad (already preconditioned)
+    const float* __restrict__ inv_hessian,   // H^{-1} for repulsive scaling
+    float* __restrict__ phi,
+    const float* __restrict__ d_bandwidth,
+    int n
+) {
+    extern __shared__ float smem[];
+    float* sh_h = smem;
+    float* sh_precond_grad = smem + n;
+    float* sh_inv_hess = smem + 2 * n;
+    float* sh_reduce = smem + 3 * n;
+    
+    // Load ALL data once (cooperative across threads)
+    for (int j = threadIdx.x; j < n; j += blockDim.x) {
+        sh_h[j] = h[j];
+        sh_precond_grad[j] = precond_grad[j];
+        sh_inv_hess[j] = inv_hessian[j];
+    }
+    __syncthreads();
+    
+    float bw = *d_bandwidth;
+    float bw_sq = bw * bw;
+    
+    // Grid-stride loop over particles
+    for (int i = blockIdx.x; i < n; i += gridDim.x) {
+        float h_i = sh_h[i];
+        
+        // Threads cooperate on j summation
+        float k_sum = 0.0f;
+        float gk_sum = 0.0f;
+        
+        for (int j = threadIdx.x; j < n; j += blockDim.x) {
+            float diff = h_i - sh_h[j];
+            float K = expf(-diff * diff / (2.0f * bw_sq));
+            float inv_H_j = sh_inv_hess[j];
+            
+            // Term 1: Kernel * Preconditioned_Gradient
+            // Note: precond_grad already contains H^{-1} * grad
+            k_sum += K * sh_precond_grad[j];
+            
+            // Term 2: Matrix-Valued Repulsive Term
+            // Standard: -K * diff / bw²
+            // Newton:   -K * diff / bw² * H_j^{-1}
+            // The inverse Hessian scales repulsion:
+            // - High curvature (small inv_H): weak repulsion (stay near peak)
+            // - Low curvature (large inv_H): strong repulsion (spread out in flat regions)
+            gk_sum += (-K * diff / bw_sq) * inv_H_j;
+        }
+        
+        // Block reduction for k_sum
+        k_sum = warp_reduce_sum(k_sum);
+        int lane = threadIdx.x % WARP_SIZE;
+        int wid = threadIdx.x / WARP_SIZE;
+        if (lane == 0) sh_reduce[wid] = k_sum;
+        __syncthreads();
+        
+        k_sum = (threadIdx.x < BLOCK_SIZE / WARP_SIZE) ? sh_reduce[threadIdx.x] : 0.0f;
+        if (wid == 0) k_sum = warp_reduce_sum(k_sum);
+        
+        // Block reduction for gk_sum
+        gk_sum = warp_reduce_sum(gk_sum);
+        if (lane == 0) sh_reduce[wid] = gk_sum;
+        __syncthreads();
+        
+        gk_sum = (threadIdx.x < BLOCK_SIZE / WARP_SIZE) ? sh_reduce[threadIdx.x] : 0.0f;
+        if (wid == 0) gk_sum = warp_reduce_sum(gk_sum);
+        
+        // Thread 0 writes transport direction
+        if (threadIdx.x == 0) {
+            phi[i] = (k_sum + gk_sum) / (float)n;
+        }
+        __syncthreads();
+    }
 }
 
 // =============================================================================
@@ -844,42 +1126,28 @@ void svpf_optimized_init(SVPFOptimizedState* opt, int n) {
     cudaMalloc(&opt->d_bandwidth, sizeof(float));
     cudaMalloc(&opt->d_bandwidth_sq, sizeof(float));
     
-    // Device timestep counter
-    cudaMalloc(&opt->d_timestep, sizeof(int));
-    
     // Initialize bandwidth_sq to 0 (triggers fresh computation on first step)
     float zero = 0.0f;
     cudaMemcpy(opt->d_bandwidth_sq, &zero, sizeof(float), cudaMemcpyHostToDevice);
     
-    // Buffers
+    // Stein computation buffers
     cudaMalloc(&opt->d_exp_w, n * sizeof(float));
     cudaMalloc(&opt->d_phi, n * sizeof(float));
-    cudaMalloc(&opt->d_grad_lik, n * sizeof(float));  // For mixture prior fix
+    cudaMalloc(&opt->d_grad_lik, n * sizeof(float));
+    
+    // Newton-Stein buffers (Hessian preconditioning)
+    cudaMalloc(&opt->d_precond_grad, n * sizeof(float));
+    cudaMalloc(&opt->d_inv_hessian, n * sizeof(float));
     
     // Particle-local parameters: store h_mean from previous step
     cudaMalloc(&opt->d_h_mean_prev, sizeof(float));
-    // Initialize to a reasonable default (params->mu would be better, but we don't have it here)
     float init_h_mean = -3.5f;  // Typical log-vol
     cudaMemcpy(opt->d_h_mean_prev, &init_h_mean, sizeof(float), cudaMemcpyHostToDevice);
-    
-    // Staging buffers for CUDA Graph
-    cudaMalloc(&opt->d_obs_staging, MAX_T_SIZE * sizeof(float));
-    cudaMalloc(&opt->d_loglik_staging, MAX_T_SIZE * sizeof(float));
-    cudaMalloc(&opt->d_vol_staging, MAX_T_SIZE * sizeof(float));
-    opt->staging_T = MAX_T_SIZE;
     
     // Single-step API buffers (avoid malloc in hot loop)
     cudaMalloc(&opt->d_y_single, 2 * sizeof(float));
     cudaMalloc(&opt->d_loglik_single, sizeof(float));
     cudaMalloc(&opt->d_vol_single, sizeof(float));
-    
-    // Graph not yet captured
-    opt->graph_captured = false;
-    opt->graph_n = 0;
-    opt->graph_n_stein = 0;
-    
-    // Create dedicated stream for graph capture (non-blocking to avoid sync with default stream)
-    cudaStreamCreateWithFlags(&opt->graph_stream, cudaStreamNonBlocking);
     
     opt->allocated_n = n;
     opt->initialized = true;
@@ -893,30 +1161,15 @@ void svpf_optimized_cleanup(SVPFOptimizedState* opt) {
     cudaFree(opt->d_sum_exp);
     cudaFree(opt->d_bandwidth);
     cudaFree(opt->d_bandwidth_sq);
-    cudaFree(opt->d_timestep);
     cudaFree(opt->d_exp_w);
     cudaFree(opt->d_phi);
     cudaFree(opt->d_grad_lik);
+    cudaFree(opt->d_precond_grad);
+    cudaFree(opt->d_inv_hessian);
     cudaFree(opt->d_h_mean_prev);
-    cudaFree(opt->d_obs_staging);
-    cudaFree(opt->d_loglik_staging);
-    cudaFree(opt->d_vol_staging);
     cudaFree(opt->d_y_single);
     cudaFree(opt->d_loglik_single);
     cudaFree(opt->d_vol_single);
-    
-    // Destroy CUDA Graph if captured
-    if (opt->graph_captured) {
-        cudaGraphExecDestroy(opt->graphExec);
-        cudaGraphDestroy(opt->graph);
-        opt->graph_captured = false;
-    }
-    
-    // Destroy dedicated stream
-    if (opt->graph_stream) {
-        cudaStreamDestroy(opt->graph_stream);
-        opt->graph_stream = NULL;
-    }
     
     opt->allocated_n = 0;
     opt->initialized = false;
@@ -1103,6 +1356,11 @@ void svpf_step_adaptive(
     int n_anneal = state->use_annealing ? state->n_anneal_steps : 1;
     float beta_schedule[3] = {0.3f, 0.65f, 1.0f};  // Default schedule
     
+    // Newton-Stein requires more shared memory (3*n vs 2*n)
+    size_t newton_smem = (3 * n + BLOCK_SIZE / WARP_SIZE) * sizeof(float);
+    bool newton_fits_smem = (newton_smem <= prop.sharedMemPerBlockOptin);
+    bool use_newton = state->use_newton && newton_fits_smem;
+    
     for (int anneal_idx = 0; anneal_idx < n_anneal; anneal_idx++) {
         float beta = state->use_annealing 
                    ? beta_schedule[anneal_idx % 3]
@@ -1134,6 +1392,15 @@ void svpf_step_adaptive(
             beta, n
         );
         
+        // Step 4 (Newton-Stein): Compute Hessian-preconditioned gradient
+        if (use_newton) {
+            svpf_hessian_precond_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
+                state->h, state->grad_log_p,
+                opt->d_precond_grad, opt->d_inv_hessian,
+                opt->d_y_single, 1, state->nu, p.sigma_z, n
+            );
+        }
+        
         // Stein iterations at this β level
         int stein_iters = state->n_stein_steps / n_anneal;
         if (anneal_idx == n_anneal - 1) {
@@ -1143,15 +1410,37 @@ void svpf_step_adaptive(
         
         for (int s = 0; s < stein_iters; s++) {
             // Compute Stein direction
-           
+            cudaMemsetAsync(opt->d_phi, 0, n * sizeof(float), stream);
             
-                cudaMemsetAsync(opt->d_phi, 0, n * sizeof(float), stream);
-                int num_tiles = (n + TILE_J - 1) / TILE_J;
-                dim3 grid_2d(n, num_tiles);
-                svpf_stein_2d_kernel<<<grid_2d, BLOCK_SIZE, 0, stream>>>(
-                    state->h, state->grad_log_p, opt->d_phi, opt->d_bandwidth, n
-                );
-           
+            if (use_newton) {
+                // Newton-Stein: use H^{-1} scaled gradient and repulsion
+                if (use_small_n) {
+                    svpf_stein_newton_persistent_kernel<<<persistent_blocks, BLOCK_SIZE, newton_smem, stream>>>(
+                        state->h, opt->d_precond_grad, opt->d_inv_hessian,
+                        opt->d_phi, opt->d_bandwidth, n
+                    );
+                } else {
+                    int num_tiles = (n + TILE_J - 1) / TILE_J;
+                    dim3 grid_2d(n, num_tiles);
+                    svpf_stein_newton_2d_kernel<<<grid_2d, BLOCK_SIZE, 0, stream>>>(
+                        state->h, opt->d_precond_grad, opt->d_inv_hessian,
+                        opt->d_phi, opt->d_bandwidth, n
+                    );
+                }
+            } else {
+                // Standard Stein
+                if (use_small_n) {
+                    svpf_stein_persistent_kernel<<<persistent_blocks, BLOCK_SIZE, persistent_smem, stream>>>(
+                        state->h, state->grad_log_p, opt->d_phi, opt->d_bandwidth, n
+                    );
+                } else {
+                    int num_tiles = (n + TILE_J - 1) / TILE_J;
+                    dim3 grid_2d(n, num_tiles);
+                    svpf_stein_2d_kernel<<<grid_2d, BLOCK_SIZE, 0, stream>>>(
+                        state->h, state->grad_log_p, opt->d_phi, opt->d_bandwidth, n
+                    );
+                }
+            }
             
             // Apply transport with fused SVLD (RMSProp + Langevin noise)
             // Temperature control: 0 = SVGD (deterministic), 1 = SVLD (diffusion)
@@ -1202,6 +1491,15 @@ void svpf_step_adaptive(
                     state->grad_log_p, opt->d_grad_lik, state->grad_log_p,
                     beta, n
                 );
+                
+                // Newton-Stein: recompute Hessian-preconditioned gradient
+                if (use_newton) {
+                    svpf_hessian_precond_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
+                        state->h, state->grad_log_p,
+                        opt->d_precond_grad, opt->d_inv_hessian,
+                        opt->d_y_single, 1, state->nu, p.sigma_z, n
+                    );
+                }
             }
         }
     }

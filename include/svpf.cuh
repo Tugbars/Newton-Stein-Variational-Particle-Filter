@@ -15,19 +15,12 @@
  * - Weights use exact Student-t likelihood for unbiased importance sampling
  * - Gradients use log-squared approximation for robust linear transport
  * 
- * Usage:
- *   SVPFState* filter = svpf_create(512, 5, 5.0f, stream);
+ * Usage (single-step, real-time):
+ *   SVPFState* filter = svpf_create(1024, 10, 5.0f, stream);
  *   svpf_initialize(filter, &params, seed);
  *   for each observation y_t:
- *       svpf_step(filter, y_t, &params, &result);
- *       // result.vol_mean is current volatility estimate
+ *       svpf_step_adaptive(filter, y_t, y_prev, &params, &loglik, &vol, &h_mean);
  *   svpf_destroy(filter);
- * 
- * For batch processing (faster - thread-safe, auto-initialized):
- *   svpf_run_sequence_optimized(filter, d_observations, T, &params, d_loglik, d_vol);
- * 
- * For maximum speed (CUDA Graph):
- *   svpf_run_sequence_graph(filter, d_observations, T, &params, d_loglik, d_vol);
  * 
  * Memory Layout: Structure of Arrays (SoA) for coalesced GPU access
  * 
@@ -84,9 +77,6 @@ typedef struct {
     float* d_bandwidth;
     float* d_bandwidth_sq;
     
-    // Device timestep counter (for CUDA Graph)
-    int* d_timestep;
-    
     // Stein computation buffers
     float* d_exp_w;
     float* d_phi;
@@ -95,30 +85,20 @@ typedef struct {
     // Required for correct O(N²) mixture prior + O(N) likelihood decomposition
     float* d_grad_lik;
     
+    // Newton-Stein buffers (Hessian preconditioning)
+    float* d_precond_grad;    // H^{-1} * grad (preconditioned gradient)
+    float* d_inv_hessian;     // H^{-1} (inverse Hessian per particle)
+    
     // Particle-local parameters: h_mean from previous step
     float* d_h_mean_prev;
-    
-    // Staging buffers for CUDA Graph (fixed addresses)
-    float* d_obs_staging;
-    float* d_loglik_staging;
-    float* d_vol_staging;
     
     // Single-step API buffers (avoid malloc in hot loop)
     float* d_y_single;
     float* d_loglik_single;
     float* d_vol_single;
     
-    // CUDA Graph state
-    cudaGraph_t graph;
-    cudaGraphExec_t graphExec;
-    cudaStream_t graph_stream;  // Dedicated stream for graph capture
-    bool graph_captured;
-    int graph_n;        // N for which graph was captured
-    int graph_n_stein;  // n_stein for which graph was captured
-    
     // Capacity tracking
     int allocated_n;
-    int staging_T;
     bool initialized;
 } SVPFOptimizedState;
 
@@ -245,6 +225,11 @@ typedef struct {
     float rho_up;           // Persistence when vol increasing (e.g., 0.98)
     float rho_down;         // Persistence when vol decreasing (e.g., 0.93)
     
+    // Newton-Stein config (Hessian preconditioning)
+    // Moves particles along H^{-1} * grad instead of grad
+    // Benefits: adaptive step size based on local curvature
+    int use_newton;         // Enable Newton-Stein (0=standard SVGD, 1=Newton)
+    
     // Guide density (EKF) config
     int use_guide;          // Enable EKF guide density
     float guide_strength;   // How much to pull particles toward guide (0.1-0.3)
@@ -353,40 +338,6 @@ void svpf_run_sequence_device(
 // =============================================================================
 
 /**
- * @brief OPTIMIZED: Run full sequence with correct mixture prior
- * 
- * Key algorithm features (per Fan et al. 2021):
- * - O(N²) mixture prior gradient: each particle feels pull from ALL prior means
- * - O(N²) Stein kernel: particle interactions for diversity
- * - Hybrid likelihood: exact Student-t weights, log-squared gradients
- * 
- * Key optimizations:
- * - 2D tiled grid for O(N²) Stein: guarantees SM saturation for any N
- * - Shared memory tiling for bandwidth-efficient access
- * - CUB reductions for log-sum-exp
- * - Small N path (N ≤ 4096): persistent CTA, all data in SMEM
- * - NO device→host copies in loop (CUDA Graph compatible)
- * - EMA bandwidth smoothing for stability
- * 
- * Thread-safe: Each SVPFState has its own optimization buffers.
- * 
- * @param state SVPF state
- * @param d_observations Device array [T]
- * @param T Number of observations
- * @param params Model parameters
- * @param d_loglik_out Device array [T] for log-likelihoods
- * @param d_vol_out Device array [T] for volatilities (can be NULL)
- */
-void svpf_run_sequence_optimized(
-    SVPFState* state,
-    const float* d_observations,
-    int T,
-    const SVPFParams* params,
-    float* d_loglik_out,
-    float* d_vol_out
-);
-
-/**
  * @brief OPTIMIZED: Single step (for real-time/HFT usage)
  * 
  * Uses pre-allocated buffers (zero malloc in hot loop).
@@ -448,33 +399,6 @@ void svpf_step_adaptive(
     float* h_loglik_out,
     float* h_vol_out,
     float* h_mean_out
-);
-
-/**
- * @brief CUDA GRAPH: Fastest sequence runner (minimal launch overhead)
- * 
- * Captures one timestep as a CUDA Graph, then replays it T times.
- * Reduces per-step overhead from ~65μs to ~5-10μs.
- * 
- * Uses correct O(N²) mixture prior gradient per Fan et al. 2021.
- * 
- * Note: Graph is cached and reused. First call has capture overhead.
- * Graph is invalidated if n_particles or n_stein_steps change.
- * 
- * @param state SVPF state
- * @param d_observations Device array [T]
- * @param T Number of observations
- * @param params Model parameters
- * @param d_loglik_out Device array [T] for log-likelihoods
- * @param d_vol_out Device array [T] for volatilities (can be NULL)
- */
-void svpf_run_sequence_graph(
-    SVPFState* state,
-    const float* d_observations,
-    int T,
-    const SVPFParams* params,
-    float* d_loglik_out,
-    float* d_vol_out
 );
 
 /**
