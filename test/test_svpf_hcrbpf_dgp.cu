@@ -539,19 +539,19 @@ static Metrics run_svpf_on_scenario(
         filter->rmsprop_eps = 1e-6f;
         
         filter->use_mim = 1;
-        filter->mim_jump_prob = 0.10f;
-        filter->mim_jump_scale = 5.0f;
+        filter->mim_jump_prob = 0.15f;
+        filter->mim_jump_scale = 7.0f;
         
         filter->use_asymmetric_rho = 1;
         filter->rho_up = 0.99f;
-        filter->rho_down = 0.91f;
+        filter->rho_down = 0.92f;
         
         // Particle-local parameters
         // Key insight: DGP has θ(z), σ(z) — params depend on latent z
         // We use h deviation as proxy: high h → likely high z → different dynamics
-        filter->use_local_params = 1;
-        filter->delta_rho = 0.02f;    // ±2% rho variation based on h deviation
-        filter->delta_sigma = 0.1f;   // ±10% sigma variation
+        filter->use_local_params = 0;
+        filter->delta_rho = 0.04f;    // ±2% rho variation based on h deviation
+        filter->delta_sigma = 0.3f;   // ±10% sigma variation
         
         // Newton-Stein (Hessian preconditioning)
         // Adaptive step size based on local curvature: H^{-1} * grad
