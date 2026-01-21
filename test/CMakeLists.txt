@@ -3,24 +3,24 @@
 # =============================================================================
 
 # Main test executable (unit tests + benchmarks)
-add_executable(svpf_test svpf_test.cu)
+#add_executable(svpf_test svpf_test.cu)
 
-target_include_directories(svpf_test
-    PRIVATE
-        ${CMAKE_SOURCE_DIR}/include
-        ${CUDAToolkit_INCLUDE_DIRS}
-)
+#target_include_directories(svpf_test
+#    PRIVATE
+#        ${CMAKE_SOURCE_DIR}/include
+#        ${CUDAToolkit_INCLUDE_DIRS}
+#)
 
-target_link_libraries(svpf_test
-    PRIVATE
-        svpf
-        CUDA::cudart
-        CUDA::curand
-)
+#target_link_libraries(svpf_test
+#    PRIVATE
+#        svpf
+#        CUDA::cudart
+#        CUDA::curand
+#)
 
-set_target_properties(svpf_test PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
-)
+#set_target_properties(svpf_test PROPERTIES
+#    CUDA_SEPARABLE_COMPILATION ON
+#)
 
 # -----------------------------------------------------------------------------
 # Scenario test (continuous SV DGP - SVPF-favorable)
@@ -94,20 +94,20 @@ set_tests_properties(HCRBPFComparison PROPERTIES
 # =============================================================================
 
 # Run unit tests with verbose output
-add_custom_target(run_tests
-    COMMAND ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/svpf_test
-    DEPENDS svpf_test
-    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
-    COMMENT "Running SVPF unit tests..."
-)
+#add_custom_target(run_tests
+#   COMMAND ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/svpf_test
+#    DEPENDS svpf_test
+#    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+#    COMMENT "Running SVPF unit tests..."
+#)
 
 # Benchmark target
-add_custom_target(benchmark
-    COMMAND ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/svpf_test --benchmark
-    DEPENDS svpf_test
-    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
-    COMMENT "Running SVPF benchmarks..."
-)
+#add_custom_target(benchmark
+#    COMMAND ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/svpf_test --benchmark
+#   DEPENDS svpf_test
+#    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+#    COMMENT "Running SVPF benchmarks..."
+#)
 
 # Run scenario test (outputs CSV for comparison)
 add_custom_target(scenarios

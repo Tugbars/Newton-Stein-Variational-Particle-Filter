@@ -510,6 +510,13 @@ static Metrics run_svpf_on_scenario(
         filter->rho_up = 0.99f;
         filter->rho_down = 0.91f;
         
+        // Particle-local parameters
+        // Key insight: DGP has θ(z), σ(z) — params depend on latent z
+        // We use h deviation as proxy: high h → likely high z → different dynamics
+        filter->use_local_params = 1;
+        filter->delta_rho = 0.05f;    // ±2% rho variation based on h deviation
+        filter->delta_sigma = 0.15f;   // ±10% sigma variation
+        
         filter->use_guide = 1;
         filter->guide_strength = 0.05f;
     } else {
@@ -517,6 +524,7 @@ static Metrics run_svpf_on_scenario(
         filter->use_annealing = 0;
         filter->use_mim = 0;
         filter->use_asymmetric_rho = 0;
+        filter->use_local_params = 0;
         filter->use_guide = 0;
     }
     

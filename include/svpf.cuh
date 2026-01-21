@@ -95,6 +95,9 @@ typedef struct {
     // Required for correct O(N²) mixture prior + O(N) likelihood decomposition
     float* d_grad_lik;
     
+    // Particle-local parameters: h_mean from previous step
+    float* d_h_mean_prev;
+    
     // Staging buffers for CUDA Graph (fixed addresses)
     float* d_obs_staging;
     float* d_loglik_staging;
@@ -229,6 +232,13 @@ typedef struct {
     int use_mim;            // Enable MIM predict (vs standard Gaussian)
     float mim_jump_prob;    // Probability of jump component (e.g., 0.05)
     float mim_jump_scale;   // Scale factor for jump component std (e.g., 5.0)
+    
+    // Particle-local parameters config
+    // Key insight: DGP has θ(z), σ(z) — params depend on latent z
+    // We use h deviation from mean as proxy: high h → likely high z
+    int use_local_params;   // Enable particle-local ρ and σ
+    float delta_rho;        // Rho sensitivity to h deviation (e.g., 0.02)
+    float delta_sigma;      // Sigma sensitivity to |h deviation| (e.g., 0.1)
     
     // Asymmetric persistence config
     int use_asymmetric_rho; // Enable asymmetric rho (vol spikes fast, decays slow)

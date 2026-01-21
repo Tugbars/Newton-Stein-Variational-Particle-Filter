@@ -121,16 +121,6 @@ __device__ float block_reduce_max(float val) {
 }
 
 // =============================================================================
-// Kernel 0: Increment timestep (for CUDA Graph path)
-// =============================================================================
-
-__global__ void svpf_increment_timestep_kernel(int* d_timestep) {
-    if (threadIdx.x == 0 && blockIdx.x == 0) {
-        (*d_timestep)++;
-    }
-}
-
-// =============================================================================
 // Kernel 1: Predict (Run ONCE per timestep - samples process noise)
 // =============================================================================
 
@@ -177,12 +167,15 @@ __global__ void svpf_predict_mim_kernel(
     float* __restrict__ h_prev,
     curandStatePhilox4_32_10_t* __restrict__ rng,
     const float* __restrict__ d_y,
+    const float* __restrict__ d_h_mean,  // Mean from previous step (for local params)
     int t,
-    float rho_up,         // Persistence when vol increasing (e.g., 0.98)
-    float rho_down,       // Persistence when vol decreasing (e.g., 0.93)
+    float rho_up,         // Base persistence when vol increasing
+    float rho_down,       // Base persistence when vol decreasing
     float sigma_z, float mu, float gamma,
-    float jump_prob,      // e.g., 0.05 (5% of particles get large innovation)
-    float jump_scale,     // e.g., 5.0 (5x std dev for jump component)
+    float jump_prob,      // MIM jump probability
+    float jump_scale,     // MIM jump scale
+    float delta_rho,      // Particle-local rho sensitivity (e.g., 0.02)
+    float delta_sigma,    // Particle-local sigma sensitivity (e.g., 0.1)
     int n
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -192,6 +185,25 @@ __global__ void svpf_predict_mim_kernel(
     float h_prev_i = h_prev[i];
     h_prev[i] = h_i;  // Store for next step
 
+    // =========================================================================
+    // PARTICLE-LOCAL PARAMETERS
+    // Key insight: DGP has θ(z), σ(z) — params depend on latent z
+    // We don't have z, but h is correlated with z (high h → high z)
+    // So we use h deviation from mean as proxy for z-dependent behavior
+    // =========================================================================
+    float h_bar = *d_h_mean;
+    float dev = h_i - h_bar;
+    float abs_dev = fabsf(dev);
+    float tanh_dev = tanhf(dev);  // Maps (-inf, inf) → (-1, 1)
+
+    // Local rho: particles far from mean may have different persistence
+    // tanh ensures smooth bounded adjustment
+    float rho_adjust = delta_rho * tanh_dev;
+    
+    // Local sigma: particles far from mean get higher vol-of-vol
+    // This mimics "when volatility is high, it's also more volatile"
+    float sigma_scale = 1.0f + delta_sigma * abs_dev;
+
     // Sample innovation noise
     float noise = curand_normal(&rng[i]);
     float selector = curand_uniform(&rng[i]);
@@ -200,125 +212,22 @@ __global__ void svpf_predict_mim_kernel(
     float scale = (selector < jump_prob) ? jump_scale : 1.0f;
 
     // Asymmetric persistence: vol spikes fast, decays slow
-    // Compare current h to previous h (not h_prev which we just overwrote)
-    float rho = (h_i > h_prev_i) ? rho_up : rho_down;
+    float base_rho = (h_i > h_prev_i) ? rho_up : rho_down;
+    
+    // Apply particle-local adjustment, clamp to [0, 0.999]
+    float rho = fminf(fmaxf(base_rho + rho_adjust, 0.0f), 0.999f);
+    
+    // Apply particle-local sigma scaling
+    float sigma_local = sigma_z * sigma_scale;
 
     // Leverage effect
     float y_prev = (t > 0) ? d_y[t - 1] : 0.0f;
     float vol_prev = safe_exp(h_i / 2.0f);
     float leverage = gamma * y_prev / (vol_prev + 1e-8f);
 
-    // Evolve state with scaled innovation
+    // Evolve state with local params and scaled innovation
     float prior_mean = mu + rho * (h_i - mu) + leverage;
-    h[i] = clamp_logvol(prior_mean + sigma_z * scale * noise);
-}
-
-// Version reading t from device memory (for CUDA Graph path)
-__global__ void svpf_predict_kernel_graph(
-    float* __restrict__ h,
-    float* __restrict__ h_prev,
-    curandStatePhilox4_32_10_t* __restrict__ rng,
-    const float* __restrict__ d_y,
-    const int* __restrict__ d_timestep,
-    float rho, float sigma_z, float mu, float gamma,
-    int n
-) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    
-    int t = *d_timestep;
-    
-    float h_i = h[i];
-    h_prev[i] = h_i;
-    
-    float y_prev = (t > 0) ? d_y[t - 1] : 0.0f;
-    
-    float noise = curand_normal(&rng[i]);
-    float vol_prev = safe_exp(h_i / 2.0f);
-    float leverage = gamma * y_prev / (vol_prev + 1e-8f);
-    
-    h[i] = clamp_logvol(mu + rho * (h_i - mu) + sigma_z * noise + leverage);
-}
-
-// =============================================================================
-// Kernel 2: Likelihood + Gradient (Deterministic - runs after predict and 
-//           after each Stein step)
-// =============================================================================
-
-__global__ void svpf_likelihood_grad_kernel(
-    const float* __restrict__ h,
-    const float* __restrict__ h_prev,
-    float* __restrict__ grad,
-    float* __restrict__ log_w,
-    const float* __restrict__ d_y,
-    int t,
-    float rho, float sigma_z, float mu, float nu, float student_t_const,
-    int n
-) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    
-    float h_i = h[i];
-    float h_prev_i = h_prev[i];
-    float y_t = d_y[t];
-    
-    // WEIGHTS: Exact Student-t (unbiased IS)
-    float vol = safe_exp(h_i);
-    float scaled_y_sq = (y_t * y_t) / (vol + 1e-8f);
-    log_w[i] = student_t_const - 0.5f * h_i
-             - (nu + 1.0f) / 2.0f * log1pf(fmaxf(scaled_y_sq / nu, -0.999f));
-    
-    // GRADIENT: Prior (per-particle, not mixture - legacy)
-    float mu_prior = mu + rho * (h_prev_i - mu);
-    float sigma_z_sq = sigma_z * sigma_z + 1e-8f;
-    float grad_prior = -(h_i - mu_prior) / sigma_z_sq;
-    
-    // GRADIENT: Log-squared likelihood (linear restoring force)
-    float log_y2 = logf(y_t * y_t + 1e-10f);
-    float offset = -1.0f / nu;
-    float R_noise = 2.0f;
-    float grad_lik = (log_y2 - h_i - offset) / R_noise;
-    
-    grad[i] = fminf(fmaxf(grad_prior + grad_lik, -10.0f), 10.0f);
-}
-
-// Graph version - reads t from device memory
-__global__ void svpf_likelihood_grad_kernel_graph(
-    const float* __restrict__ h,
-    const float* __restrict__ h_prev,
-    float* __restrict__ grad,
-    float* __restrict__ log_w,
-    const float* __restrict__ d_y,
-    const int* __restrict__ d_timestep,
-    float rho, float sigma_z, float mu, float nu, float student_t_const,
-    int n
-) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    
-    int t = *d_timestep;
-    float h_i = h[i];
-    float h_prev_i = h_prev[i];
-    float y_t = d_y[t];
-    
-    // WEIGHTS: Exact Student-t
-    float vol = safe_exp(h_i);
-    float scaled_y_sq = (y_t * y_t) / (vol + 1e-8f);
-    log_w[i] = student_t_const - 0.5f * h_i
-             - (nu + 1.0f) / 2.0f * log1pf(fmaxf(scaled_y_sq / nu, -0.999f));
-    
-    // GRADIENT: Prior (legacy per-particle)
-    float mu_prior = mu + rho * (h_prev_i - mu);
-    float sigma_z_sq = sigma_z * sigma_z + 1e-8f;
-    float grad_prior = -(h_i - mu_prior) / sigma_z_sq;
-    
-    // GRADIENT: Log-squared likelihood
-    float log_y2 = logf(y_t * y_t + 1e-10f);
-    float offset = -1.0f / nu;
-    float R_noise = 2.0f;
-    float grad_lik = (log_y2 - h_i - offset) / R_noise;
-    
-    grad[i] = fminf(fmaxf(grad_prior + grad_lik, -10.0f), 10.0f);
+    h[i] = clamp_logvol(prior_mean + sigma_local * scale * noise);
 }
 
 // =============================================================================
@@ -515,39 +424,6 @@ __global__ void svpf_likelihood_only_kernel(
     grad_lik[i] = (log_y2 - h_i - offset) / R_noise;
 }
 
-// Graph version - reads timestep from device memory
-__global__ void svpf_likelihood_only_kernel_graph(
-    const float* __restrict__ h,
-    float* __restrict__ grad_lik,
-    float* __restrict__ log_w,
-    const float* __restrict__ d_y,
-    const int* __restrict__ d_timestep,
-    float nu,
-    float student_t_const,
-    int n
-) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    
-    int t = *d_timestep;
-    float h_i = h[i];
-    float y_t = d_y[t];
-    
-    // WEIGHTS: Exact Student-t (unbiased IS)
-    float vol = safe_exp(h_i);
-    float scaled_y_sq = (y_t * y_t) / (vol + 1e-8f);
-    
-    log_w[i] = student_t_const - 0.5f * h_i
-             - (nu + 1.0f) / 2.0f * log1pf(fmaxf(scaled_y_sq / nu, -0.999f));
-    
-    // GRADIENT: Log-squared (linear restoring force)
-    float log_y2 = logf(y_t * y_t + 1e-10f);
-    float offset = -1.0f / nu;
-    float R_noise = 2.0f;
-    
-    grad_lik[i] = (log_y2 - h_i - offset) / R_noise;
-}
-
 // =============================================================================
 // Kernel 2d: Combine Gradients (prior + likelihood)
 // =============================================================================
@@ -608,61 +484,6 @@ __global__ void svpf_logsumexp_kernel(
         d_loglik[t] = local_max + logf(local_sum / (float)n + 1e-10f);
         *d_max_log_w = local_max;
     }
-}
-
-// Graph version - reads t from device memory
-__global__ void svpf_logsumexp_kernel_graph(
-    const float* __restrict__ log_w,
-    float* __restrict__ d_loglik,
-    float* __restrict__ d_max_log_w,
-    const int* __restrict__ d_timestep,
-    int n
-) {
-    __shared__ float warp_vals[BLOCK_SIZE / WARP_SIZE];
-    
-    int t = *d_timestep;
-    
-    float local_max = -1e10f;
-    for (int i = threadIdx.x; i < n; i += blockDim.x) {
-        local_max = fmaxf(local_max, log_w[i]);
-    }
-    
-    int lane = threadIdx.x % WARP_SIZE;
-    int wid = threadIdx.x / WARP_SIZE;
-    local_max = warp_reduce_max(local_max);
-    if (lane == 0) warp_vals[wid] = local_max;
-    __syncthreads();
-    
-    local_max = (threadIdx.x < BLOCK_SIZE / WARP_SIZE) ? warp_vals[threadIdx.x] : -1e10f;
-    if (wid == 0) local_max = warp_reduce_max(local_max);
-    
-    __shared__ float s_max;
-    if (threadIdx.x == 0) s_max = local_max;
-    __syncthreads();
-    local_max = s_max;
-    
-    float local_sum = 0.0f;
-    for (int i = threadIdx.x; i < n; i += blockDim.x) {
-        local_sum += expf(log_w[i] - local_max);
-    }
-    local_sum = block_reduce_sum(local_sum);
-    
-    if (threadIdx.x == 0) {
-        d_loglik[t] = local_max + logf(local_sum / (float)n + 1e-10f);
-        *d_max_log_w = local_max;
-    }
-}
-
-// Multi-block version for large N using CUB
-__global__ void svpf_exp_shifted_kernel(
-    const float* __restrict__ log_w,
-    const float* __restrict__ d_max_log_w,  // Read from device
-    float* __restrict__ exp_w,
-    int n
-) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    exp_w[i] = expf(log_w[i] - *d_max_log_w);
 }
 
 __global__ void svpf_finalize_loglik_kernel(
@@ -776,82 +597,6 @@ __global__ void svpf_stein_2d_kernel(
     }
 }
 
-// =============================================================================
-// Kernel 5b: Persistent CTA Stein Kernel (Small N path)
-// =============================================================================
-
-/**
- * Persistent CTA approach:
- * - Launch one block per SM (or small multiple)
- * - Each block loads ALL data once into SMEM
- * - Grid-stride over i: block b handles particles b, b+gridDim.x, b+2*gridDim.x...
- * - Within each i: threads cooperate on j summation
- * 
- * CRITICAL: Writes to phi[], NOT h[] - avoids race condition.
- * Caller must apply transport separately with svpf_apply_transport_kernel.
- */
-__global__ void svpf_stein_persistent_kernel(
-    const float* __restrict__ h,      // READ-ONLY
-    const float* __restrict__ grad,
-    float* __restrict__ phi,          // OUTPUT: transport direction
-    const float* __restrict__ d_bandwidth,
-    int n
-) {
-    extern __shared__ float smem[];
-    float* sh_h = smem;
-    float* sh_grad = smem + n;
-    float* sh_reduce = smem + 2 * n;  // Workspace for reduction
-    
-    // Load ALL data once (cooperative across threads)
-    for (int j = threadIdx.x; j < n; j += blockDim.x) {
-        sh_h[j] = h[j];
-        sh_grad[j] = grad[j];
-    }
-    __syncthreads();
-    
-    float bw = *d_bandwidth;
-    float bw_sq = bw * bw;
-    
-    // Grid-stride loop over particles
-    for (int i = blockIdx.x; i < n; i += gridDim.x) {
-        float h_i = sh_h[i];
-        
-        // Threads cooperate on j summation
-        float k_sum = 0.0f;
-        float gk_sum = 0.0f;
-        
-        for (int j = threadIdx.x; j < n; j += blockDim.x) {
-            float diff = h_i - sh_h[j];
-            float K = expf(-diff * diff / (2.0f * bw_sq));
-            k_sum += K * sh_grad[j];
-            gk_sum += -K * diff / bw_sq;
-        }
-        
-        // Block reduction for k_sum
-        k_sum = warp_reduce_sum(k_sum);
-        int lane = threadIdx.x % WARP_SIZE;
-        int wid = threadIdx.x / WARP_SIZE;
-        if (lane == 0) sh_reduce[wid] = k_sum;
-        __syncthreads();
-        
-        k_sum = (threadIdx.x < BLOCK_SIZE / WARP_SIZE) ? sh_reduce[threadIdx.x] : 0.0f;
-        if (wid == 0) k_sum = warp_reduce_sum(k_sum);
-        
-        // Block reduction for gk_sum
-        gk_sum = warp_reduce_sum(gk_sum);
-        if (lane == 0) sh_reduce[wid] = gk_sum;
-        __syncthreads();
-        
-        gk_sum = (threadIdx.x < BLOCK_SIZE / WARP_SIZE) ? sh_reduce[threadIdx.x] : 0.0f;
-        if (wid == 0) gk_sum = warp_reduce_sum(gk_sum);
-        
-        // Thread 0 writes transport direction to phi (NOT h)
-        if (threadIdx.x == 0) {
-            phi[i] = (k_sum + gk_sum) / (float)n;
-        }
-        __syncthreads();  // Ensure write completes before next iteration
-    }
-}
 
 // =============================================================================
 // Kernel 6: Apply Transport (for 2D kernel path) - Basic version
@@ -1023,60 +768,6 @@ __global__ void svpf_adaptive_bandwidth_kernel(
     }
 }
 
-// -----------------------------------------------------------------------------
-// Kernel A3: Annealed Gradient Computation (Improvement #2)
-//
-// Computes gradient with annealing factor β:
-//   grad = β * grad_likelihood + grad_prior
-//
-// Called instead of standard gradient kernel during annealing passes.
-// -----------------------------------------------------------------------------
-
-__global__ void svpf_gradient_annealed_kernel(
-    const float* __restrict__ h,
-    const float* __restrict__ h_prev,
-    float* __restrict__ grad_log_p,
-    float y,
-    float rho,
-    float sigma_z,
-    float mu,
-    float gamma,
-    float nu,
-    float student_t_const,
-    float y_prev,
-    float beta,                           // Annealing factor [0, 1]
-    int n
-) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    
-    float h_i = h[i];
-    float h_prev_i = h_prev[i];
-    
-    // Prior gradient: d/dh log p(h|h_prev)
-    // p(h|h_prev) ~ N(mu + rho*(h_prev - mu) + gamma*leverage, sigma_z²)
-    float prior_mean = mu + rho * (h_prev_i - mu);
-    if (fabsf(y_prev) > 1e-8f) {
-        float vol_prev = safe_exp(h_prev_i / 2.0f);
-        prior_mean += gamma * y_prev / vol_prev;
-    }
-    float grad_prior = -(h_i - prior_mean) / (sigma_z * sigma_z);
-    
-    // Likelihood gradient: d/dh log p(y|h)
-    // Student-t: log p(y|h) = const - (nu+1)/2 * log(1 + (y/vol)²/nu) - h/2
-    float vol = safe_exp(h_i / 2.0f);
-    float z = y / vol;
-    float z_sq_over_nu = (z * z) / nu;
-    
-    // d/dh log p(y|h) = -1/2 + (nu+1)/2 * (z²/nu) / (1 + z²/nu) * (-1)
-    //                 = -1/2 + (nu+1)/2 * z² / (nu + z²) * (-1)
-    // Simplified: grad = -0.5 + (nu+1) * z² / (2*(nu + z²))
-    float grad_lik = -0.5f + ((nu + 1.0f) * z * z) / (2.0f * (nu + z * z));
-    
-    // Annealed gradient: β * likelihood + prior
-    grad_log_p[i] = beta * grad_lik + grad_prior;
-}
-
 // =============================================================================
 // Kernel 7: Volatility Mean
 // =============================================================================
@@ -1098,23 +789,17 @@ __global__ void svpf_vol_mean_opt_kernel(
     }
 }
 
-// Graph version - reads t from device memory
-__global__ void svpf_vol_mean_opt_kernel_graph(
-    const float* __restrict__ h,
-    float* __restrict__ d_vol,
-    const int* __restrict__ d_timestep,
+// =============================================================================
+// Kernel: Store h_mean for particle-local params
+// =============================================================================
+// Takes sum from CUB reduction and stores mean to d_h_mean_prev
+__global__ void svpf_store_h_mean_kernel(
+    const float* __restrict__ d_sum,
+    float* __restrict__ d_h_mean_prev,
     int n
 ) {
-    int t = *d_timestep;
-    
-    float local_sum = 0.0f;
-    for (int i = threadIdx.x; i < n; i += blockDim.x) {
-        local_sum += safe_exp(h[i] / 2.0f);
-    }
-    local_sum = block_reduce_sum(local_sum);
-    
     if (threadIdx.x == 0) {
-        d_vol[t] = local_sum / (float)n;
+        *d_h_mean_prev = *d_sum / (float)n;
     }
 }
 
@@ -1171,6 +856,12 @@ void svpf_optimized_init(SVPFOptimizedState* opt, int n) {
     cudaMalloc(&opt->d_phi, n * sizeof(float));
     cudaMalloc(&opt->d_grad_lik, n * sizeof(float));  // For mixture prior fix
     
+    // Particle-local parameters: store h_mean from previous step
+    cudaMalloc(&opt->d_h_mean_prev, sizeof(float));
+    // Initialize to a reasonable default (params->mu would be better, but we don't have it here)
+    float init_h_mean = -3.5f;  // Typical log-vol
+    cudaMemcpy(opt->d_h_mean_prev, &init_h_mean, sizeof(float), cudaMemcpyHostToDevice);
+    
     // Staging buffers for CUDA Graph
     cudaMalloc(&opt->d_obs_staging, MAX_T_SIZE * sizeof(float));
     cudaMalloc(&opt->d_loglik_staging, MAX_T_SIZE * sizeof(float));
@@ -1206,6 +897,7 @@ void svpf_optimized_cleanup(SVPFOptimizedState* opt) {
     cudaFree(opt->d_exp_w);
     cudaFree(opt->d_phi);
     cudaFree(opt->d_grad_lik);
+    cudaFree(opt->d_h_mean_prev);
     cudaFree(opt->d_obs_staging);
     cudaFree(opt->d_loglik_staging);
     cudaFree(opt->d_vol_staging);
@@ -1235,480 +927,6 @@ void svpf_optimized_cleanup_state(SVPFState* state) {
     if (state) {
         svpf_optimized_cleanup(&state->opt_backend);
     }
-}
-
-// =============================================================================
-// Host API: Optimized Sequence Runner (NO host sync in loop)
-// =============================================================================
-
-void svpf_run_sequence_optimized(
-    SVPFState* state,
-    const float* d_observations,
-    int T,
-    const SVPFParams* params,
-    float* d_loglik_out,
-    float* d_vol_out
-) {
-    SVPFOptimizedState* opt = get_opt(state);
-    int n = state->n_particles;
-    int n_stein = state->n_stein_steps;
-    cudaStream_t stream = state->stream;
-    
-    svpf_optimized_init(opt, n);
-    
-    // Pre-compute constant
-    float student_t_const = lgammaf((state->nu + 1.0f) / 2.0f)
-                          - lgammaf(state->nu / 2.0f)
-                          - 0.5f * logf((float)M_PI * state->nu);
-    
-    // Kernel configs
-    int n_blocks_1d = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    int num_tiles = (n + TILE_J - 1) / TILE_J;
-    dim3 grid_2d(n, num_tiles);
-    
-    bool use_small_n = (n <= SMALL_N_THRESHOLD);
-    
-    // Persistent CTA config: ~1 block per SM (query at runtime)
-    int device;
-    cudaGetDevice(&device);
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, device);
-    int num_sms = prop.multiProcessorCount;
-    
-    int persistent_blocks = min(num_sms, n);
-    // SMEM: h[n] + grad[n] + reduce[BLOCK_SIZE/WARP_SIZE]
-    size_t persistent_smem = (2 * n + BLOCK_SIZE / WARP_SIZE) * sizeof(float);
-    
-    // Check if SMEM fits; if not, fall back to 2D tiled path
-    if (persistent_smem > prop.sharedMemPerBlockOptin) {
-        use_small_n = false;
-    }
-    
-    // Set max dynamic shared memory for persistent kernel
-    if (use_small_n) {
-        cudaFuncSetAttribute(svpf_stein_persistent_kernel,
-                            cudaFuncAttributeMaxDynamicSharedMemorySize,
-                            persistent_smem);
-    }
-    
-    float bw_alpha = 0.3f;
-    
-    // Main loop - NO cudaStreamSynchronize inside
-    for (int t = 0; t < T; t++) {
-        
-        // === 1. Predict (samples noise ONCE) ===
-        svpf_predict_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
-            state->h, state->h_prev, state->rng_states,
-            d_observations, t,
-            params->rho, params->sigma_z, params->mu, params->gamma,
-            n
-        );
-        
-        // === 2. Mixture Prior Gradient (O(N²) - CORRECT per paper Eq. 6) ===
-        // This is the key fix: prior is a Gaussian mixture over ALL h_prev particles
-        if (n <= SMALL_N_THRESHOLD) {
-            svpf_mixture_prior_grad_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
-                state->h, state->h_prev, state->grad_log_p,
-                params->rho, params->sigma_z, params->mu, n
-            );
-        } else {
-            svpf_mixture_prior_grad_tiled_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
-                state->h, state->h_prev, state->grad_log_p,
-                params->rho, params->sigma_z, params->mu, n
-            );
-        }
-        
-        // === 3. Likelihood Gradient + Log Weights ===
-        svpf_likelihood_only_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
-            state->h, opt->d_grad_lik, state->log_weights,
-            d_observations, t, state->nu, student_t_const, n
-        );
-        
-        // === 4. Combine Gradients: grad = grad_prior + grad_lik ===
-        svpf_combine_gradients_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
-            state->grad_log_p, opt->d_grad_lik, state->grad_log_p,
-            1.0f,  // beta = 1.0 (no annealing in this path)
-            n
-        );
-        
-        // === 5. Log-Sum-Exp (all on device) ===
-        if (n <= 4096) {
-            // Single block for small N
-            svpf_logsumexp_kernel<<<1, BLOCK_SIZE, 0, stream>>>(
-                state->log_weights, d_loglik_out, opt->d_max_log_w, t, n
-            );
-        } else {
-            // Multi-block with CUB
-            cub::DeviceReduce::Max(opt->d_temp_storage, opt->temp_storage_bytes,
-                                   state->log_weights, opt->d_max_log_w, n, stream);
-            
-            svpf_exp_shifted_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
-                state->log_weights, opt->d_max_log_w, opt->d_exp_w, n
-            );
-            
-            cub::DeviceReduce::Sum(opt->d_temp_storage, opt->temp_storage_bytes,
-                                   opt->d_exp_w, opt->d_sum_exp, n, stream);
-            
-            svpf_finalize_loglik_kernel<<<1, 1, 0, stream>>>(
-                opt->d_max_log_w, opt->d_sum_exp, d_loglik_out, t, n
-            );
-        }
-        
-        // === 6. Bandwidth (every few steps for stability) ===
-        if (t % BANDWIDTH_UPDATE_INTERVAL == 0) {
-            svpf_bandwidth_kernel<<<1, BLOCK_SIZE, 0, stream>>>(
-                state->h, opt->d_bandwidth, opt->d_bandwidth_sq, bw_alpha, n
-            );
-        }
-        
-        // === 7. Stein Transport Iterations ===
-        for (int s = 0; s < n_stein; s++) {
-            if (use_small_n) {
-                // Persistent CTA path - writes to phi, then apply transport
-                cudaMemsetAsync(opt->d_phi, 0, n * sizeof(float), stream);
-                
-                svpf_stein_persistent_kernel<<<persistent_blocks, BLOCK_SIZE, persistent_smem, stream>>>(
-                    state->h, state->grad_log_p,
-                    opt->d_phi, opt->d_bandwidth, n
-                );
-                
-                // Apply transport (same as large N path)
-                svpf_apply_transport_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
-                    state->h, opt->d_phi, SVPF_STEIN_STEP_SIZE, n
-                );
-            } else {
-                // 2D tiled path
-                cudaMemsetAsync(opt->d_phi, 0, n * sizeof(float), stream);
-                
-                svpf_stein_2d_kernel<<<grid_2d, BLOCK_SIZE, 0, stream>>>(
-                    state->h, state->grad_log_p, opt->d_phi, opt->d_bandwidth, n
-                );
-                
-                svpf_apply_transport_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
-                    state->h, opt->d_phi, SVPF_STEIN_STEP_SIZE, n
-                );
-            }
-            
-            // Re-compute gradients for next Stein iteration (deterministic, no noise)
-            if (s < n_stein - 1) {
-                // Recompute mixture prior (particles moved)
-                if (n <= SMALL_N_THRESHOLD) {
-                    svpf_mixture_prior_grad_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
-                        state->h, state->h_prev, state->grad_log_p,
-                        params->rho, params->sigma_z, params->mu, n
-                    );
-                } else {
-                    svpf_mixture_prior_grad_tiled_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
-                        state->h, state->h_prev, state->grad_log_p,
-                        params->rho, params->sigma_z, params->mu, n
-                    );
-                }
-                
-                // Recompute likelihood gradient
-                svpf_likelihood_only_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
-                    state->h, opt->d_grad_lik, state->log_weights,
-                    d_observations, t, state->nu, student_t_const, n
-                );
-                
-                // Combine
-                svpf_combine_gradients_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
-                    state->grad_log_p, opt->d_grad_lik, state->grad_log_p,
-                    1.0f, n
-                );
-            }
-        }
-        
-        // === 8. Volatility Mean ===
-        if (d_vol_out) {
-            svpf_vol_mean_opt_kernel<<<1, BLOCK_SIZE, 0, stream>>>(
-                state->h, d_vol_out, t, n
-            );
-        }
-    }
-    
-    // Single sync at end
-    cudaStreamSynchronize(stream);
-}
-
-// =============================================================================
-// Host API: CUDA Graph Sequence Runner (Fastest - minimal launch overhead)
-// =============================================================================
-
-/**
- * CUDA Graph-accelerated sequence runner.
- * 
- * Captures one timestep as a graph, then replays T times.
- * Uses staging buffers so graph captures fixed addresses.
- * 
- * Key fixes:
- * - Passthrough: If stream is already capturing, fall back to optimized path
- * - Strict sync before capture
- * - Check n_stein in invalidation
- * - Emergency fallback on capture failure
- */
-void svpf_run_sequence_graph(
-    SVPFState* state,
-    const float* d_observations,
-    int T,
-    const SVPFParams* params,
-    float* d_loglik_out,
-    float* d_vol_out
-) {
-    SVPFOptimizedState* opt = get_opt(state);
-    int n = state->n_particles;
-    int n_stein = state->n_stein_steps;
-    
-    // Sanity check T
-    if (T > MAX_T_SIZE) {
-        svpf_run_sequence_optimized(state, d_observations, T, params, d_loglik_out, d_vol_out);
-        return;
-    }
-    
-    // === CHECK STATE->STREAM CAPTURE STATUS FIRST (before any sync) ===
-    // If user's stream is capturing, we cannot interfere - fall back to optimized path
-    cudaStreamCaptureStatus captureStatus;
-    cudaStreamIsCapturing(state->stream, &captureStatus);
-    if (captureStatus != cudaStreamCaptureStatusNone) {
-        svpf_run_sequence_optimized(state, d_observations, T, params, d_loglik_out, d_vol_out);
-        return;
-    }
-    
-    // Now safe to initialize (may create our dedicated stream)
-    svpf_optimized_init(opt, n);
-    
-    // Use our dedicated graph_stream (default/NULL stream doesn't support graph capture)
-    cudaStream_t stream = opt->graph_stream;
-    
-    // Sync with state->stream to ensure observations and particles are ready
-    cudaStreamSynchronize(state->stream);
-    
-    // === STAGING SETUP ===
-    // Copy observations to fixed staging address that graph will use
-    cudaMemcpyAsync(opt->d_obs_staging, d_observations, T * sizeof(float), 
-                    cudaMemcpyDeviceToDevice, stream);
-    
-    // Reset counters
-    int zero = 0;
-    float zero_f = 0.0f;
-    cudaMemcpyAsync(opt->d_timestep, &zero, sizeof(int), cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(opt->d_bandwidth_sq, &zero_f, sizeof(float), cudaMemcpyHostToDevice, stream);
-    
-    // Pre-compute constant
-    float student_t_const = lgammaf((state->nu + 1.0f) / 2.0f)
-                          - lgammaf(state->nu / 2.0f)
-                          - 0.5f * logf((float)M_PI * state->nu);
-    
-    // Kernel configs
-    int n_blocks_1d = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    
-    bool use_small_n = (n <= SMALL_N_THRESHOLD);
-    
-    int device;
-    cudaGetDevice(&device);
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, device);
-    int num_sms = prop.multiProcessorCount;
-    
-    int persistent_blocks = min(num_sms, n);
-    size_t persistent_smem = (2 * n + BLOCK_SIZE / WARP_SIZE) * sizeof(float);
-    
-    if (persistent_smem > prop.sharedMemPerBlockOptin) {
-        use_small_n = false;
-    }
-    
-    if (use_small_n) {
-        cudaFuncSetAttribute(svpf_stein_persistent_kernel,
-                            cudaFuncAttributeMaxDynamicSharedMemorySize,
-                            persistent_smem);
-    }
-    
-    float bw_alpha = 0.3f;
-    
-    // === GRAPH CAPTURE LOGIC ===
-    // Invalidation: Check n AND n_stein
-    bool need_capture = !opt->graph_captured || 
-                        (opt->graph_n != n) || 
-                        (opt->graph_n_stein != n_stein);
-    
-    if (need_capture) {
-        // Cleanup old graph
-        if (opt->graph_captured) {
-            cudaGraphExecDestroy(opt->graphExec);
-            cudaGraphDestroy(opt->graph);
-            opt->graph_captured = false;
-        }
-        
-        // STRICT SYNC: Stream must be idle before capture
-        cudaStreamSynchronize(stream);
-        
-        // Begin capture
-        cudaError_t err = cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
-        if (err != cudaSuccess) {
-            svpf_run_sequence_optimized(state, d_observations, T, params, d_loglik_out, d_vol_out);
-            return;
-        }
-        
-        // === KERNEL RECORDING START ===
-        
-        // 1. Predict - use staging buffer
-        svpf_predict_kernel_graph<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
-            state->h, state->h_prev, state->rng_states,
-            opt->d_obs_staging, opt->d_timestep,
-            params->rho, params->sigma_z, params->mu, params->gamma,
-            n
-        );
-        
-        // 2. Mixture Prior Gradient (O(N²) - CORRECT per paper Eq. 6)
-        // Note: This kernel doesn't need timestep - uses h and h_prev directly
-        if (n <= SMALL_N_THRESHOLD) {
-            svpf_mixture_prior_grad_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
-                state->h, state->h_prev, state->grad_log_p,
-                params->rho, params->sigma_z, params->mu, n
-            );
-        } else {
-            svpf_mixture_prior_grad_tiled_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
-                state->h, state->h_prev, state->grad_log_p,
-                params->rho, params->sigma_z, params->mu, n
-            );
-        }
-        
-        // 3. Likelihood Gradient + Log Weights - use staging buffer
-        svpf_likelihood_only_kernel_graph<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
-            state->h, opt->d_grad_lik, state->log_weights,
-            opt->d_obs_staging, opt->d_timestep,
-            state->nu, student_t_const, n
-        );
-        
-        // 4. Combine Gradients: grad = grad_prior + grad_lik
-        svpf_combine_gradients_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
-            state->grad_log_p, opt->d_grad_lik, state->grad_log_p,
-            1.0f, n  // beta = 1.0 in graph path (no annealing)
-        );
-        
-        // 5. Log-Sum-Exp - output to staging
-        svpf_logsumexp_kernel_graph<<<1, BLOCK_SIZE, 0, stream>>>(
-            state->log_weights, opt->d_loglik_staging, opt->d_max_log_w, 
-            opt->d_timestep, n
-        );
-        
-        // 6. Bandwidth
-        svpf_bandwidth_kernel<<<1, BLOCK_SIZE, 0, stream>>>(
-            state->h, opt->d_bandwidth, opt->d_bandwidth_sq, bw_alpha, n
-        );
-        
-        // 7. Stein iterations
-        for (int s = 0; s < n_stein; s++) {
-            if (use_small_n) {
-                // Persistent CTA path - writes to phi, then apply transport
-                cudaMemsetAsync(opt->d_phi, 0, n * sizeof(float), stream);
-                
-                svpf_stein_persistent_kernel<<<persistent_blocks, BLOCK_SIZE, persistent_smem, stream>>>(
-                    state->h, state->grad_log_p,
-                    opt->d_phi, opt->d_bandwidth, n
-                );
-                
-                svpf_apply_transport_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
-                    state->h, opt->d_phi, SVPF_STEIN_STEP_SIZE, n
-                );
-            } else {
-                cudaMemsetAsync(opt->d_phi, 0, n * sizeof(float), stream);
-                
-                int num_tiles = (n + TILE_J - 1) / TILE_J;
-                dim3 grid_2d(n, num_tiles);
-                svpf_stein_2d_kernel<<<grid_2d, BLOCK_SIZE, 0, stream>>>(
-                    state->h, state->grad_log_p, opt->d_phi, opt->d_bandwidth, n
-                );
-                
-                svpf_apply_transport_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
-                    state->h, opt->d_phi, SVPF_STEIN_STEP_SIZE, n
-                );
-            }
-            
-            if (s < n_stein - 1) {
-                // Recompute mixture prior (particles moved)
-                if (n <= SMALL_N_THRESHOLD) {
-                    svpf_mixture_prior_grad_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
-                        state->h, state->h_prev, state->grad_log_p,
-                        params->rho, params->sigma_z, params->mu, n
-                    );
-                } else {
-                    svpf_mixture_prior_grad_tiled_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
-                        state->h, state->h_prev, state->grad_log_p,
-                        params->rho, params->sigma_z, params->mu, n
-                    );
-                }
-                
-                // Recompute likelihood gradient
-                svpf_likelihood_only_kernel_graph<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
-                    state->h, opt->d_grad_lik, state->log_weights,
-                    opt->d_obs_staging, opt->d_timestep,
-                    state->nu, student_t_const, n
-                );
-                
-                // Combine
-                svpf_combine_gradients_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
-                    state->grad_log_p, opt->d_grad_lik, state->grad_log_p,
-                    1.0f, n
-                );
-            }
-        }
-        
-        // 8. Volatility mean - output to staging
-        svpf_vol_mean_opt_kernel_graph<<<1, BLOCK_SIZE, 0, stream>>>(
-            state->h, opt->d_vol_staging, opt->d_timestep, n
-        );
-        
-        // 9. Increment timestep counter
-        svpf_increment_timestep_kernel<<<1, 1, 0, stream>>>(opt->d_timestep);
-        
-        // === KERNEL RECORDING END ===
-        
-        // End capture
-        err = cudaStreamEndCapture(stream, &opt->graph);
-        if (err != cudaSuccess) {
-            opt->graph = NULL;
-            svpf_run_sequence_optimized(state, d_observations, T, params, d_loglik_out, d_vol_out);
-            return;
-        }
-        
-        // Validation: Verify we captured something meaningful
-        size_t numNodes = 0;
-        cudaGraphGetNodes(opt->graph, NULL, &numNodes);
-        
-        if (numNodes < 5) {
-            cudaGraphDestroy(opt->graph);
-            opt->graph = NULL;
-            svpf_run_sequence_optimized(state, d_observations, T, params, d_loglik_out, d_vol_out);
-            return;
-        }
-        
-        err = cudaGraphInstantiate(&opt->graphExec, opt->graph, NULL, NULL, 0);
-        if (err != cudaSuccess) {
-            cudaGraphDestroy(opt->graph);
-            opt->graph = NULL;
-            svpf_run_sequence_optimized(state, d_observations, T, params, d_loglik_out, d_vol_out);
-            return;
-        }
-        
-        opt->graph_captured = true;
-        opt->graph_n = n;
-        opt->graph_n_stein = n_stein;
-    }
-    
-    // === LAUNCH ===
-    for (int t = 0; t < T; t++) {
-        cudaGraphLaunch(opt->graphExec, stream);
-    }
-    
-    // === COPY OUTPUTS ===
-    cudaMemcpyAsync(d_loglik_out, opt->d_loglik_staging, T * sizeof(float),
-                    cudaMemcpyDeviceToDevice, stream);
-    if (d_vol_out) {
-        cudaMemcpyAsync(d_vol_out, opt->d_vol_staging, T * sizeof(float),
-                        cudaMemcpyDeviceToDevice, stream);
-    }
-    
-    cudaStreamSynchronize(stream);
 }
 
 // =============================================================================
@@ -1825,12 +1043,19 @@ void svpf_step_adaptive(
         float rho_up = state->use_asymmetric_rho ? state->rho_up : p.rho;
         float rho_down = state->use_asymmetric_rho ? state->rho_down : p.rho;
         
+        // Particle-local parameters (0 if disabled)
+        float delta_rho = state->use_local_params ? state->delta_rho : 0.0f;
+        float delta_sigma = state->use_local_params ? state->delta_sigma : 0.0f;
+        
         svpf_predict_mim_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
             state->h, state->h_prev, state->rng_states,
-            opt->d_y_single, 1, 
+            opt->d_y_single, opt->d_h_mean_prev,
+            1,  // t (always 1 for single-step API since we only use y_prev)
             rho_up, rho_down,  // Asymmetric persistence
             p.sigma_z, p.mu, p.gamma,
-            state->mim_jump_prob, state->mim_jump_scale, n
+            state->mim_jump_prob, state->mim_jump_scale,
+            delta_rho, delta_sigma,
+            n
         );
     } else {
         svpf_predict_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, stream>>>(
@@ -1918,19 +1143,15 @@ void svpf_step_adaptive(
         
         for (int s = 0; s < stein_iters; s++) {
             // Compute Stein direction
-            if (use_small_n) {
-                cudaMemsetAsync(opt->d_phi, 0, n * sizeof(float), stream);
-                svpf_stein_persistent_kernel<<<persistent_blocks, BLOCK_SIZE, persistent_smem, stream>>>(
-                    state->h, state->grad_log_p, opt->d_phi, opt->d_bandwidth, n
-                );
-            } else {
+           
+            
                 cudaMemsetAsync(opt->d_phi, 0, n * sizeof(float), stream);
                 int num_tiles = (n + TILE_J - 1) / TILE_J;
                 dim3 grid_2d(n, num_tiles);
                 svpf_stein_2d_kernel<<<grid_2d, BLOCK_SIZE, 0, stream>>>(
                     state->h, state->grad_log_p, opt->d_phi, opt->d_bandwidth, n
                 );
-            }
+           
             
             // Apply transport with fused SVLD (RMSProp + Langevin noise)
             // Temperature control: 0 = SVGD (deterministic), 1 = SVLD (diffusion)
@@ -2010,6 +1231,11 @@ void svpf_step_adaptive(
         cub::DeviceReduce::Sum(state->d_cub_temp, state->cub_temp_bytes, 
                                state->h, state->d_scalar_sum, n, stream);
     }
+    
+    // Store h_mean for particle-local params in next step
+    svpf_store_h_mean_kernel<<<1, 1, 0, stream>>>(
+        state->d_scalar_sum, opt->d_h_mean_prev, n
+    );
     
     // Single sync + copy results
     cudaStreamSynchronize(stream);
