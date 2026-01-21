@@ -671,7 +671,7 @@ int main(int argc, char** argv) {
     /* Configuration */
     int seed = 42;
     int n_ticks = 5000;
-    int n_particles = 512;
+    int n_particles = 400;
     int n_stein = 8;
     float nu = 5.0f;
     int use_adaptive = 1;
