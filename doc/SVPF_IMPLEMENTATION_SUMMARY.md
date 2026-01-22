@@ -130,6 +130,71 @@ Why not make `scale = 20.0f` or use 50% scouts?
 1. **Jitter:** During stable times, your effective sample size is only 95% of your particle count. You are slightly "noisier" than a standard filter.
 2. **False Alarms:** If your sensor is noisy (has outliers), a Scout might accidentally latch onto a piece of noise thinking it's a jump. The 5% / 5.0f ratio is a heuristic tune to balance **reactivity** vs. **stability**.
 
+However, using a fixed heuristic (like "5% of particles" or "5x variance") is a "blind" strategy.
+
+**Stein** filter, have access to a powerful intrinsic metric that tells you *exactly* how confused your particles are: **The Magnitude of the Stein Force ()**.
+
+You can use this to create **Adaptive Scouts** that only "panic" when necessary, solving both the Jitter and False Alarm problems.
+
+### The Solution: "Gradient-Modulated Innovation"
+
+In SVPF, you calculate a displacement vector  for every particle to move it toward the target. This vector is effectively a "Desire to Move" metric.
+
+* **Small :** The particle is happy. It sits near a peak and has good neighbors. (Stable)
+* **Large :** The particle is in a bad spot and is being pulled violently toward a better region. (Unstable)
+
+Instead of hard-coding `scale = 5.0f`, you can link the scout's jump range to the average "stress" of your swarm.
+
+#### The Algorithm
+
+1. **Measure Swarm Stress:** Before the prediction step, look at the average magnitude of the Stein update vector () from the *previous* frame.
+2. **Modulate Variance:**
+* If : The filter is converged. Set Scout Scale to **1.0x** (effectively turning them into normal particles).
+* If  is High: The filter is tracking a fast-moving object or has lost lock. Increase Scout Scale to **5.0x** (or higher).
+
+#### Why this solves your Trade-off
+
+| Problem | The "Fixed 5%" Approach | The "Adaptive Stein" Approach |
+| --- | --- | --- |
+| **Jitter** | **Bad.** Scouts are jumping around even when the target is sitting still, adding noise. | **Solved.** When stable, $ |
+| **Reactivity** | **Good.** Scouts are always ready. | **Good.** As soon as the target moves, $ |
+| **False Alarms** | **Risk.** A scout might jump onto a sensor glitch. | **Mitigated.** A single sensor glitch might not spike the *average* swarm stress enough to trigger a massive expansion, filtering out momentary outliers. |
+
+### Advanced Metric: Kernelized Stein Discrepancy (KSD)
+
+If you want a more rigorous statistical trigger (rather than just the raw gradient magnitude), you can use the **Kernelized Stein Discrepancy**.
+
+This is a specific number that SVPF can calculate which ranges from  to .
+
+* **KSD = 0:** Your particles *perfectly* match the true distribution.
+* **KSD > Threshold:** Your particles do not match the target.
+
+You can use KSD as a **"Mode Switch"**:
+
+```cpp
+// Pseudo-code logic
+float current_KSD = calculate_KSD(particles, gradients);
+
+if (current_KSD < STABLE_THRESHOLD) {
+    // Mode 1: Precision Tracking
+    // All particles use standard small noise.
+    // Result: Ultra-smooth output, no jitter.
+    scout_variance = 1.0f; 
+} else {
+    // Mode 2: Panic / Search
+    // We lost the target (or it moved fast).
+    // Deploy the scouts!
+    scout_variance = 10.0f;
+}
+
+```
+
+### Summary
+
+You do not need to accept the "no free lunch" penalty of constant jitter.
+
+By using the **Stein Force Magnitude** or **KSD**, you create a "Smart Swarm" that tightens its formation during stable times (precision) and only scatters scouts when the underlying math indicates that the target is escaping (reactivity).
+
 ---
 
 ## 2. Asymmetric Persistence (ρ_up / ρ_down)
