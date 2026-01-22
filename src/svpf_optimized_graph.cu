@@ -2,14 +2,72 @@
  * @file svpf_optimized_graph.cu
  * @brief CUDA Graph-accelerated SVPF implementation
  * 
- * Contains:
- * - svpf_step_graph (graph-based step function)
- * - svpf_graph_is_captured / svpf_graph_invalidate
- * 
- * Kernels are in svpf_kernels.cu
+ * Uses fused kernels for reduced launch overhead:
+ * - svpf_fused_gradient_kernel (replaces 4 kernels)
+ * - svpf_fused_stein_transport_kernel (replaces 3 kernels)
+ * - svpf_fused_bandwidth_kernel (replaces 2 kernels)
+ * - svpf_fused_outputs_kernel (replaces 3 kernels)
  */
 
 #include "svpf_kernels.cuh"
+
+// =============================================================================
+// Forward declarations for fused kernels (defined in svpf_opt_kernels.cu)
+// =============================================================================
+
+__global__ void svpf_fused_gradient_kernel(
+    const float* __restrict__ h,
+    const float* __restrict__ h_prev,
+    float* __restrict__ grad_combined,
+    float* __restrict__ log_w,
+    float* __restrict__ precond_grad,
+    float* __restrict__ inv_hessian,
+    const float* __restrict__ d_y,
+    int y_idx,
+    float rho, float sigma_z, float mu,
+    float beta, float nu, float student_t_const,
+    bool use_newton, int n
+);
+
+__global__ void svpf_fused_stein_transport_kernel(
+    float* __restrict__ h,
+    const float* __restrict__ grad,
+    float* __restrict__ v_rmsprop,
+    curandStatePhilox4_32_10_t* __restrict__ rng,
+    const float* __restrict__ d_bandwidth,
+    float step_size, float beta_factor, float temperature,
+    float rho_rmsprop, float epsilon, int n
+);
+
+__global__ void svpf_fused_stein_transport_newton_kernel(
+    float* __restrict__ h,
+    const float* __restrict__ precond_grad,
+    const float* __restrict__ inv_hessian,
+    float* __restrict__ v_rmsprop,
+    curandStatePhilox4_32_10_t* __restrict__ rng,
+    const float* __restrict__ d_bandwidth,
+    float step_size, float beta_factor, float temperature,
+    float rho_rmsprop, float epsilon, int n
+);
+
+__global__ void svpf_fused_outputs_kernel(
+    const float* __restrict__ h,
+    const float* __restrict__ log_w,
+    float* __restrict__ d_loglik,
+    float* __restrict__ d_vol,
+    float* __restrict__ d_h_mean,
+    int t_out, int n
+);
+
+__global__ void svpf_fused_bandwidth_kernel(
+    const float* __restrict__ h,
+    const float* __restrict__ d_y,
+    float* __restrict__ d_bandwidth,
+    float* __restrict__ d_bandwidth_sq,
+    float* __restrict__ d_return_ema,
+    float* __restrict__ d_return_var,
+    int y_idx, float alpha_bw, float alpha_ret, int n
+);
 
 // =============================================================================
 // Helper
@@ -34,44 +92,47 @@ static void svpf_graph_capture_internal(
     int n = state->n_particles;
     cudaStream_t capture_stream = opt->graph_stream;
     
-    SVPFParams p = *params;
+    // Precompute constants
     float student_t_const = lgammaf((state->nu + 1.0f) / 2.0f)
                           - lgammaf(state->nu / 2.0f)
                           - 0.5f * logf((float)M_PI * state->nu);
     
     int n_blocks_1d = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
     
-    int device;
-    cudaGetDevice(&device);
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, device);
-    int persistent_blocks = min(prop.multiProcessorCount, n);
-    size_t persistent_smem = (2 * n + BLOCK_SIZE / WARP_SIZE) * sizeof(float);
-    size_t newton_smem = (3 * n + BLOCK_SIZE / WARP_SIZE) * sizeof(float);
+    // Shared memory sizes for fused kernels
+    size_t grad_smem = 2 * n * sizeof(float);   // h_prev + mu_i
+    size_t stein_smem = state->use_newton 
+                      ? 3 * n * sizeof(float)   // h + precond_grad + inv_hess
+                      : 2 * n * sizeof(float);  // h + grad
     
-    bool use_small_n = (n <= SMALL_N_THRESHOLD) && (persistent_smem <= prop.sharedMemPerBlockOptin);
-    bool use_newton = state->use_newton && (newton_smem <= prop.sharedMemPerBlockOptin);
-    
-    float rho_up = state->use_asymmetric_rho ? state->rho_up : p.rho;
-    float rho_down = state->use_asymmetric_rho ? state->rho_down : p.rho;
-    float delta_rho = state->use_local_params ? state->delta_rho : 0.0f;
-    float delta_sigma = state->use_local_params ? state->delta_sigma : 0.0f;
-    
+    // Annealing
     int n_anneal = state->use_annealing ? state->n_anneal_steps : 1;
     float beta_schedule[3] = {0.3f, 0.65f, 1.0f};
+    
+    // Step size
+    float base_step = SVPF_STEIN_STEP_SIZE;
+    if (state->use_guide) base_step *= 0.5f;
+    
+    // Asymmetric rho
+    float rho_up = state->use_asymmetric_rho ? state->rho_up : params->rho;
+    float rho_down = state->use_asymmetric_rho ? state->rho_down : params->rho;
+    float delta_rho = state->use_local_params ? state->delta_rho : 0.0f;
+    float delta_sigma = state->use_local_params ? state->delta_sigma : 0.0f;
     
     // =========================================================================
     // BEGIN CAPTURE
     // =========================================================================
     cudaStreamBeginCapture(capture_stream, cudaStreamCaptureModeGlobal);
     
+    // -------------------------------------------------------------------------
     // PREDICT
+    // -------------------------------------------------------------------------
     if (state->use_guided) {
         svpf_predict_guided_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, capture_stream>>>(
             state->h, state->h_prev, state->rng_states,
             opt->d_y_single, opt->d_h_mean_prev,
             1, rho_up, rho_down,
-            p.sigma_z, p.mu, p.gamma,
+            params->sigma_z, params->mu, params->gamma,
             state->mim_jump_prob, state->mim_jump_scale,
             delta_rho, delta_sigma,
             state->guided_alpha_base,
@@ -84,18 +145,20 @@ static void svpf_graph_capture_internal(
             state->h, state->h_prev, state->rng_states,
             opt->d_y_single, opt->d_h_mean_prev,
             1, rho_up, rho_down,
-            p.sigma_z, p.mu, p.gamma,
+            params->sigma_z, params->mu, params->gamma,
             state->mim_jump_prob, state->mim_jump_scale,
             delta_rho, delta_sigma, n
         );
     } else {
         svpf_predict_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, capture_stream>>>(
             state->h, state->h_prev, state->rng_states,
-            opt->d_y_single, 1, p.rho, p.sigma_z, p.mu, p.gamma, n
+            opt->d_y_single, 1, params->rho, params->sigma_z, params->mu, params->gamma, n
         );
     }
     
-    // EKF GUIDE
+    // -------------------------------------------------------------------------
+    // EKF GUIDE (if enabled)
+    // -------------------------------------------------------------------------
     if (state->use_guide) {
         if (state->use_guide_preserving) {
             svpf_apply_guide_preserving_kernel_graph<<<n_blocks_1d, BLOCK_SIZE, 0, capture_stream>>>(
@@ -108,157 +171,92 @@ static void svpf_graph_capture_internal(
         }
     }
     
-    // BANDWIDTH
-    svpf_bandwidth_kernel<<<1, BLOCK_SIZE, 0, capture_stream>>>(
-        state->h, opt->d_bandwidth, opt->d_bandwidth_sq, 0.3f, n
+    // -------------------------------------------------------------------------
+    // BANDWIDTH (fused: base + adaptive)
+    // -------------------------------------------------------------------------
+    svpf_fused_bandwidth_kernel<<<1, BLOCK_SIZE, 0, capture_stream>>>(
+        state->h,
+        opt->d_y_single,
+        opt->d_bandwidth,
+        opt->d_bandwidth_sq,
+        state->d_return_ema,
+        state->d_return_var,
+        1,      // y_idx
+        0.3f,   // alpha_bw
+        0.05f,  // alpha_ret
+        n
     );
     
-    svpf_adaptive_bandwidth_kernel_graph<<<1, BLOCK_SIZE, 0, capture_stream>>>(
-        state->h, opt->d_bandwidth,
-        state->d_return_ema, state->d_return_var,
-        opt->d_y_single, 1, 0.05f, n
-    );
-    
-    // ANNEALED STEIN UPDATES
+    // -------------------------------------------------------------------------
+    // ANNEALED STEIN ITERATIONS
+    // -------------------------------------------------------------------------
     for (int anneal_idx = 0; anneal_idx < n_anneal; anneal_idx++) {
         float beta = state->use_annealing ? beta_schedule[anneal_idx % 3] : 1.0f;
+        float beta_factor = sqrtf(beta);
+        float temp = state->use_svld ? state->temperature : 0.0f;
         
-        // Gradient
-        if (use_small_n) {
-            svpf_mixture_prior_grad_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, capture_stream>>>(
-                state->h, state->h_prev, state->grad_log_p,
-                p.rho, p.sigma_z, p.mu, n
-            );
-        } else {
-            svpf_mixture_prior_grad_tiled_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, capture_stream>>>(
-                state->h, state->h_prev, state->grad_log_p,
-                p.rho, p.sigma_z, p.mu, n
-            );
-        }
-        
-        svpf_likelihood_only_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, capture_stream>>>(
-            state->h, opt->d_grad_lik, state->log_weights,
-            opt->d_y_single, 1, state->nu, student_t_const, n
-        );
-        
-        svpf_combine_gradients_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, capture_stream>>>(
-            state->grad_log_p, opt->d_grad_lik, state->grad_log_p, beta, n
-        );
-        
-        if (use_newton) {
-            svpf_hessian_precond_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, capture_stream>>>(
-                state->h, state->grad_log_p,
-                opt->d_precond_grad, opt->d_inv_hessian,
-                opt->d_y_single, 1, state->nu, p.sigma_z, n
-            );
-        }
-        
-        // Stein iterations
+        // Distribute Stein iterations across annealing stages
         int stein_iters = state->n_stein_steps / n_anneal;
         if (anneal_idx == n_anneal - 1) {
             stein_iters = state->n_stein_steps - stein_iters * (n_anneal - 1);
         }
         
         for (int s = 0; s < stein_iters; s++) {
-            // Graph-compatible memset
-            svpf_memset_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, capture_stream>>>(
-                opt->d_phi, 0.0f, n
+            // FUSED GRADIENT (was: prior_grad + likelihood + combine + hessian)
+            svpf_fused_gradient_kernel<<<n_blocks_1d, BLOCK_SIZE, grad_smem, capture_stream>>>(
+                state->h,
+                state->h_prev,
+                state->grad_log_p,
+                state->log_weights,
+                state->use_newton ? opt->d_precond_grad : nullptr,
+                state->use_newton ? opt->d_inv_hessian : nullptr,
+                opt->d_y_single,
+                1,  // y_idx
+                params->rho, params->sigma_z, params->mu,
+                beta, state->nu, student_t_const,
+                state->use_newton,
+                n
             );
             
-            if (use_newton) {
-                if (use_small_n) {
-                    svpf_stein_newton_persistent_kernel<<<persistent_blocks, BLOCK_SIZE, newton_smem, capture_stream>>>(
-                        state->h, opt->d_precond_grad, opt->d_inv_hessian,
-                        opt->d_phi, opt->d_bandwidth, n
-                    );
-                } else {
-                    int num_tiles = (n + TILE_J - 1) / TILE_J;
-                    dim3 grid_2d(n, num_tiles);
-                    svpf_stein_newton_2d_kernel<<<grid_2d, BLOCK_SIZE, 0, capture_stream>>>(
-                        state->h, opt->d_precond_grad, opt->d_inv_hessian,
-                        opt->d_phi, opt->d_bandwidth, n
-                    );
-                }
+            // FUSED STEIN + TRANSPORT (was: memset + stein + transport)
+            if (state->use_newton) {
+                svpf_fused_stein_transport_newton_kernel<<<n_blocks_1d, BLOCK_SIZE, stein_smem, capture_stream>>>(
+                    state->h,
+                    opt->d_precond_grad,
+                    opt->d_inv_hessian,
+                    state->d_grad_v,
+                    state->rng_states,
+                    opt->d_bandwidth,
+                    base_step, beta_factor, temp,
+                    state->rmsprop_rho, state->rmsprop_eps,
+                    n
+                );
             } else {
-                if (use_small_n) {
-                    svpf_stein_persistent_kernel<<<persistent_blocks, BLOCK_SIZE, persistent_smem, capture_stream>>>(
-                        state->h, state->grad_log_p, opt->d_phi, opt->d_bandwidth, n
-                    );
-                } else {
-                    int num_tiles = (n + TILE_J - 1) / TILE_J;
-                    dim3 grid_2d(n, num_tiles);
-                    svpf_stein_2d_kernel<<<grid_2d, BLOCK_SIZE, 0, capture_stream>>>(
-                        state->h, state->grad_log_p, opt->d_phi, opt->d_bandwidth, n
-                    );
-                }
-            }
-            
-            // Transport
-            float temp = state->use_svld ? state->temperature : 0.0f;
-            float beta_factor = sqrtf(beta);
-            float step_size = SVPF_STEIN_STEP_SIZE;
-            if (state->use_guide) step_size *= 0.5f;
-            
-            svpf_apply_transport_svld_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, capture_stream>>>(
-                state->h, opt->d_phi, state->d_grad_v, state->rng_states,
-                step_size, beta_factor, temp,
-                state->rmsprop_rho, state->rmsprop_eps, n
-            );
-            
-            // Recompute gradient if more iterations
-            if (s < stein_iters - 1) {
-                if (use_small_n) {
-                    svpf_mixture_prior_grad_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, capture_stream>>>(
-                        state->h, state->h_prev, state->grad_log_p,
-                        p.rho, p.sigma_z, p.mu, n
-                    );
-                } else {
-                    svpf_mixture_prior_grad_tiled_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, capture_stream>>>(
-                        state->h, state->h_prev, state->grad_log_p,
-                        p.rho, p.sigma_z, p.mu, n
-                    );
-                }
-                
-                svpf_likelihood_only_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, capture_stream>>>(
-                    state->h, opt->d_grad_lik, state->log_weights,
-                    opt->d_y_single, 1, state->nu, student_t_const, n
+                svpf_fused_stein_transport_kernel<<<n_blocks_1d, BLOCK_SIZE, stein_smem, capture_stream>>>(
+                    state->h,
+                    state->grad_log_p,
+                    state->d_grad_v,
+                    state->rng_states,
+                    opt->d_bandwidth,
+                    base_step, beta_factor, temp,
+                    state->rmsprop_rho, state->rmsprop_eps,
+                    n
                 );
-                
-                svpf_combine_gradients_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, capture_stream>>>(
-                    state->grad_log_p, opt->d_grad_lik, state->grad_log_p, beta, n
-                );
-                
-                if (use_newton) {
-                    svpf_hessian_precond_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, capture_stream>>>(
-                        state->h, state->grad_log_p,
-                        opt->d_precond_grad, opt->d_inv_hessian,
-                        opt->d_y_single, 1, state->nu, p.sigma_z, n
-                    );
-                }
             }
         }
     }
     
-    // FINAL OUTPUTS
-    svpf_logsumexp_kernel<<<1, BLOCK_SIZE, 0, capture_stream>>>(
-        state->log_weights, opt->d_loglik_single, opt->d_max_log_w, 0, n
-    );
-    
-    svpf_vol_mean_opt_kernel<<<1, BLOCK_SIZE, 0, capture_stream>>>(
-        state->h, opt->d_vol_single, 0, n
-    );
-    
-    // Graph-compatible h-mean
-    svpf_memset_kernel<<<1, 1, 0, capture_stream>>>(
-        state->d_scalar_sum, 0.0f, 1
-    );
-    
-    svpf_h_mean_reduce_kernel<<<n_blocks_1d, BLOCK_SIZE, 0, capture_stream>>>(
-        state->h, opt->d_phi, n
-    );
-    
-    svpf_h_mean_finalize_kernel<<<1, BLOCK_SIZE, 0, capture_stream>>>(
-        opt->d_phi, opt->d_h_mean_prev, n_blocks_1d, n
+    // -------------------------------------------------------------------------
+    // OUTPUTS (fused: logsumexp + vol_mean + h_mean)
+    // -------------------------------------------------------------------------
+    svpf_fused_outputs_kernel<<<1, BLOCK_SIZE, 0, capture_stream>>>(
+        state->h,
+        state->log_weights,
+        opt->d_loglik_single,
+        opt->d_vol_single,
+        opt->d_h_mean_prev,
+        0,  // t_out
+        n
     );
     
     // =========================================================================
