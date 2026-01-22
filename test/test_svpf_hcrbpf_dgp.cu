@@ -538,9 +538,9 @@ static Metrics run_svpf_on_scenario(
         filter->rmsprop_rho = 0.9f;
         filter->rmsprop_eps = 1e-6f;
         
-        filter->use_mim = 1;
-        filter->mim_jump_prob = 0.15f;
-        filter->mim_jump_scale = 7.0f;
+        //filter->use_mim = 1;
+        //filter->mim_jump_prob = 0.15f;
+        //filter->mim_jump_scale = 7.0f;
         
         filter->use_asymmetric_rho = 1;
         filter->rho_up = 0.99f;
@@ -560,10 +560,13 @@ static Metrics run_svpf_on_scenario(
         // Guided Prediction with INNOVATION GATING (FIXED)
         // - Bottom clamp prevents zero-return trap (log(0) → -inf)
         // - Asymmetric gating only activates on UPWARD shocks (spikes)
-        filter->use_guided = 1;
-        filter->guided_alpha_base = 0.0f;             // 0% when model fits
-        filter->guided_alpha_shock = 0.5f;            // 50% when model fails
-        filter->guided_innovation_threshold = 1.5f;   // 1.5σ = "surprised"
+        //filter->use_guided = 1;
+        //filter->guided_alpha_base = 0.0f;             // 0% when model fits
+        //filter->guided_alpha_shock = 0.5f;            // 50% when model fails
+        //filter->guided_innovation_threshold = 1.5f;   // 1.5σ = "surprised"
+
+        svpf_init_heavy_tail(filter, 5.0f);
+
         
         // EKF Guide density
         filter->use_guide = 1;

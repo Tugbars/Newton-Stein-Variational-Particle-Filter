@@ -8,6 +8,7 @@
  * - Stein transport prevents particle degeneracy
  * - Student-t likelihood handles tail events
  * - Fewer particles needed vs bootstrap PF (500 vs 3000)
+ * - NEW: Adaptive scouts via φ-stress feedback
  * 
  * Algorithm (Fan et al. 2021, arXiv:2106.10568):
  * - Prior is Gaussian MIXTURE over all particles: p(h_t|Z_{t-1}) = (1/N) Σ_i p(h_t|h_{t-1}^i)
@@ -18,8 +19,9 @@
  * Usage (single-step, real-time):
  *   SVPFState* filter = svpf_create(1024, 10, 5.0f, stream);
  *   svpf_initialize(filter, &params, seed);
+ *   svpf_init_adaptive_scouts(filter);  // NEW: enable adaptive scouts
  *   for each observation y_t:
- *       svpf_step_adaptive(filter, y_t, y_prev, &params, &loglik, &vol, &h_mean);
+ *       svpf_step_graph(filter, y_t, y_prev, &params, &loglik, &vol, &h_mean);
  *   svpf_destroy(filter);
  * 
  * Memory Layout: Structure of Arrays (SoA) for coalesced GPU access
@@ -87,7 +89,7 @@ extern "C" {
  * [17] alpha_shock      - Guided alpha (shock)
  * [18] innovation_thresh - Guided innovation threshold
  * [19] jump_prob        - MIM jump probability
- * [20] jump_scale       - MIM jump scale
+ * [20] jump_scale       - MIM jump scale (or adaptive_scout_scale)
  * [21] guide_strength   - Guide density strength
  * [22] rmsprop_rho      - RMSProp decay
  * [23] rmsprop_eps      - RMSProp epsilon
@@ -173,10 +175,20 @@ typedef struct {
     bool graph_captured;
     int graph_n;              // N at capture time (recapture if changed)
     int graph_n_stein;        // Stein steps at capture time
+    int graph_n_anneal;       // Anneal steps at capture time
+    bool graph_adaptive_enabled; // Whether adaptive scouts were enabled at capture
+    bool graph_use_student_t;    // Whether Student-t noise was enabled at capture
+    bool graph_use_imq;          // Whether IMQ kernel was enabled at capture
     
     // Device-side parameter staging (kernels read from here)
     // Updated via cudaMemcpyAsync before graph replay
     float* d_params_staging;  // Packed: [y_prev, y_t, guide_mean, beta, step_size, temp, ...]
+    
+    // =========================================================================
+    // ADAPTIVE SCOUTS (φ-stress feedback)
+    // =========================================================================
+    float* d_phi_stress;      // Mean |φ| after final Stein iteration
+    float* d_adaptive_scale;  // Scout scale, staged to device for graph
     
     // Capacity tracking
     int allocated_n;
@@ -223,6 +235,16 @@ typedef struct {
  *   pulls particles toward the observation, even from far away.
  *   The Student-t gradient creates a "volcano" that saturates for
  *   large deviations, causing particles to get stuck.
+ * 
+ * ADAPTIVE SCOUTS (NEW):
+ *   Instead of fixed 5%/5x scout configuration, scout variance is
+ *   dynamically modulated based on Stein force magnitude |φ|.
+ *   
+ *   When |φ| is low (swarm converged): scouts tighten (scale → 1.0)
+ *   When |φ| is high (swarm stressed): scouts expand (scale → 5.0)
+ *   
+ *   This eliminates jitter during stable tracking and false alarms
+ *   from sensor noise, while preserving reactivity to true jumps.
  */
 typedef struct {
     // Particle states
@@ -311,6 +333,30 @@ typedef struct {
     // Benefits: adaptive step size based on local curvature
     int use_newton;         // Enable Newton-Stein (0=standard SVGD, 1=Newton)
     
+    // =========================================================================
+    // HEAVY-TAIL CONFIG (Student-t noise + IMQ kernel)
+    // 
+    // Replaces all MIM/Scout heuristics with principled heavy-tailed physics:
+    // 
+    // 1. Student-t Noise: Every particle naturally explores tails via Levy flights.
+    //    No mixture model needed - occasional large jumps are built-in.
+    //    - ν=3: Very heavy tails (~1% of jumps > 4σ)
+    //    - ν=5: Moderate heavy tails (~0.3% of jumps > 4σ)
+    //    - ν→∞: Approaches Gaussian (defeats the purpose)
+    //
+    // 2. IMQ Kernel: Polynomial decay (1/distance) vs RBF exponential decay.
+    //    Distant particles still feel attraction - "infinite vision".
+    //    Solves vanishing gradient trap without guide densities.
+    //
+    // Parameters eliminated:
+    //    - mim_jump_prob, mim_jump_scale (no mixture)
+    //    - use_adaptive_scouts, phi_ema, etc. (not needed)
+    //    - use_guide, guide_strength (not needed - IMQ handles it)
+    // =========================================================================
+    int use_student_t;      // Use Student-t noise instead of Gaussian (default: 1)
+    float predict_nu;       // Degrees of freedom for Student-t (default: 3.0)
+    int use_imq;            // Use IMQ kernel instead of RBF (default: 1)
+    
     // Guided Prediction config (Lookahead / APF-style)
     // Standard predict is REACTIVE: scatters blindly, then corrects.
     // Guided predict is PROACTIVE: peeks at y_t to know where to go.
@@ -333,6 +379,34 @@ typedef struct {
     float guide_var;        // EKF posterior variance (P_t)
     float guide_K;          // Kalman gain (for debugging)
     int guide_initialized;  // Whether guide has been initialized
+    
+    // =========================================================================
+    // ADAPTIVE SCOUTS CONFIG (φ-stress feedback)
+    // 
+    // Instead of fixed mim_jump_scale, the scout variance is dynamically
+    // modulated based on Stein force magnitude. When the swarm is converged
+    // (low |φ|), scouts tighten to reduce jitter. When the swarm is stressed
+    // (high |φ|), scouts expand to catch jumps.
+    //
+    // The mechanism:
+    //   1. After final Stein iteration, compute mean |φ|
+    //   2. Update phi_ema with exponential smoothing
+    //   3. Apply sigmoid to map phi_ema → adaptive_scout_scale
+    //   4. Next timestep's predict uses adaptive_scout_scale
+    //
+    // This solves both "jitter during stable tracking" and "false alarms"
+    // while preserving reactivity to true volatility jumps.
+    // =========================================================================
+    int use_adaptive_scouts;     // Enable adaptive scout mechanism (0=fixed, 1=adaptive)
+    float phi_ema;               // EMA of mean |φ| (host-side state)
+    float adaptive_scout_scale;  // Current scout scale [min_scout_scale, max_scout_scale]
+    
+    // Tuning parameters
+    float phi_ema_alpha;         // EMA smoothing factor (higher = more reactive, e.g., 0.15)
+    float phi_stress_threshold;  // "Normal" |φ| level (data-dependent, e.g., 0.3)
+    float phi_stress_softness;   // Sigmoid width (smaller = sharper transition, e.g., 0.15)
+    float min_scout_scale;       // Scale when stable (1.0 = no scouts)
+    float max_scout_scale;       // Scale when panicking (e.g., 5.0)
     
     // Optimized backend (embedded for thread safety)
     SVPFOptimizedState opt_backend;
@@ -546,6 +620,8 @@ float svpf_get_ess(const SVPFState* state);
  *   - First call
  *   - Particle count change
  *   - Stein step count change
+ *   - Anneal step count change
+ *   - use_adaptive_scouts toggle
  * 
  * IMPORTANT: Model parameters (rho, sigma_z, mu, gamma) are "burned in" at
  * capture time. If you change SVPFParams, you MUST call svpf_graph_invalidate()
@@ -553,6 +629,9 @@ float svpf_get_ess(const SVPFState* state);
  * 
  * Filter configuration flags (use_guided, use_newton, etc.) are also burned in.
  * Call svpf_graph_invalidate() after changing any configuration.
+ * 
+ * NOTE: adaptive_scout_scale is NOT burned in - it's staged to device memory
+ * before each graph launch, so it can change every timestep without recapture.
  * 
  * @param state     Filter state
  * @param y_t       Current observation (staged to device before graph launch)
@@ -588,6 +667,73 @@ bool svpf_graph_is_captured(SVPFState* state);
  * The next svpf_step_graph() call will recapture with new parameters.
  */
 void svpf_graph_invalidate(SVPFState* state);
+
+// =============================================================================
+// ADAPTIVE SCOUTS API (φ-stress feedback)
+// =============================================================================
+
+/**
+ * @brief Initialize adaptive scout mechanism with default parameters
+ * 
+ * Sets up the φ-stress feedback loop for dynamic scout variance.
+ * Call after svpf_create(), before first svpf_step_graph().
+ * 
+ * Default parameters:
+ *   - phi_ema_alpha = 0.15 (EMA smoothing)
+ *   - phi_stress_threshold = 0.3 (tune based on your data!)
+ *   - phi_stress_softness = 0.15 (sigmoid transition width)
+ *   - min_scout_scale = 1.0 (no scouts when stable)
+ *   - max_scout_scale = 5.0 (full scouts when panicking)
+ * 
+ * @param state SVPF state
+ */
+void svpf_init_adaptive_scouts(SVPFState* state);
+
+/**
+ * @brief Get current adaptive scout state (for monitoring/tuning)
+ * 
+ * @param state SVPF state
+ * @param phi_ema_out Output: current EMA of mean |φ| (can be NULL)
+ * @param scout_scale_out Output: current scout scale (can be NULL)
+ */
+void svpf_get_adaptive_state(
+    SVPFState* state,
+    float* phi_ema_out,
+    float* scout_scale_out
+);
+
+/**
+ * @brief Manually update adaptive scout scale (internal, called by svpf_step_graph)
+ * 
+ * Computes: phi_ema = α*phi_stress + (1-α)*phi_ema
+ *           scout_scale = min + (max-min) * sigmoid((phi_ema - threshold) / softness)
+ * 
+ * @param state SVPF state
+ * @param phi_stress Mean |φ| from current timestep
+ */
+void svpf_update_adaptive_scouts(SVPFState* state, float phi_stress);
+
+/**
+ * @brief Initialize heavy-tail mode (Student-t noise + IMQ kernel)
+ * 
+ * This is the recommended approach for robust vol tracking without heuristics.
+ * Replaces: MIM scouts, adaptive scouts, guide density.
+ * 
+ * Benefits:
+ * - Student-t noise: Natural Levy flights, every particle is a potential scout
+ * - IMQ kernel: Polynomial decay, "infinite vision" prevents vanishing gradients
+ * 
+ * @param state SVPF state
+ * @param nu Degrees of freedom (3.0=very heavy tails, 5.0=moderate)
+ */
+void svpf_init_heavy_tail(SVPFState* state, float nu);
+
+/**
+ * @brief Initialize heavy-tail mode with defaults (nu=3.0)
+ * 
+ * @param state SVPF state
+ */
+void svpf_init_heavy_tail_default(SVPFState* state);
 
 #ifdef __cplusplus
 }

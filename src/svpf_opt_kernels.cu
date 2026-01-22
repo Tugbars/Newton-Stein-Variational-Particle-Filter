@@ -3,6 +3,8 @@
  * @brief CUDA kernel definitions for optimized SVPF paths
  * 
  * All __global__ kernel implementations for svpf_optimized.cu and svpf_optimized_graph.cu
+ * 
+ * NEW: Adaptive scout kernels that read scale from device memory
  */
 
 #include "svpf_kernels.cuh"
@@ -18,6 +20,95 @@ __device__ __forceinline__ float clamp_logvol(float h) {
 
 __device__ __forceinline__ float safe_exp(float x) {
     return expf(fminf(x, 20.0f));
+}
+
+// -----------------------------------------------------------------------------
+// Student-t Random Number Generator
+// 
+// Generates samples from Student-t distribution with nu degrees of freedom.
+// Heavy tails naturally produce occasional large jumps ("Levy flights").
+// No mixture model needed - every particle is a potential scout.
+//
+// For nu=3: ~1% chance of |x| > 4σ (vs ~0.006% for Gaussian)
+// For nu=5: ~0.3% chance of |x| > 4σ
+// -----------------------------------------------------------------------------
+
+__device__ __forceinline__ float curand_student_t(
+    curandStatePhilox4_32_10_t* state,
+    float nu
+) {
+    // T = Z * sqrt(nu / V) where Z ~ N(0,1), V ~ Chi-squared(nu)
+    // Chi-squared(nu) = sum of nu squared standard normals
+    
+    float z = curand_normal(state);
+    
+    // For nu <= 4, generate exact chi-squared
+    // For nu > 4, use normal approximation (chi-sq concentrates)
+    float chi_sq;
+    if (nu <= 2.0f) {
+        float v1 = curand_normal(state);
+        float v2 = curand_normal(state);
+        chi_sq = v1*v1 + v2*v2;
+    } else if (nu <= 4.0f) {
+        float v1 = curand_normal(state);
+        float v2 = curand_normal(state);
+        float v3 = curand_normal(state);
+        chi_sq = v1*v1 + v2*v2 + v3*v3;
+        if (nu > 3.0f) {
+            float v4 = curand_normal(state);
+            chi_sq += v4*v4;
+        }
+    } else {
+        // For larger nu, use 5 samples (good enough, tails still heavier than Gaussian)
+        float v1 = curand_normal(state);
+        float v2 = curand_normal(state);
+        float v3 = curand_normal(state);
+        float v4 = curand_normal(state);
+        float v5 = curand_normal(state);
+        chi_sq = v1*v1 + v2*v2 + v3*v3 + v4*v4 + v5*v5;
+    }
+    
+    // Clamp to avoid division by near-zero (extreme tail events)
+    chi_sq = fmaxf(chi_sq, 0.01f);
+    
+    return z * sqrtf(nu / chi_sq);
+}
+
+// Convenience version for nu=3 (very heavy tails, good default)
+__device__ __forceinline__ float curand_student_t_nu3(
+    curandStatePhilox4_32_10_t* state
+) {
+    float z = curand_normal(state);
+    float v1 = curand_normal(state);
+    float v2 = curand_normal(state);
+    float v3 = curand_normal(state);
+    float chi_sq = fmaxf(v1*v1 + v2*v2 + v3*v3, 0.01f);
+    return z * sqrtf(3.0f / chi_sq);
+}
+
+// =============================================================================
+// IMQ (Inverse Multiquadric) Kernel Helpers
+//
+// k(x,y) = (c² + ||x-y||²)^(-β)  where typically β = 0.5
+//
+// Unlike RBF (Gaussian kernel) which decays exponentially:
+//   RBF: k(x,y) = exp(-||x-y||² / 2h²)  → vanishes for distant particles
+//   IMQ: k(x,y) = (1 + ||x-y||²/h²)^(-0.5) → polynomial decay, "infinite vision"
+//
+// This means particles always feel some attraction, even from far away.
+// Solves the "vanishing gradient trap" without needing guide densities.
+// =============================================================================
+
+__device__ __forceinline__ float imq_kernel(float diff, float bw_sq) {
+    // k(x,y) = (1 + (x-y)² / bw²)^(-0.5) = 1 / sqrt(1 + diff²/bw²)
+    float base = 1.0f + (diff * diff) / bw_sq;
+    return rsqrtf(base);
+}
+
+__device__ __forceinline__ float imq_kernel_grad(float diff, float bw_sq, float K) {
+    // grad_x k(x,y) = -0.5 * (1 + diff²/bw²)^(-1.5) * 2*diff/bw²
+    //              = -K³ * diff / bw²
+    return -K * K * K * diff / bw_sq;
 }
 
 __device__ __forceinline__ float warp_reduce_sum(float val) {
@@ -87,7 +178,7 @@ __device__ float block_reduce_max(float val) {
 }
 
 // =============================================================================
-// Kernel 1: Predict
+// Kernel 1: Predict (Standard)
 // =============================================================================
 
 __global__ void svpf_predict_kernel(
@@ -115,7 +206,89 @@ __global__ void svpf_predict_kernel(
 }
 
 // =============================================================================
-// Kernel 1b: Predict with MIM + Asymmetric ρ
+// Kernel 1-HeavyTail: Predict with Student-t Noise
+// 
+// REPLACES all MIM/Scout/Adaptive logic with principled heavy-tailed noise.
+// 
+// Key insight: Gaussian noise effectively never explores beyond 3σ.
+// Student-t with ν=3-5 naturally generates occasional large jumps ("Levy flights")
+// making every particle a potential scout without mixture heuristics.
+//
+// Parameters eliminated:
+//   - mim_jump_prob, mim_jump_scale (no mixture)
+//   - use_adaptive_scouts, phi_ema, etc. (not needed)
+//   - elite_guard_* (not needed)
+//
+// One parameter: predict_nu (degrees of freedom)
+//   - ν=3: Very heavy tails, ~1% of |x|>4σ
+//   - ν=5: Moderate tails, ~0.3% of |x|>4σ
+// =============================================================================
+
+__global__ void svpf_predict_student_t_kernel(
+    float* __restrict__ h,
+    float* __restrict__ h_prev,
+    curandStatePhilox4_32_10_t* __restrict__ rng,
+    const float* __restrict__ d_y,
+    int t,
+    float rho, float sigma_z, float mu, float gamma,
+    float predict_nu,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    
+    float h_i = h[i];
+    h_prev[i] = h_i;
+    
+    float y_prev = (t > 0) ? d_y[t - 1] : 0.0f;
+    float vol_prev = safe_exp(h_i / 2.0f);
+    float leverage = gamma * y_prev / (vol_prev + 1e-8f);
+    
+    // Heavy-tailed noise: natural exploration without heuristics
+    float noise = curand_student_t(&rng[i], predict_nu);
+    
+    float prior_mean = mu + rho * (h_i - mu) + leverage;
+    h[i] = clamp_logvol(prior_mean + sigma_z * noise);
+}
+
+// =============================================================================
+// Kernel 1-HeavyTail-Asymmetric: Student-t with asymmetric rho
+// =============================================================================
+
+__global__ void svpf_predict_student_t_asymmetric_kernel(
+    float* __restrict__ h,
+    float* __restrict__ h_prev,
+    curandStatePhilox4_32_10_t* __restrict__ rng,
+    const float* __restrict__ d_y,
+    int t,
+    float rho_up, float rho_down,
+    float sigma_z, float mu, float gamma,
+    float predict_nu,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    
+    float h_i = h[i];
+    float h_prev_i = h_prev[i];
+    h_prev[i] = h_i;
+    
+    float y_prev = (t > 0) ? d_y[t - 1] : 0.0f;
+    float vol_prev = safe_exp(h_i / 2.0f);
+    float leverage = gamma * y_prev / (vol_prev + 1e-8f);
+    
+    // Asymmetric persistence
+    float rho = (h_i > h_prev_i) ? rho_up : rho_down;
+    
+    // Heavy-tailed noise
+    float noise = curand_student_t(&rng[i], predict_nu);
+    
+    float prior_mean = mu + rho * (h_i - mu) + leverage;
+    h[i] = clamp_logvol(prior_mean + sigma_z * noise);
+}
+
+// =============================================================================
+// Kernel 1b: Predict with MIM + Asymmetric ρ (Fixed scale)
 // =============================================================================
 
 __global__ void svpf_predict_mim_kernel(
@@ -163,7 +336,87 @@ __global__ void svpf_predict_mim_kernel(
 }
 
 // =============================================================================
-// Kernel 1c: Guided Predict with Lookahead
+// Kernel 1b-Adaptive: Predict with MIM + Elite Guard Strategy
+// 
+// Split scouts into two tiers:
+//   - 2% Elite Guard: Fixed scale=5.0 (always watching, no latency)
+//   - 3% Reserves: Adaptive scale (reactive reinforcements)
+//   - 95% Sheep: scale=1.0 (normal particles)
+// 
+// This addresses two problems with pure adaptive scouts:
+//   1. Latency: Elite guard catches jumps immediately (0-frame response)
+//   2. Vanishing gradient: Elite guard provides gradient signal even when
+//      clustered particles can't "see" the target
+// =============================================================================
+
+__global__ void svpf_predict_mim_adaptive_kernel(
+    float* __restrict__ h,
+    float* __restrict__ h_prev,
+    curandStatePhilox4_32_10_t* __restrict__ rng,
+    const float* __restrict__ d_y,
+    const float* __restrict__ d_h_mean,
+    const float* __restrict__ d_adaptive_scale,  // Reactive scale for reserves
+    int t,
+    float rho_up, float rho_down,
+    float sigma_z, float mu, float gamma,
+    float jump_prob,  // Total scout probability (e.g., 0.05 = 5%)
+    float delta_rho, float delta_sigma,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    // Read adaptive scale from device memory (graph-compatible)
+    float adaptive_scale = *d_adaptive_scale;
+    
+    // Elite Guard parameters (hardcoded for robustness)
+    const float elite_prob = 0.02f;      // 2% always-on elite guard
+    const float elite_scale = 5.0f;      // Fixed high scale for elite
+    // Remaining (jump_prob - elite_prob) are adaptive reserves
+
+    float h_i = h[i];
+    float h_prev_i = h_prev[i];
+    h_prev[i] = h_i;
+
+    float h_bar = *d_h_mean;
+    float dev = h_i - h_bar;
+    float abs_dev = fabsf(dev);
+    float tanh_dev = tanhf(dev);
+
+    float rho_adjust = delta_rho * tanh_dev;
+    float sigma_scale = 1.0f + delta_sigma * abs_dev;
+
+    float noise = curand_normal(&rng[i]);
+    float selector = curand_uniform(&rng[i]);
+
+    // Elite Guard Strategy:
+    // - [0, 0.02): Elite Guard - fixed scale=5.0 (always proactive)
+    // - [0.02, 0.05): Reserves - adaptive scale (reactive)
+    // - [0.05, 1.0): Sheep - scale=1.0
+    float scale = 1.0f;
+    if (selector < elite_prob) {
+        // Elite Guard: always watching
+        scale = elite_scale;
+    } else if (selector < jump_prob) {
+        // Reserves: reactive reinforcements
+        scale = adaptive_scale;
+    }
+    // else: Sheep (scale = 1.0)
+
+    float base_rho = (h_i > h_prev_i) ? rho_up : rho_down;
+    float rho = fminf(fmaxf(base_rho + rho_adjust, 0.0f), 0.999f);
+    float sigma_local = sigma_z * sigma_scale;
+
+    float y_prev = (t > 0) ? d_y[t - 1] : 0.0f;
+    float vol_prev = safe_exp(h_i / 2.0f);
+    float leverage = gamma * y_prev / (vol_prev + 1e-8f);
+
+    float prior_mean = mu + rho * (h_i - mu) + leverage;
+    h[i] = clamp_logvol(prior_mean + sigma_local * scale * noise);
+}
+
+// =============================================================================
+// Kernel 1c: Guided Predict with Lookahead (Fixed scale)
 // =============================================================================
 
 __global__ void svpf_predict_guided_kernel(
@@ -199,6 +452,87 @@ __global__ void svpf_predict_guided_kernel(
     float noise = curand_normal(&rng[i]);
     float selector = curand_uniform(&rng[i]);
     float scale = (selector < jump_prob) ? jump_scale : 1.0f;
+
+    float base_rho = (h_i > h_prev_i) ? rho_up : rho_down;
+    float rho = fminf(fmaxf(base_rho + rho_adjust, 0.0f), 0.999f);
+    float sigma_local = sigma_z * sigma_scale;
+
+    float y_prev = (t > 0) ? d_y[t - 1] : 0.0f;
+    float vol_prev = safe_exp(h_i / 2.0f);
+    float leverage = gamma * y_prev / (vol_prev + 1e-8f);
+    float mean_prior = mu + rho * (h_i - mu) + leverage;
+
+    float y_curr = d_y[t];
+    float log_y2 = logf(y_curr * y_curr + 1e-10f);
+    float mean_implied = fmaxf(log_y2 + 1.27f, -5.0f);
+
+    float innovation = mean_implied - mean_prior;
+    float total_std = 2.5f;
+    float z_score = innovation / total_std;
+
+    float activation = 0.0f;
+    if (z_score > innovation_threshold) {
+        activation = tanhf(z_score - innovation_threshold);
+    }
+
+    float guided_alpha = alpha_base + (alpha_shock - alpha_base) * activation;
+    float mean_proposal = (1.0f - guided_alpha) * mean_prior + guided_alpha * mean_implied;
+    
+    h[i] = clamp_logvol(mean_proposal + sigma_local * scale * noise);
+}
+
+// =============================================================================
+// Kernel 1c-Adaptive: Guided Predict with Elite Guard Strategy
+// =============================================================================
+
+__global__ void svpf_predict_guided_adaptive_kernel(
+    float* __restrict__ h,
+    float* __restrict__ h_prev,
+    curandStatePhilox4_32_10_t* __restrict__ rng,
+    const float* __restrict__ d_y,
+    const float* __restrict__ d_h_mean,
+    const float* __restrict__ d_adaptive_scale,  // Reactive scale for reserves
+    int t,
+    float rho_up, float rho_down,
+    float sigma_z, float mu, float gamma,
+    float jump_prob,  // Total scout probability
+    float delta_rho, float delta_sigma,
+    float alpha_base, float alpha_shock,
+    float innovation_threshold,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    // Read adaptive scale from device memory
+    float adaptive_scale = *d_adaptive_scale;
+    
+    // Elite Guard parameters
+    const float elite_prob = 0.02f;
+    const float elite_scale = 5.0f;
+
+    float h_i = h[i];
+    float h_prev_i = h_prev[i];
+    h_prev[i] = h_i;
+
+    float h_bar = *d_h_mean;
+    float dev = h_i - h_bar;
+    float abs_dev = fabsf(dev);
+    float tanh_dev = tanhf(dev);
+
+    float rho_adjust = delta_rho * tanh_dev;
+    float sigma_scale = 1.0f + delta_sigma * abs_dev;
+
+    float noise = curand_normal(&rng[i]);
+    float selector = curand_uniform(&rng[i]);
+    
+    // Elite Guard Strategy
+    float scale = 1.0f;
+    if (selector < elite_prob) {
+        scale = elite_scale;
+    } else if (selector < jump_prob) {
+        scale = adaptive_scale;
+    }
 
     float base_rho = (h_i > h_prev_i) ? rho_up : rho_down;
     float rho = fminf(fmaxf(base_rho + rho_adjust, 0.0f), 0.999f);
@@ -337,6 +671,158 @@ __global__ void svpf_mixture_prior_grad_tiled_kernel(
     }
     
     grad_prior[j] = weighted_grad / (sum_r + 1e-8f);
+}
+
+// =============================================================================
+// Kernel 2b-Student-t: Mixture Prior Gradient (Heavy-tailed)
+// 
+// CRITICAL: Must be used with Student-t noise to maintain consistency.
+// 
+// The Gaussian gradient has linear "spring" force: F ∝ -x
+// The Student-t gradient has "redescending" force: F ∝ -x / (1 + x²)
+// 
+// This means:
+//   - Small deviations: Similar to Gaussian (pulls back)
+//   - Large deviations: Force saturates and decreases (accepts outliers)
+// 
+// Without this, Student-t noise + Gaussian gradient = negative bias
+// (particles jump far, then get crushed back by linear gradient)
+// =============================================================================
+
+__global__ void svpf_mixture_prior_grad_student_t_kernel(
+    const float* __restrict__ h,
+    const float* __restrict__ h_prev,
+    float* __restrict__ grad_prior,
+    float rho, float sigma_z, float mu,
+    float nu,  // Degrees of freedom (match predict_nu)
+    int n
+) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n) return;
+
+    float h_j = h[j];
+    float sigma_sq = sigma_z * sigma_z + 1e-8f;
+    float nu_sigma_sq = nu * sigma_sq;
+    
+    // Gradient prefactor: -(nu+1) / (nu * sigma^2)
+    float grad_factor = -(nu + 1.0f) / nu_sigma_sq;
+
+    float log_p_max = -1e10f;
+    
+    // First pass: find max log_p for numerical stability
+    for (int i = 0; i < n; i++) {
+        float mu_i = mu + rho * (h_prev[i] - mu);
+        float diff = h_j - mu_i;
+        float diff_sq = diff * diff;
+        
+        // Log-PDF of Student-t (up to constant):
+        // log p = -0.5*(nu+1) * log(1 + diff^2 / (nu*sigma^2))
+        float term = 1.0f + diff_sq / nu_sigma_sq;
+        float log_p = -0.5f * (nu + 1.0f) * logf(term);
+        
+        log_p_max = fmaxf(log_p_max, log_p);
+    }
+
+    float sum_p = 0.0f;
+    float weighted_grad = 0.0f;
+
+    // Second pass: compute weighted gradient
+    for (int i = 0; i < n; i++) {
+        float mu_i = mu + rho * (h_prev[i] - mu);
+        float diff = h_j - mu_i;
+        float diff_sq = diff * diff;
+        
+        float term = 1.0f + diff_sq / nu_sigma_sq;
+        float log_p = -0.5f * (nu + 1.0f) * logf(term);
+        
+        float p_i = expf(log_p - log_p_max);
+        
+        // Student-t score function: grad = factor * diff / term
+        // Note: term in denominator makes this "redescending"
+        float grad_i = grad_factor * diff / term;
+
+        sum_p += p_i;
+        weighted_grad += p_i * grad_i;
+    }
+
+    grad_prior[j] = weighted_grad / (sum_p + 1e-10f);
+}
+
+// Tiled version for large N
+__global__ void svpf_mixture_prior_grad_student_t_tiled_kernel(
+    const float* __restrict__ h,
+    const float* __restrict__ h_prev,
+    float* __restrict__ grad_prior,
+    float rho, float sigma_z, float mu,
+    float nu,
+    int n
+) {
+    __shared__ float sh_h_prev[TILE_J];
+    __shared__ float sh_mu_i[TILE_J];
+    
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n) return;
+
+    float h_j = h[j];
+    float sigma_sq = sigma_z * sigma_z + 1e-8f;
+    float nu_sigma_sq = nu * sigma_sq;
+    float grad_factor = -(nu + 1.0f) / nu_sigma_sq;
+
+    float log_p_max = -1e10f;
+
+    // First pass: find max
+    for (int tile = 0; tile < (n + TILE_J - 1) / TILE_J; tile++) {
+        int tile_start = tile * TILE_J;
+        int tile_end = min(tile_start + TILE_J, n);
+        int tile_size = tile_end - tile_start;
+        
+        __syncthreads();
+        for (int k = threadIdx.x; k < tile_size; k += blockDim.x) {
+            float hp = h_prev[tile_start + k];
+            sh_h_prev[k] = hp;
+            sh_mu_i[k] = mu + rho * (hp - mu);
+        }
+        __syncthreads();
+
+        for (int i = 0; i < tile_size; i++) {
+            float diff = h_j - sh_mu_i[i];
+            float diff_sq = diff * diff;
+            float term = 1.0f + diff_sq / nu_sigma_sq;
+            float log_p = -0.5f * (nu + 1.0f) * logf(term);
+            log_p_max = fmaxf(log_p_max, log_p);
+        }
+    }
+
+    float sum_p = 0.0f;
+    float weighted_grad = 0.0f;
+
+    // Second pass: compute weighted gradient
+    for (int tile = 0; tile < (n + TILE_J - 1) / TILE_J; tile++) {
+        int tile_start = tile * TILE_J;
+        int tile_end = min(tile_start + TILE_J, n);
+        int tile_size = tile_end - tile_start;
+        
+        __syncthreads();
+        for (int k = threadIdx.x; k < tile_size; k += blockDim.x) {
+            float hp = h_prev[tile_start + k];
+            sh_h_prev[k] = hp;
+            sh_mu_i[k] = mu + rho * (hp - mu);
+        }
+        __syncthreads();
+
+        for (int i = 0; i < tile_size; i++) {
+            float diff = h_j - sh_mu_i[i];
+            float diff_sq = diff * diff;
+            float term = 1.0f + diff_sq / nu_sigma_sq;
+            float log_p = -0.5f * (nu + 1.0f) * logf(term);
+            float p_i = expf(log_p - log_p_max);
+            float grad_i = grad_factor * diff / term;
+            sum_p += p_i;
+            weighted_grad += p_i * grad_i;
+        }
+    }
+
+    grad_prior[j] = weighted_grad / (sum_p + 1e-10f);
 }
 
 // =============================================================================
@@ -571,6 +1057,72 @@ __global__ void svpf_stein_2d_kernel(
 }
 
 // =============================================================================
+// Kernel 5-IMQ: 2D Tiled Stein Kernel with IMQ (Inverse Multiquadric)
+// 
+// Replaces Gaussian RBF kernel with IMQ for "infinite vision":
+//   RBF: k(x,y) = exp(-||x-y||²/2h²)     - exponential decay, vanishes at distance
+//   IMQ: k(x,y) = (1 + ||x-y||²/h²)^(-β) - polynomial decay, always interacts
+//
+// With IMQ, distant particles still feel attraction. Solves vanishing gradient
+// problem without needing guide densities or teleportation heuristics.
+// =============================================================================
+
+__global__ void svpf_stein_imq_2d_kernel(
+    const float* __restrict__ h,
+    const float* __restrict__ grad,
+    float* __restrict__ phi,
+    const float* __restrict__ d_bandwidth,
+    int n
+) {
+    int i = blockIdx.x;
+    int tile = blockIdx.y;
+    int tile_start = tile * TILE_J;
+    int tile_end = min(tile_start + TILE_J, n);
+    int tile_size = tile_end - tile_start;
+    
+    if (i >= n || tile_start >= n) return;
+    
+    __shared__ float sh_h[TILE_J];
+    __shared__ float sh_grad[TILE_J];
+    
+    for (int j = threadIdx.x; j < tile_size; j += blockDim.x) {
+        sh_h[j] = h[tile_start + j];
+        sh_grad[j] = grad[tile_start + j];
+    }
+    __syncthreads();
+    
+    float h_i = h[i];
+    float bw = *d_bandwidth;
+    float bw_sq = bw * bw;
+    
+    float k_sum = 0.0f;
+    float gk_sum = 0.0f;
+    
+    for (int j = threadIdx.x; j < tile_size; j += blockDim.x) {
+        float diff = h_i - sh_h[j];
+        float diff_sq = diff * diff;
+        
+        // IMQ kernel: k(x,y) = (1 + diff²/bw²)^(-0.5) = 1/sqrt(base)
+        float base = 1.0f + diff_sq / bw_sq;
+        float K = rsqrtf(base);
+        
+        // Gradient: ∇_x k = -0.5 * base^(-1.5) * 2*diff/bw² = -K³ * diff/bw²
+        float grad_K = -K * K * K * diff / bw_sq;
+        
+        k_sum += K * sh_grad[j];
+        gk_sum += grad_K;
+    }
+    
+    k_sum = block_reduce_sum(k_sum);
+    __syncthreads();
+    gk_sum = block_reduce_sum(gk_sum);
+    
+    if (threadIdx.x == 0) {
+        atomicAdd(&phi[i], (k_sum + gk_sum) / (float)n);
+    }
+}
+
+// =============================================================================
 // Kernel 5a-Newton: 2D Tiled Newton-Stein Kernel
 // =============================================================================
 
@@ -615,6 +1167,68 @@ __global__ void svpf_stein_newton_2d_kernel(
         
         k_sum += K * sh_precond_grad[j];
         gk_sum += (-K * diff / bw_sq) * inv_H_j;
+    }
+    
+    k_sum = block_reduce_sum(k_sum);
+    __syncthreads();
+    gk_sum = block_reduce_sum(gk_sum);
+    
+    if (threadIdx.x == 0) {
+        atomicAdd(&phi[i], (k_sum + gk_sum) / (float)n);
+    }
+}
+
+// =============================================================================
+// Kernel 5a-Newton-IMQ: 2D Tiled Newton-Stein with IMQ
+// =============================================================================
+
+__global__ void svpf_stein_newton_imq_2d_kernel(
+    const float* __restrict__ h,
+    const float* __restrict__ precond_grad,
+    const float* __restrict__ inv_hessian,
+    float* __restrict__ phi,
+    const float* __restrict__ d_bandwidth,
+    int n
+) {
+    int i = blockIdx.x;
+    int tile = blockIdx.y;
+    int tile_start = tile * TILE_J;
+    int tile_end = min(tile_start + TILE_J, n);
+    int tile_size = tile_end - tile_start;
+    
+    if (i >= n || tile_start >= n) return;
+    
+    __shared__ float sh_h[TILE_J];
+    __shared__ float sh_precond_grad[TILE_J];
+    __shared__ float sh_inv_hess[TILE_J];
+    
+    for (int j = threadIdx.x; j < tile_size; j += blockDim.x) {
+        sh_h[j] = h[tile_start + j];
+        sh_precond_grad[j] = precond_grad[tile_start + j];
+        sh_inv_hess[j] = inv_hessian[tile_start + j];
+    }
+    __syncthreads();
+    
+    float h_i = h[i];
+    float bw = *d_bandwidth;
+    float bw_sq = bw * bw;
+    
+    float k_sum = 0.0f;
+    float gk_sum = 0.0f;
+    
+    for (int j = threadIdx.x; j < tile_size; j += blockDim.x) {
+        float diff = h_i - sh_h[j];
+        float diff_sq = diff * diff;
+        
+        // IMQ kernel
+        float base = 1.0f + diff_sq / bw_sq;
+        float K = rsqrtf(base);
+        float grad_K = -K * K * K * diff / bw_sq;
+        
+        float inv_H_j = sh_inv_hess[j];
+        
+        k_sum += K * sh_precond_grad[j];
+        gk_sum += grad_K * inv_H_j;
     }
     
     k_sum = block_reduce_sum(k_sum);
@@ -688,6 +1302,73 @@ __global__ void svpf_stein_persistent_kernel(
 }
 
 // =============================================================================
+// Kernel 5b-IMQ: Persistent CTA Stein Kernel with IMQ
+// =============================================================================
+
+__global__ void svpf_stein_imq_persistent_kernel(
+    const float* __restrict__ h,
+    const float* __restrict__ grad,
+    float* __restrict__ phi,
+    const float* __restrict__ d_bandwidth,
+    int n
+) {
+    extern __shared__ float smem[];
+    float* sh_h = smem;
+    float* sh_grad = smem + n;
+    float* sh_reduce = smem + 2 * n;
+    
+    for (int j = threadIdx.x; j < n; j += blockDim.x) {
+        sh_h[j] = h[j];
+        sh_grad[j] = grad[j];
+    }
+    __syncthreads();
+    
+    float bw = *d_bandwidth;
+    float bw_sq = bw * bw;
+    
+    for (int i = blockIdx.x; i < n; i += gridDim.x) {
+        float h_i = sh_h[i];
+        
+        float k_sum = 0.0f;
+        float gk_sum = 0.0f;
+        
+        for (int j = threadIdx.x; j < n; j += blockDim.x) {
+            float diff = h_i - sh_h[j];
+            float diff_sq = diff * diff;
+            
+            // IMQ kernel
+            float base = 1.0f + diff_sq / bw_sq;
+            float K = rsqrtf(base);
+            float grad_K = -K * K * K * diff / bw_sq;
+            
+            k_sum += K * sh_grad[j];
+            gk_sum += grad_K;
+        }
+        
+        k_sum = warp_reduce_sum(k_sum);
+        int lane = threadIdx.x % WARP_SIZE;
+        int wid = threadIdx.x / WARP_SIZE;
+        if (lane == 0) sh_reduce[wid] = k_sum;
+        __syncthreads();
+        
+        k_sum = (threadIdx.x < BLOCK_SIZE / WARP_SIZE) ? sh_reduce[threadIdx.x] : 0.0f;
+        if (wid == 0) k_sum = warp_reduce_sum(k_sum);
+        
+        gk_sum = warp_reduce_sum(gk_sum);
+        if (lane == 0) sh_reduce[wid] = gk_sum;
+        __syncthreads();
+        
+        gk_sum = (threadIdx.x < BLOCK_SIZE / WARP_SIZE) ? sh_reduce[threadIdx.x] : 0.0f;
+        if (wid == 0) gk_sum = warp_reduce_sum(gk_sum);
+        
+        if (threadIdx.x == 0) {
+            phi[i] = (k_sum + gk_sum) / (float)n;
+        }
+        __syncthreads();
+    }
+}
+
+// =============================================================================
 // Kernel 5b-Newton: Newton-Stein Persistent Kernel
 // =============================================================================
 
@@ -728,6 +1409,78 @@ __global__ void svpf_stein_newton_persistent_kernel(
             
             k_sum += K * sh_precond_grad[j];
             gk_sum += (-K * diff / bw_sq) * inv_H_j;
+        }
+        
+        k_sum = warp_reduce_sum(k_sum);
+        int lane = threadIdx.x % WARP_SIZE;
+        int wid = threadIdx.x / WARP_SIZE;
+        if (lane == 0) sh_reduce[wid] = k_sum;
+        __syncthreads();
+        
+        k_sum = (threadIdx.x < BLOCK_SIZE / WARP_SIZE) ? sh_reduce[threadIdx.x] : 0.0f;
+        if (wid == 0) k_sum = warp_reduce_sum(k_sum);
+        
+        gk_sum = warp_reduce_sum(gk_sum);
+        if (lane == 0) sh_reduce[wid] = gk_sum;
+        __syncthreads();
+        
+        gk_sum = (threadIdx.x < BLOCK_SIZE / WARP_SIZE) ? sh_reduce[threadIdx.x] : 0.0f;
+        if (wid == 0) gk_sum = warp_reduce_sum(gk_sum);
+        
+        if (threadIdx.x == 0) {
+            phi[i] = (k_sum + gk_sum) / (float)n;
+        }
+        __syncthreads();
+    }
+}
+
+// =============================================================================
+// Kernel 5b-Newton-IMQ: Newton-Stein Persistent Kernel with IMQ
+// =============================================================================
+
+__global__ void svpf_stein_newton_imq_persistent_kernel(
+    const float* __restrict__ h,
+    const float* __restrict__ precond_grad,
+    const float* __restrict__ inv_hessian,
+    float* __restrict__ phi,
+    const float* __restrict__ d_bandwidth,
+    int n
+) {
+    extern __shared__ float smem[];
+    float* sh_h = smem;
+    float* sh_precond_grad = smem + n;
+    float* sh_inv_hess = smem + 2 * n;
+    float* sh_reduce = smem + 3 * n;
+    
+    for (int j = threadIdx.x; j < n; j += blockDim.x) {
+        sh_h[j] = h[j];
+        sh_precond_grad[j] = precond_grad[j];
+        sh_inv_hess[j] = inv_hessian[j];
+    }
+    __syncthreads();
+    
+    float bw = *d_bandwidth;
+    float bw_sq = bw * bw;
+    
+    for (int i = blockIdx.x; i < n; i += gridDim.x) {
+        float h_i = sh_h[i];
+        
+        float k_sum = 0.0f;
+        float gk_sum = 0.0f;
+        
+        for (int j = threadIdx.x; j < n; j += blockDim.x) {
+            float diff = h_i - sh_h[j];
+            float diff_sq = diff * diff;
+            
+            // IMQ kernel
+            float base = 1.0f + diff_sq / bw_sq;
+            float K = rsqrtf(base);
+            float grad_K = -K * K * K * diff / bw_sq;
+            
+            float inv_H_j = sh_inv_hess[j];
+            
+            k_sum += K * sh_precond_grad[j];
+            gk_sum += grad_K * inv_H_j;
         }
         
         k_sum = warp_reduce_sum(k_sum);
@@ -1071,4 +1824,61 @@ __global__ void svpf_h_mean_finalize_kernel(
     if (tid == 0) {
         *d_h_mean = sdata[0] / (float)n_particles;
     }
+}
+
+// =============================================================================
+// NEW: Phi Stress Computation Kernel (for Adaptive Scouts)
+// Uses atomicAdd for multi-block safety. Caller must memset d_phi_stress to 0
+// before launch and divide by N after.
+// =============================================================================
+
+__global__ void svpf_compute_phi_stress_kernel(
+    const float* __restrict__ phi,
+    float* __restrict__ d_phi_stress,
+    int n
+) {
+    float local_sum = 0.0f;
+    
+    // Grid-stride loop for robustness with any launch config
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += blockDim.x * gridDim.x) {
+        local_sum += fabsf(phi[i]);
+    }
+    
+    // Block reduction
+    local_sum = block_reduce_sum(local_sum);
+    
+    // Atomic accumulation (safe across multiple blocks)
+    if (threadIdx.x == 0) {
+        atomicAdd(d_phi_stress, local_sum);
+    }
+}
+
+// =============================================================================
+// Host Function: Update Adaptive Scout Scale
+// =============================================================================
+
+void svpf_update_adaptive_scouts(SVPFState* state, float phi_stress) {
+    if (!state->use_adaptive_scouts) {
+        state->adaptive_scout_scale = state->mim_jump_scale;
+        return;
+    }
+    
+    // EMA update
+    float alpha = state->phi_ema_alpha;
+    if (state->phi_ema > 0.0f) {
+        state->phi_ema = alpha * phi_stress + (1.0f - alpha) * state->phi_ema;
+    } else {
+        state->phi_ema = phi_stress;
+    }
+    
+    // Sigmoid activation: smoothly ramps from min_scale to max_scale
+    float threshold = state->phi_stress_threshold;
+    float softness = state->phi_stress_softness;
+    float min_scale = state->min_scout_scale;
+    float max_scale = state->max_scout_scale;
+    
+    float x = (state->phi_ema - threshold) / softness;
+    float activation = 1.0f / (1.0f + expf(-x));  // sigmoid in [0, 1]
+    
+    state->adaptive_scout_scale = min_scale + (max_scale - min_scale) * activation;
 }
