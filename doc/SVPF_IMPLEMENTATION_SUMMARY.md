@@ -97,21 +97,54 @@ float rho = (h_i > h_prev_i) ? rho_up : rho_down;
 
 ## 3. EKF Guide Density (SV-GPF)
 
-**Problem:** Stein gradients are slow at large-scale transport.
+This technique, **Stein Variational Guided Particle Filter (SV-GPF)**, is a hybrid method designed to solve the "blindness" of standard filters.
 
-**Solution:** Use Extended Kalman Filter for coarse positioning:
-```c
-// Host-side EKF (~20 FLOPs)
-float m_pred = mu + rho * (guide_mean - mu);
-float P_pred = rho² * guide_var + sigma_z²;
-float K = P_pred / (P_pred + R_noise);
-guide_mean = m_pred + K * (log(y²) - m_pred - offset);
+In simple terms: It uses an **Extended Kalman Filter (EKF)** as a "scout" to find the high-probability region first, and then uses the **Stein** method to map out the details.
 
-// GPU kernel: pull particles toward guide
-h[i] += strength * (guide_mean - h[i]);
-```
+Here is the breakdown of its strong sides and mechanism.
 
-**Benefit:** Particles start near posterior; Stein handles fine structure.
+### 1. The Core Concept: The "Guide" Density
+
+To understand the strength of this method, you have to understand the weakness of the others:
+
+* **Standard PF (Blind):** Particles move based on where they *were* yesterday (the prior). They don't look at the new measurement until *after* they move. If the measurement is far away, the particles miss it entirely.
+* **Standard SVGD (Local):** Particles follow gradients. If particles start too far from the target peak, the gradient is flat (zero), and they don't know where to go. They get stuck.
+
+**The SV-GPF Solution:**
+It uses an **EKF** to construct a **"Guide Density"** (usually a Gaussian proposal distribution).
+
+1. **EKF Step (The Scout):** You run a quick, cheap EKF update. This gives you a rough Gaussian estimate () of where the true state likely is.
+2. **Guide Step:** You use this EKF estimate to inject or move particles into this high-probability zone *immediately*.
+3. **Stein Step (The Artist):** Once the particles are in the right neighborhood, you turn on the Stein Variational Gradient Descent. It takes this rough Gaussian blob and warps it into the *exact* complex, non-Gaussian shape of the true posterior.
+
+### 2. Strong Sides
+
+#### A. It Solves the "Vanishing Gradient" Problem
+
+This is its biggest strength. In high-dimensional spaces, if your particles are far from the target, the gradient  is effectively zero. The particles are "lost in the flatlands."
+
+* **SV-GPF:** The EKF guide "teleports" the particles to the base of the mountain (the mode). Now that they are close, the gradients are strong, and SVGD can do its job efficiently.
+
+#### B. It Corrects EKF Linearization Errors
+
+The EKF is fast but often wrong—it assumes everything is a Gaussian bell curve (linear).
+
+* **SV-GPF:** It doesn't stop at the EKF result. It uses the EKF only as a starting point (or proposal). The subsequent Stein updates physically move the particles to correct for the EKF's errors, capturing skewness, kurtosis, and multi-modality that the EKF missed.
+
+#### C. Sample Efficiency
+
+Because you are guiding particles to the right place *before* you start the heavy optimization, you need far fewer particles.
+
+* **Standard PF:** Might need 10,000 particles to hit the target by luck.
+* **SV-GPF:** Might only need 50 particles, because the EKF ensures they are all relevant, and Stein ensures they are diverse.
+
+### Summary: The "Best of Both Worlds"
+
+| Component | Role | Weakness if used alone |
+| --- | --- | --- |
+| **EKF (Guide)** | **The Compass.** Points particles roughly in the right direction using the new observation. | **Inaccurate.** Assumes everything is a simple Gaussian; fails on complex shapes. |
+| **Stein (SVGD)** | **The Sculptor.** Refines the particle cloud to match the exact true distribution. | **Nearsighted.** If particles start too far away, it can't find the target (vanishing gradient). |
+| **SV-GPF** | **Combined.** EKF gets you close; Stein makes you perfect. | **Complex.** Requires implementing Jacobian matrices (for EKF) *and* Kernels (for Stein). |
 
 ---
 
