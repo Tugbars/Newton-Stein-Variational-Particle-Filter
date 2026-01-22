@@ -65,9 +65,9 @@ Where `k(·,·)` is an RBF kernel with adaptive bandwidth.
 
 ---
 
-## Improvements Implemented
+# Improvements Implemented
 
-### 1. Mixture Innovation Model (MIM)
+## 1. Mixture Innovation Model (MIM)
 
 **Problem:** Standard Gaussian innovation can't capture sudden volatility spikes.
 
@@ -81,7 +81,7 @@ h[i] = prior_mean + sigma_z * scale * noise;
 
 ---
 
-### 2. Asymmetric Persistence (ρ_up / ρ_down)
+## 2. Asymmetric Persistence (ρ_up / ρ_down)
 
 **Problem:** Volatility spikes fast but decays slowly (empirical fact).
 
@@ -95,7 +95,7 @@ float rho = (h_i > h_prev_i) ? rho_up : rho_down;
 
 ---
 
-### 3. EKF Guide Density (SV-GPF)
+## 3. EKF Guide Density (SV-GPF)
 
 **Problem:** Stein gradients are slow at large-scale transport.
 
@@ -129,33 +129,162 @@ bandwidth *= alpha;
 
 ---
 
-### 5. Annealed Stein Updates
+## 5. Annealed Stein Updates
 
-**Problem:** Sharp likelihood causes particle collapse.
+While **Stein Variational Newton** speeds up convergence (fixing the lag), **Annealed Stein Updates** ensure that the convergence happens towards the *correct* global solution, preventing particles from getting stuck in the wrong local valleys.
 
-**Solution:** Gradually increase likelihood weight: β ∈ {0.3, 0.65, 1.0}
-```c
-grad = β * grad_likelihood + grad_prior;
-```
+Here is the explanation of **Annealed Stein Variational Gradient Descent (ASVGD)**.
+
+### 1. The Core Concept: "Melting" the Landscape
+
+Standard SVPF is "greedy"—it climbs the steepest hill immediately available to it. If your probability landscape has two mountains separated by a deep valley, particles starting near the smaller mountain will climb it and get stuck there, never realizing a bigger mountain (the true target) exists just across the valley.
+
+**Annealed Updates** solve this by introducing a **Temperature ()** parameter to the target distribution :
+
+* **High Temperature ():** The distribution is "melted" and flat. The deep valleys disappear. Particles can move freely across the entire space without getting trapped.
+* **Low Temperature ():** The distribution "freezes" back into its true, sharp shape.
+
+### 2. How it works in practice (The Schedule)
+
+Instead of running the filter on the difficult target immediately, you run it through a sequence of changing targets (a "schedule"):
+
+1. **Start Hot:** You set  very high. The repulsive force dominates, pushing particles to spread out and cover the *entire* global space uniformly.
+2. **Cool Down:** You slowly lower . As the landscape starts to wrinkle and form hills, the particles—which are already spread out globally—naturally slide into the "basins" of the most significant modes.
+3. **Freeze:** By the time  (the true target), the particles are already sitting inside the correct high-probability regions. They just need to do a final local adjustment.
+
+### 3. Why this is a "Strong Side"
+
+This technique essentially gives the filter a "global map" before asking it to find a specific address.
+
+* **Solves Mode Collapse:** In standard SVGD, if you initialize all particles in one corner, they stay there. With annealing, the initial "hot" phase forces them to explore the whole map first.
+* **Fixes "Lag" via Guidance:** It creates a smooth path (a homotopy) from the prior to the posterior. The particles don't have to "jump" or "catch up" to a moving target blindly; they are guided there by the slowly changing temperature.
+
+### 4. Relevant Literature
+
+Since you requested the connection to literature, this specific technique is a key focus in recent high-dimensional inference papers:
+
+* **The Core Paper:** *“Annealed Stein Variational Gradient Descent”* by **D'Angelo and Fortuin (2021)**.
+* **Relevance:** They formally proved that standard SVGD fails to escape local modes in multimodal distributions. They introduced the annealing schedule to ASVGD to fix this, showing it recovers modes that standard SVGD completely misses.
+
+* **The Application:** *“Annealed Stein Variational Gradient Descent for Improved Uncertainty Estimation in Full-Waveform Inversion”* by **Corrales et al. (2025)**.
+* **Relevance:** This is a very recent application in geophysics. It shows that for massive, complex inverse problems (like mapping the earth's subsurface), standard SVGD gets stuck in local minima (producing wrong maps), while the Annealed version successfully finds the true geological structure.
+
+### Summary
+
+| Feature | Standard SVGD | Annealed SVGD |
+| --- | --- | --- |
+| **Strategy** | **Greedy.** Climb the nearest hill immediately. | **Global.** Survey the land, then climb. |
+| **Weakness** | Gets trapped in local optima (sub-optimal solutions). | Computationally more expensive (requires multiple "stages"). |
+| **Best For** | Simple, unimodal targets. | Complex, "rugged" landscapes with many traps. |
+
+### Next Step
+
+Would you like to explore how **"Projected SVGD"** works (to fix the high-dimensional cost), or are you ready for the full list of literature you mentioned earlier?
 
 **Benefit:** Particles explore before committing to likelihood mode.
 
 ---
 
-### 6. SVLD (Stein Variational Langevin Descent)
+## 6. SVLD (Stein Variational Langevin Descent)
 
-**Problem:** Deterministic SVGD loses diversity over time.
+While **Annealed SVGD** solves the "trap" problem using temperature, **Stein Variational Langevin Descent (SVLD)** solves a more subtle but dangerous problem: **Variance Collapse in High Dimensions.**
 
-**Solution:** Add calibrated Langevin noise after transport:
-```c
-float drift = step_size * phi[i] / sqrt(v[i] + eps);  // RMSProp
-float diffusion = sqrt(2 * step_size * temperature) * noise;
-h[i] += drift + diffusion;
-```
+Here is the breakdown of why this hybrid exists and what it offers.
 
-**Benefit:** Maintains particle diversity; prevents mode collapse.
+### 1. The Core Problem: "Variance Collapse"
+
+In low dimensions (2D or 3D), the repulsive force of standard SVGD works perfectly. Particles push against each other like magnets, filling the space.
+
+However, in **High Dimensions** (e.g., neural network parameters), the "kernel" (which measures distance between particles) starts to fail due to the **Curse of Dimensionality**.
+
+* The distances between all particles become roughly the same.
+* The repulsive force weakens or becomes uniform.
+* **The result:** The particles stop pushing each other effectively and clump together around the mode (the peak). They find the *answer* (the mode), but they fail to describe the *uncertainty* (the variance).
+
+### 2. The Solution: SVGD + Langevin Noise
+
+SVLD fixes this by adding a "kick" of random noise to the deterministic Stein update.
+
+* **Standard SVGD:** Move down the gradient + Push away from neighbors. (Deterministic)
+* **Langevin Dynamics:** Move down the gradient + Add random Gaussian noise. (Stochastic)
+* **SVLD (The Hybrid):**
+
+It uses the **Stein force** to guide particles intelligently toward the typical set, and uses the **Langevin noise** to artificially inflate the cloud, preventing the particles from collapsing into a single point.
+
+### 3. Strong Sides (Why use it?)
+
+This method is currently considered one of the robust "gold standards" for high-dimensional Bayesian Deep Learning.
+
+| Feature | Pure SVGD | Pure Langevin (SGLD) | **SVLD (Hybrid)** |
+| --- | --- | --- | --- |
+| **Movement** | Smooth, deterministic flow. | Random "drunkard's walk." | Guided flow with vibration. |
+| **Exploration** | Can get trapped in local modes. | Good exploration, but very slow convergence. | **Fast convergence + Good escape capabilities.** |
+| **High Dimensions** | **Fails.** Particles clump together (Variance Collapse). | **Works.** Noise scales well with dimension. | **Works.** Noise prevents collapse where kernel fails. |
+
+### 4. Visual Analogy: The Canyon
+
+Imagine finding the deepest point of a foggy canyon.
+
+* **Pure SVGD** is like a team of hikers roped together. They walk down, spreading out to search. But if the canyon is narrow, they might all huddle together at the bottom, thinking "this is the only spot."
+* **Pure Langevin** is like letting 100 drunk hikers loose. They will eventually explore every inch of the canyon, but it will take forever for them to gather at the bottom.
+* **SVLD** is a team of hikers who are roped together (Stein repulsion) but are also told to constantly jitter and jump around (Langevin noise). The rope pulls them to the interesting area quickly, but the jumping ensures they don't just stand on top of each other once they arrive.
+
+### 5. Relevant Literature
+
+This specific hybrid has been analyzed to address the "Variance Collapse" phenomenon:
+
+* **The "Variance Collapse" Discovery:** *"Understanding the Variance Collapse of SVGD in High Dimensions"* by **Ba et al. (2021)**.
+* **Relevance:** This paper mathematically proved that standard SVGD stops working correctly as dimensions increase, motivating the need for stochastic counterparts like SVLD.
+
+
+* **The Method:** *"A Stochastic Version of Stein Variational Gradient Descent"* by **Li et al. (2019/2020)**.
+* **Relevance:** This paper formally introduces the stochastic variant (often called **sSVGD**), proving that adding the diffusion term (noise) makes the algorithm asymptotically exact, whereas pure SVGD can have deterministic bias.
 
 ---
+
+## 7. Stein-Newton
+
+Because SVPF relies on an iterative **optimization process** (gradient descent) rather than an instantaneous **selection process** (resampling), it is prone to being "too slow" to catch up with a rapidly changing target.
+
+Here is why that lag happens and how **Stein Variational Newton (SVN)** methods fix it, relating back to the relevant literature.
+
+### 1. Why it lags: The "Gradient Flow" Bottleneck
+
+In a standard Particle Filter, if the target moves from point A to point B, the resampling step instantly "teleports" probability mass to B (by cloning the few lucky particles that are already near B).
+
+In SVPF, the particles must physically *travel* from A to B.
+
+* **The Mechanism:** SVPF updates particles by simulating a "flow" (specifically, the gradient flow of the KL divergence).
+* **The Constraint:** This flow takes time (iterations). In a real-time filter, you often have a limited budget (e.g., only 10 or 20 gradient steps per observation).
+* **The Lag:** If the target moves further than the particles can travel in those 10 steps, the particle cloud stops short. Over time, this error accumulates, and the filter consistently trails behind the true state. This is formally described as **bias due to non-convergence**.
+
+### 2. The Solution: Stein Variational Newton (SVN)
+
+Just as **Newton’s Method** is vastly faster than **Gradient Descent** in standard optimization because it accounts for curvature, **Stein Variational Newton** applies this same logic to the particle space.
+
+Standard SVPF (SVGD) uses only the **first derivative** (gradient). It tells the particles *which direction* to go but not *how far* to step safely. If the terrain is "stiff" (e.g., a long, narrow valley), the particles zig-zag efficiently and converge slowly.
+
+**Stein Variational Newton** incorporates the **Hessian** (second derivative), which provides information about the **geometry and curvature** of the posterior.
+
+* **Preconditioning:** It effectively rescales the gradient. If the landscape is flat in one direction and steep in another, SVN normalizes this, allowing particles to take much larger, more confident steps without overshooting.
+* **Result:** It can converge in 2-3 iterations where standard SVPF might take 100, effectively eliminating the "lag" in sequential tracking.
+
+### Relevant Literature
+
+Per your interest in the literature, these are the key papers that address this specific limitation:
+
+* **The Origin of the Solution:** *“A Stein Variational Newton Method”* by Detommaso et al. (2018).
+* **Relevance:** This is the seminal paper that proposed using the Hessian to accelerate SVGD. They show that applying Newton-like steps in the Reproducing Kernel Hilbert Space (RKHS) dramatically speeds up convergence, solving the lag issue in "stiff" posteriors.
+
+* **The High-Dimensional Fix:** *“Projected Stein Variational Gradient Descent”* by Chen and Ghattas (2020).
+* **Relevance:** Calculating the full Hessian (Newton method) is expensive in high dimensions. This paper proposes projecting the gradient onto a lower-dimensional subspace, allowing you to get the speed benefits of Newton/SVPF without the crushing computational cost.
+
+### Summary: The Trade-off
+
+| Method | Convergence Speed | Risk of Lag | Computational Cost |
+| --- | --- | --- | --- |
+| **Standard SVPF (SVGD)** | Slow (Linear) | **High.** Struggles with fast dynamics. | Low (First-order only). |
+| **Stein Variational Newton** | Fast (Quadratic) | **Low.** Snaps to target quickly. | High (Requires Hessian). |
 
 ## Configuration Reference
 
