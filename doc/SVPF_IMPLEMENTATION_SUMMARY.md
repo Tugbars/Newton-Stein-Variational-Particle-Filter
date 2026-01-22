@@ -69,15 +69,66 @@ Where `k(·,·)` is an RBF kernel with adaptive bandwidth.
 
 ## 1. Mixture Innovation Model (MIM)
 
-**Problem:** Standard Gaussian innovation can't capture sudden volatility spikes.
+This model is effectively an **insurance policy** against the standard Particle Filter's greatest weakness: "Tunnel Vision."
 
-**Solution:** 5% of particles sample from a "jump" distribution with 5× variance:
-```c
-float scale = (selector < 0.05f) ? 5.0f : 1.0f;
-h[i] = prior_mean + sigma_z * scale * noise;
-```
+In a standard Gaussian filter, the particle cloud is a tight cluster. If the target makes a massive, unexpected jump (e.g., a car braking instantly, a stock market crash), the entire cloud is looking in the wrong place. The probability of a standard Gaussian particle landing in the new location is mathematically near zero, so the filter "loses" the track.
 
-**Benefit:** Scout particles pre-positioned in tails for rapid regime changes.
+Here is exactly how the **Mixture Innovation Model (MIM)** fixes this using your "Scout" mechanics.
+
+### 1. The Mechanic: The "Heavy Tail"
+
+Your code creates a **Mixure Distribution** (specifically, a Mixture of two Gaussians).
+
+* **95% of the swarm (The Sheep):** Use `scale = 1.0f`. They trust the current velocity/model. They are highly accurate if nothing crazy happens.
+* **5% of the swarm (The Scouts):** Use `scale = 5.0f`. They distrust the model. They are thrown randomly into wide, far-flung regions (the "tails").
+
+Mathematically, you are artificially increasing the **Kurtosis** (fatness of the tails) of your search distribution. You are telling the filter: *"The target is probably here, but there is a non-zero chance it teleported over there."*
+
+### 2. Step-by-Step Execution
+
+Here is what happens during a sudden volatility spike:
+
+#### Phase A: The Quiet Times (Stable Tracking)
+
+* **Prediction:** You propagate particles. The 95% (Sheep) land right on top of the target. The 5% (Scouts) land far away in empty space.
+* **Update (Weighing):** The Sheep get high likelihood scores because they match the measurement. The Scouts get near-zero scores because they are far from the measurement.
+* **Resampling:** The filter kills the Scouts (low weight) and clones the Sheep.
+* **Result:** The filter looks standard. You wasted 5% of your computational budget, but you maintained a lock.
+
+#### Phase B: The "Jump" (Volatility Spike)
+
+The target suddenly jumps 10 meters to the right, but your model predicted it would move 1 meter.
+
+* **Prediction:**
+* The **Sheep** move 1 meter. They are now 9 meters away from the true target.
+* The **Scouts** (with 5x variance) are scattered widely. By pure probability, a few of them land near the new +10m location.
+
+
+* **Update (The Flip):**
+* The **Sheep** look at the new measurement and realize they are wrong. Their likelihood drops to near zero (e.g., ).
+* The successful **Scouts** look at the measurement and realize they are close. Their likelihood is high (e.g., ).
+
+
+* **Resampling (The Coup):**
+* The weights normalize. Even though there were only a few Scouts, their relative weight is now millions of times higher than the Sheep.
+* The filter **kills all the Sheep**.
+* It **clones the successful Scouts** hundreds of times to replenish the population.
+
+* **Result:** In a single frame, the particle cloud "teleports" to the new location. The Scouts have taken over and become the new Sheep.
+
+### 3. Visualizing the Probability Density
+
+If you look at the probability curve:
+
+* **Standard Gaussian:** Looks like a bell. The sides drop to zero very fast.
+* **Mixture Innovation:** Looks like a bell with a "skirt." The center is sharp, but the sides stay flat and wide. This "skirt" is where your scouts live, waiting for a black swan event.
+
+### 4. The Trade-off (There is no free lunch)
+
+Why not make `scale = 20.0f` or use 50% scouts?
+
+1. **Jitter:** During stable times, your effective sample size is only 95% of your particle count. You are slightly "noisier" than a standard filter.
+2. **False Alarms:** If your sensor is noisy (has outliers), a Scout might accidentally latch onto a piece of noise thinking it's a jump. The 5% / 5.0f ratio is a heuristic tune to balance **reactivity** vs. **stability**.
 
 ---
 
