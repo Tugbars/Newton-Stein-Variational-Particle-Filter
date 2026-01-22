@@ -21,7 +21,7 @@ __device__ __forceinline__ float clamp_logvol(float h) {
 }
 
 __device__ __forceinline__ float safe_exp(float x) {
-    return expf(fminf(x, 20.0f));
+    return __expf(fminf(x, 20.0f));
 }
 
 __device__ __forceinline__ float warp_reduce_sum(float val) {
@@ -206,7 +206,7 @@ __global__ void svpf_predict_guided_kernel(
     float mean_prior = mu + rho * (h_i - mu) + leverage;
 
     float y_curr = d_y[t];
-    float log_y2 = logf(y_curr * y_curr + 1e-10f);
+    float log_y2 = __logf(y_curr * y_curr + 1e-10f);
     float mean_implied = fmaxf(log_y2 + 1.27f, -5.0f);
 
     float innovation = mean_implied - mean_prior;
@@ -354,7 +354,7 @@ __global__ void svpf_fused_gradient_kernel(
     for (int i = 0; i < n; i++) {
         float diff = h_j - sh_mu_i[i];
         float log_r_i = -diff * diff * inv_2sigma_sq;
-        float r_i = expf(log_r_i - log_r_max);
+        float r_i = __expf(log_r_i - log_r_max);
         sum_r += r_i;
         weighted_grad -= r_i * diff * inv_sigma_sq;
     }
@@ -370,7 +370,7 @@ __global__ void svpf_fused_gradient_kernel(
              - (nu + 1.0f) * 0.5f * log1pf(fmaxf(scaled_y_sq / nu, -0.999f));
     
     // Observation pull gradient
-    float log_y2 = logf(y_sq + 1e-10f);
+    float log_y2 = __logf(y_sq + 1e-10f);
     float R_noise = 1.4f;
     float grad_lik = (log_y2 - h_j + 1.0f / nu) / R_noise;
     
@@ -441,7 +441,7 @@ __global__ void svpf_fused_stein_transport_kernel(
     #pragma unroll 8
     for (int j = 0; j < n; j++) {
         float diff = h_i - sh_h[j];
-        float K = expf(-diff * diff * inv_2bw_sq);
+        float K = __expf(-diff * diff * inv_2bw_sq);
         k_sum += K * sh_grad[j];
         gk_sum -= K * diff * inv_bw_sq;
     }
@@ -515,7 +515,7 @@ __global__ void svpf_fused_stein_transport_newton_kernel(
     #pragma unroll 8
     for (int j = 0; j < n; j++) {
         float diff = h_i - sh_h[j];
-        float K = expf(-diff * diff * inv_2bw_sq);
+        float K = __expf(-diff * diff * inv_2bw_sq);
         k_sum += K * sh_precond_grad[j];
         gk_sum -= K * diff * inv_bw_sq * sh_inv_hess[j];
     }
@@ -572,7 +572,7 @@ __global__ void svpf_fused_outputs_kernel(
     float local_sum_h = 0.0f;
     
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
-        local_sum_exp += expf(log_w[i] - max_log_w);
+        local_sum_exp += __expf(log_w[i] - max_log_w);
         float h_i = h[i];
         local_sum_vol += safe_exp(h_i * 0.5f);
         local_sum_h += h_i;
@@ -586,7 +586,7 @@ __global__ void svpf_fused_outputs_kernel(
     
     if (threadIdx.x == 0) {
         float inv_n = 1.0f / (float)n;
-        d_loglik[t_out] = max_log_w + logf(local_sum_exp * inv_n + 1e-10f);
+        d_loglik[t_out] = max_log_w + __logf(local_sum_exp * inv_n + 1e-10f);
         d_vol[t_out] = local_sum_vol * inv_n;
         *d_h_mean = local_sum_h * inv_n;
     }
@@ -636,7 +636,7 @@ __global__ void svpf_fused_bandwidth_kernel(
         float spread = local_max - local_min;
         
         // Silverman's rule with EMA smoothing
-        float bw_sq_new = 2.0f * variance / logf((float)n + 1.0f);
+        float bw_sq_new = 2.0f * variance / __logf((float)n + 1.0f);
         bw_sq_new = fmaxf(bw_sq_new, 1e-6f);
         
         float bw_sq_prev = *d_bandwidth_sq;
