@@ -1,15 +1,130 @@
 /**
  * @file svpf_optimized_graph.cu
- * @brief CUDA Graph-accelerated SVPF implementation
+ * @brief CUDA Graph-accelerated SVPF implementation (consolidated)
  * 
- * Uses fused kernels for reduced launch overhead:
- * - svpf_fused_gradient_kernel (replaces 4 kernels)
- * - svpf_fused_stein_transport_kernel (replaces 3 kernels)
- * - svpf_fused_bandwidth_kernel (replaces 2 kernels)
- * - svpf_fused_outputs_kernel (replaces 3 kernels)
+ * Contains:
+ * - State management (init/cleanup)
+ * - EKF guide update
+ * - Graph capture with fused kernels
+ * - svpf_step_graph / svpf_step_adaptive
  */
 
 #include "svpf_kernels.cuh"
+#include <cuda_runtime.h>
+#include <cub/cub.cuh>
+
+// Forward declaration
+static void svpf_optimized_cleanup(SVPFOptimizedState* opt);
+
+// =============================================================================
+// State Management
+// =============================================================================
+
+void svpf_optimized_init(SVPFOptimizedState* opt, int n) {
+    if (opt->initialized && n > opt->allocated_n) {
+        svpf_optimized_cleanup(opt);
+    }
+    if (opt->initialized) return;
+    
+    // Query CUB temp storage size
+    float* d_dummy_in;
+    float* d_dummy_out;
+    cudaMalloc(&d_dummy_in, n * sizeof(float));
+    cudaMalloc(&d_dummy_out, sizeof(float));
+    
+    opt->temp_storage_bytes = 0;
+    cub::DeviceReduce::Max(nullptr, opt->temp_storage_bytes, d_dummy_in, d_dummy_out, n);
+    size_t sum_bytes = 0;
+    cub::DeviceReduce::Sum(nullptr, sum_bytes, d_dummy_in, d_dummy_out, n);
+    opt->temp_storage_bytes = max(opt->temp_storage_bytes, sum_bytes);
+    
+    cudaMalloc(&opt->d_temp_storage, opt->temp_storage_bytes);
+    cudaFree(d_dummy_in);
+    cudaFree(d_dummy_out);
+    
+    // Device scalars
+    cudaMalloc(&opt->d_max_log_w, sizeof(float));
+    cudaMalloc(&opt->d_sum_exp, sizeof(float));
+    cudaMalloc(&opt->d_bandwidth, sizeof(float));
+    cudaMalloc(&opt->d_bandwidth_sq, sizeof(float));
+    
+    float zero = 0.0f;
+    cudaMemcpy(opt->d_bandwidth_sq, &zero, sizeof(float), cudaMemcpyHostToDevice);
+    
+    // Stein computation buffers
+    cudaMalloc(&opt->d_exp_w, n * sizeof(float));
+    cudaMalloc(&opt->d_phi, n * sizeof(float));
+    cudaMalloc(&opt->d_grad_lik, n * sizeof(float));
+    
+    // Newton-Stein buffers
+    cudaMalloc(&opt->d_precond_grad, n * sizeof(float));
+    cudaMalloc(&opt->d_inv_hessian, n * sizeof(float));
+    
+    // Particle-local parameters
+    cudaMalloc(&opt->d_h_mean_prev, sizeof(float));
+    float init_h_mean = -3.5f;
+    cudaMemcpy(opt->d_h_mean_prev, &init_h_mean, sizeof(float), cudaMemcpyHostToDevice);
+    
+    // Guide mean
+    cudaMalloc(&opt->d_guide_mean, sizeof(float));
+    cudaMemcpy(opt->d_guide_mean, &init_h_mean, sizeof(float), cudaMemcpyHostToDevice);
+    
+    // Single-step API buffers
+    cudaMalloc(&opt->d_y_single, 2 * sizeof(float));
+    cudaMalloc(&opt->d_loglik_single, sizeof(float));
+    cudaMalloc(&opt->d_vol_single, sizeof(float));
+    
+    // CUDA Graph support
+    cudaMalloc(&opt->d_params_staging, SVPF_GRAPH_PARAMS_SIZE * sizeof(float));
+    cudaStreamCreateWithFlags(&opt->graph_stream, cudaStreamNonBlocking);
+    opt->graph_captured = false;
+    opt->graph_n = 0;
+    opt->graph_n_stein = 0;
+    
+    opt->allocated_n = n;
+    opt->initialized = true;
+}
+
+void svpf_optimized_cleanup(SVPFOptimizedState* opt) {
+    if (!opt->initialized) return;
+    
+    cudaFree(opt->d_temp_storage);
+    cudaFree(opt->d_max_log_w);
+    cudaFree(opt->d_sum_exp);
+    cudaFree(opt->d_bandwidth);
+    cudaFree(opt->d_bandwidth_sq);
+    cudaFree(opt->d_exp_w);
+    cudaFree(opt->d_phi);
+    cudaFree(opt->d_grad_lik);
+    cudaFree(opt->d_precond_grad);
+    cudaFree(opt->d_inv_hessian);
+    cudaFree(opt->d_h_mean_prev);
+    cudaFree(opt->d_guide_mean);
+    cudaFree(opt->d_y_single);
+    cudaFree(opt->d_loglik_single);
+    cudaFree(opt->d_vol_single);
+    cudaFree(opt->d_params_staging);
+    
+    if (opt->graph_captured) {
+        cudaGraphExecDestroy(opt->graph_exec);
+        cudaGraphDestroy(opt->graph);
+        opt->graph_captured = false;
+    }
+    
+    if (opt->graph_stream) {
+        cudaStreamDestroy(opt->graph_stream);
+        opt->graph_stream = nullptr;
+    }
+    
+    opt->allocated_n = 0;
+    opt->initialized = false;
+}
+
+void svpf_optimized_cleanup_state(SVPFState* state) {
+    if (state) {
+        svpf_optimized_cleanup(&state->opt_backend);
+    }
+}
 
 // =============================================================================
 // Forward declarations for fused kernels (defined in svpf_opt_kernels.cu)
@@ -76,9 +191,6 @@ __global__ void svpf_fused_bandwidth_kernel(
 static inline SVPFOptimizedState* get_opt(SVPFState* state) {
     return &state->opt_backend;
 }
-
-// Defined in svpf_optimized.cu
-extern void svpf_optimized_init(SVPFOptimizedState* opt, int n);
 
 // =============================================================================
 // Graph Capture
@@ -334,6 +446,22 @@ void svpf_step_graph(
     }
     
     state->timestep++;
+}
+
+// =============================================================================
+// Backward-compatible wrapper
+// =============================================================================
+
+void svpf_step_adaptive(
+    SVPFState* state,
+    float y_t,
+    float y_prev,
+    const SVPFParams* params,
+    float* h_loglik_out,
+    float* h_vol_out,
+    float* h_mean_out
+) {
+    svpf_step_graph(state, y_t, y_prev, params, h_loglik_out, h_vol_out, h_mean_out);
 }
 
 // =============================================================================
