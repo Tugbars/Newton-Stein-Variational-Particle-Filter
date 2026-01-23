@@ -284,6 +284,13 @@ typedef struct {
     float y_prev;
     cudaStream_t stream;
     
+    // Likelihood gradient config
+    // The log-squared gradient uses: grad = (log(y²) - h + lik_offset) / R_noise
+    // lik_offset corrects for E[log(y²)|h]:
+    //   - Gaussian observation: lik_offset = 1.27 (Euler-Mascheroni constant)
+    //   - Student-t(nu) approx: lik_offset = 1/nu
+    float lik_offset;       // Likelihood center offset (default: 1.27)
+    
     // Adaptive SVPF config
     int use_svld;           // Enable SVLD (Langevin noise) - 0=SVGD, 1=SVLD
     int use_annealing;      // Enable annealed Stein

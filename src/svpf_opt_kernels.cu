@@ -318,6 +318,7 @@ __global__ void svpf_fused_gradient_kernel(
     float beta,
     float nu,
     float student_t_const,
+    float lik_offset,      // NEW: Likelihood center offset (1.27 for Gaussian, 1/nu for Student-t approx)
     bool use_newton,
     int n
 ) {
@@ -364,7 +365,11 @@ __global__ void svpf_fused_gradient_kernel(
     }
     float grad_prior = weighted_grad / (sum_r + 1e-8f);
     
-    // ===== LIKELIHOOD GRADIENT (Student-t) =====
+    // ===== LIKELIHOOD GRADIENT (Log-squared with configurable offset) =====
+    // Math: E[log(y²)] = h + offset, where offset depends on observation model
+    //   - Gaussian: offset = -1.27 (Euler-Mascheroni related)
+    //   - Student-t(nu): offset ≈ 1/nu (approximation)
+    // We use: grad = (log(y²) - h + lik_offset) / R_noise
     float vol = safe_exp(h_j);
     float y_sq = y_t * y_t;
     float scaled_y_sq = y_sq / (vol + 1e-8f);
@@ -373,10 +378,10 @@ __global__ void svpf_fused_gradient_kernel(
     log_w[j] = student_t_const - 0.5f * h_j
              - (nu + 1.0f) * 0.5f * log1pf(fmaxf(scaled_y_sq / nu, -0.999f));
     
-    // Observation pull gradient
+    // Observation pull gradient with configurable offset
     float log_y2 = __logf(y_sq + 1e-10f);
     float R_noise = 1.4f;
-    float grad_lik = (log_y2 - h_j + 1.0f / nu) / R_noise;
+    float grad_lik = (log_y2 - h_j + lik_offset) / R_noise;
     
     // ===== COMBINE (annealed) =====
     float g = grad_prior + beta * grad_lik;

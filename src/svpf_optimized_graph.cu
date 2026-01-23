@@ -114,6 +114,13 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     cudaMemcpy(state->d_return_var, &init_ema, sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(state->d_bw_alpha, &init_alpha, sizeof(float), cudaMemcpyHostToDevice);
     
+    // === Likelihood gradient config ===
+    // Offset calibration (empirical):
+    //   - 1/nu ≈ 0.2 gives bias ≈ -0.3
+    //   - 1.27 (Gaussian theory) gives bias ≈ +0.3
+    //   - Sweet spot: ~0.7 for near-zero bias
+    state->lik_offset = 0.70f;  // Tuned for minimal bias
+    
     // === ADAPTIVE SVPF: Configuration defaults ===
     state->use_svld = 1;
     state->use_annealing = 1;
@@ -475,7 +482,7 @@ static void svpf_graph_capture_internal(SVPFState* state, const SVPFParams* para
                 state->use_newton ? opt->d_precond_grad : nullptr,
                 state->use_newton ? opt->d_inv_hessian : nullptr,
                 opt->d_y_single, 1, params->rho, params->sigma_z, params->mu,
-                beta, state->nu, student_t_const, state->use_newton, n
+                beta, state->nu, student_t_const, state->lik_offset, state->use_newton, n
             );
             
             if (state->use_newton) {
@@ -604,26 +611,39 @@ void svpf_step_graph(SVPFState* state, float y_t, float y_prev, const SVPFParams
     cudaMemcpyAsync(opt->d_y_single, y_arr, 2 * sizeof(float), cudaMemcpyHostToDevice, opt->graph_stream);
     
     // =========================================================================
-    // ADAPTIVE GUIDE STRENGTH: Innovation-gated nudging
+    // ADAPTIVE GUIDE STRENGTH: Asymmetric Innovation-gated nudging
     // =========================================================================
-    // Compute on CPU before graph launch (uses vol_prev from last step)
+    // Only boost when IMPLIED volatility > ESTIMATED volatility (upward surprise)
+    // Downward surprises (price calm when vol expected high) are often just mean reversion
+    // Upward surprises (price crash) are INFORMATION - trust the guide!
     float current_guide_strength = state->guide_strength_base;
     
     if (state->use_guide && state->use_adaptive_guide && state->timestep > 0) {
         // Use previous vol estimate as proxy for prediction
         float vol_est = fmaxf(state->vol_prev, 1e-4f);
         
-        // Innovation z-score: how surprised is the model?
-        float innovation_z = fabsf(y_t / vol_est);
+        // Return z-score: magnitude of surprise
+        float return_z = fabsf(y_t) / vol_est;
         
-        // Linear ramp from base to max:
-        // Z < threshold -> base strength
-        // Z > threshold + 3 -> max strength
-        float boost_range = 3.0f;
-        float boost_frac = fminf(fmaxf(innovation_z - state->guide_innovation_threshold, 0.0f) / boost_range, 1.0f);
-        float boost = (state->guide_strength_max - state->guide_strength_base) * boost_frac;
+        // Implied h from observation: log(y²) + 1.27
+        float implied_h = logf(y_t * y_t + 1e-8f) + 1.27f;
         
-        current_guide_strength = state->guide_strength_base + boost;
+        // h_prev is our current estimate (from last step's h_mean)
+        float h_est = logf(vol_est * vol_est + 1e-8f);  // Convert vol back to h
+        
+        // Innovation in log-vol space
+        float h_innovation = implied_h - h_est;
+        
+        // ASYMMETRIC LOGIC:
+        // Only boost if implied volatility is HIGHER than current estimate (h_innovation > 0)
+        // AND the move is statistically significant (return_z > threshold)
+        if (h_innovation > 0.0f && return_z > state->guide_innovation_threshold) {
+            // We are surprised by a spike. Trust the guide!
+            float severity = fminf((return_z - state->guide_innovation_threshold) / 3.0f, 1.0f);
+            float boost = (state->guide_strength_max - state->guide_strength_base) * severity;
+            current_guide_strength = state->guide_strength_base + boost;
+        }
+        // else: downward surprise or small move -> keep base strength
     }
     
     // Upload adaptive guide strength to device
