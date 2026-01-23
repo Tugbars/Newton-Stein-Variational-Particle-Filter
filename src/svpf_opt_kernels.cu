@@ -697,7 +697,7 @@ __global__ void svpf_fused_bandwidth_kernel(
         
         bw_sq *= scale;
         float bw = sqrtf(bw_sq);
-        bw = fmaxf(fminf(bw, 2.0f), 0.01f);
+        bw = fmaxf(fminf(bw, 2.0f), 0.010f);
         
         *d_bandwidth_sq = bw_sq;
         *d_bandwidth = bw;
