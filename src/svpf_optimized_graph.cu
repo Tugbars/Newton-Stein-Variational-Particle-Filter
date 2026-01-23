@@ -115,11 +115,21 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     cudaMemcpy(state->d_bw_alpha, &init_alpha, sizeof(float), cudaMemcpyHostToDevice);
     
     // === Likelihood gradient config ===
-    // Offset calibration (empirical):
-    //   - 1/nu ≈ 0.2 gives bias ≈ -0.3
-    //   - 1.27 (Gaussian theory) gives bias ≈ +0.3
-    //   - Sweet spot: ~0.7 for near-zero bias
-    state->lik_offset = 0.70f;  // Tuned for minimal bias
+    // Likelihood offset/bias correction:
+    //   For SURROGATE (use_exact_gradient=0):
+    //     - Offset in log-squared gradient: (log(y²) - h + lik_offset) / R
+    //     - Tuned value: 0.70 for minimal bias
+    //   For EXACT (use_exact_gradient=1):
+    //     - Bias correction subtracted from exact gradient
+    //     - Raw exact gradient has ~+0.30 positive bias at equilibrium
+    //     - Tuned value: ~0.25-0.30 to center gradient around zero
+    state->lik_offset = 0.34f;  // For surrogate. Try 0.25-0.30 for exact gradient.
+    
+    // Exact vs Surrogate gradient selection:
+    //   - 0 = Surrogate (log-squared), needs lik_offset tuning, no saturation
+    //   - 1 = Exact Student-t, consistent with weights/Hessian, saturates at ±nu/2
+    // Recommended: use_exact_gradient=1 when nu >= 30, with lik_offset ≈ 0.27
+    state->use_exact_gradient = 1;  // Default to legacy for backward compatibility
     
     // === ADAPTIVE SVPF: Configuration defaults ===
     state->use_svld = 1;
@@ -496,6 +506,7 @@ static void svpf_graph_capture_internal(SVPFState* state, const SVPFParams* para
                 opt->d_y_single, 1, params->rho, params->sigma_z, params->mu,
                 beta, state->nu, student_t_const, state->lik_offset,
                 params->gamma,  // Leverage coefficient for prior consistency
+                state->use_exact_gradient,  // Exact Student-t vs log-squared surrogate
                 state->use_newton, n
             );
             

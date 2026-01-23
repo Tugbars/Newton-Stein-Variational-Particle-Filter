@@ -286,11 +286,21 @@ typedef struct {
     cudaStream_t stream;
     
     // Likelihood gradient config
-    // The log-squared gradient uses: grad = (log(y²) - h + lik_offset) / R_noise
-    // lik_offset corrects for E[log(y²)|h]:
-    //   - Gaussian observation: lik_offset = 1.27 (Euler-Mascheroni constant)
-    //   - Student-t(nu) approx: lik_offset = 1/nu
-    float lik_offset;       // Likelihood center offset (default: 1.27)
+    // lik_offset serves different purposes depending on use_exact_gradient:
+    //   SURROGATE (use_exact_gradient=0):
+    //     - grad = (log(y²) - h + lik_offset) / R_noise
+    //     - Tuned value: ~0.70 for minimal bias
+    //   EXACT (use_exact_gradient=1):
+    //     - grad = exact_student_t_grad - lik_offset
+    //     - Tuned value: ~0.25-0.30 to correct for equilibrium bias
+    float lik_offset;       // Bias correction (0.70 for surrogate, 0.27 for exact)
+    
+    // Exact vs Surrogate likelihood gradient
+    // - Exact: d/dh log p(y|h) = -0.5 + 0.5*(nu+1)*A/(1+A) - lik_offset
+    //   Mathematically consistent with log_w and Hessian. Saturates at ±nu/2.
+    // - Surrogate: (log(y²) - h + lik_offset) / R_noise
+    //   Linear (no saturation), but inconsistent with Student-t weights/Hessian.
+    int use_exact_gradient; // 0 = surrogate (legacy), 1 = exact Student-t (recommended with nu>=30)
     
     // Adaptive SVPF config
     int use_svld;           // Enable SVLD (Langevin noise) - 0=SVGD, 1=SVLD

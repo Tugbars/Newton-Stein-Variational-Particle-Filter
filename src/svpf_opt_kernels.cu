@@ -320,6 +320,7 @@ __global__ void svpf_fused_gradient_kernel(
     float student_t_const,
     float lik_offset,
     float gamma,            // Leverage coefficient
+    bool use_exact_gradient, // true = exact Student-t, false = log-squared surrogate
     bool use_newton,
     int n
 ) {
@@ -377,23 +378,36 @@ __global__ void svpf_fused_gradient_kernel(
     }
     float grad_prior = weighted_grad / (sum_r + 1e-8f);
     
-    // ===== LIKELIHOOD GRADIENT (Log-squared with configurable offset) =====
-    // Math: E[log(y²)] = h + offset, where offset depends on observation model
-    //   - Gaussian: offset = -1.27 (Euler-Mascheroni related)
-    //   - Student-t(nu): offset ≈ 1/nu (approximation)
-    // We use: grad = (log(y²) - h + lik_offset) / R_noise
+    // ===== LIKELIHOOD GRADIENT =====
     float vol = safe_exp(h_j);
     float y_sq = y_t * y_t;
     float scaled_y_sq = y_sq / (vol + 1e-8f);
+    float A = scaled_y_sq / nu;
+    float one_plus_A = 1.0f + A;
     
-    // Log-weight for ESS / resampling
+    // Log-weight for ESS / resampling (always exact Student-t)
     log_w[j] = student_t_const - 0.5f * h_j
-             - (nu + 1.0f) * 0.5f * log1pf(fmaxf(scaled_y_sq / nu, -0.999f));
+             - (nu + 1.0f) * 0.5f * log1pf(fmaxf(A, -0.999f));
     
-    // Observation pull gradient with configurable offset
-    float log_y2 = __logf(y_sq + 1e-10f);
-    float R_noise = 1.4f;
-    float grad_lik = (log_y2 - h_j + lik_offset) / R_noise;
+    // Likelihood gradient: exact vs surrogate
+    float grad_lik;
+    if (use_exact_gradient) {
+        // EXACT Student-t gradient (consistent with log_w and Hessian)
+        // d/dh log p(y|h) = -0.5 + 0.5*(nu+1) * A/(1+A)
+        // 
+        // BIAS CORRECTION: The raw gradient has positive bias at equilibrium.
+        // Theory: E[A] = 1/(nu-2) for Student-t, giving E[grad] ≈ +0.035 at true h
+        // Empirical: Need larger correction (~0.25-0.30) due to accumulation over Stein steps
+        // We use lik_offset as the correction factor (repurposed for exact gradient)
+        float raw_grad = -0.5f + 0.5f * (nu + 1.0f) * A / one_plus_A;
+        grad_lik = raw_grad - lik_offset;  // lik_offset now serves as bias correction for exact gradient
+    } else {
+        // SURROGATE: Log-squared gradient (linear, no saturation)
+        // grad = (log(y²) - h + lik_offset) / R_noise
+        float log_y2 = __logf(y_sq + 1e-10f);
+        float R_noise = 1.4f;
+        grad_lik = (log_y2 - h_j + lik_offset) / R_noise;
+    }
     
     // ===== COMBINE (annealed) =====
     float g = grad_prior + beta * grad_lik;
@@ -402,8 +416,7 @@ __global__ void svpf_fused_gradient_kernel(
     
     // ===== HESSIAN PRECONDITIONING (Newton) =====
     if (use_newton && precond_grad != nullptr) {
-        float A = scaled_y_sq / nu;
-        float one_plus_A = 1.0f + A;
+        // Hessian is always exact Student-t (already computed A, one_plus_A)
         float hess_lik = -0.5f * (nu + 1.0f) * A / (one_plus_A * one_plus_A);
         float hess_prior = -inv_sigma_sq;
         
