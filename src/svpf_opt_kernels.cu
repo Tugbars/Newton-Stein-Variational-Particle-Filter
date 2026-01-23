@@ -398,9 +398,13 @@ __global__ void svpf_fused_gradient_kernel(
         float curvature = -(hess_lik + hess_prior);
         curvature = fminf(fmaxf(curvature, 0.1f), 100.0f);
         
+        // Store raw curvature for Full Newton kernel-weighted averaging
+        // Approximate Newton kernel will invert on the fly
+        inv_hessian[j] = curvature;
+        
+        // Preconditioned gradient (for approximate Newton path)
         float inv_H = 1.0f / curvature;
         precond_grad[j] = 0.7f * g * inv_H;
-        inv_hessian[j] = inv_H;
     }
 }
 
@@ -514,7 +518,8 @@ __global__ void svpf_fused_stein_transport_newton_kernel(
     for (int k = threadIdx.x; k < n; k += blockDim.x) {
         sh_h[k] = h[k];
         sh_precond_grad[k] = precond_grad[k];
-        sh_inv_hess[k] = inv_hessian[k];
+        // inv_hessian now stores raw curvature, invert on load
+        sh_inv_hess[k] = 1.0f / inv_hessian[k];
     }
     __syncthreads();
     
@@ -549,6 +554,122 @@ __global__ void svpf_fused_stein_transport_newton_kernel(
     }
     
     float phi_i = (k_sum + gk_sum) * inv_n;
+    
+    // ===== RMSPROP =====
+    float v_prev = v_rmsprop[i];
+    float v_new = rho_rmsprop * v_prev + (1.0f - rho_rmsprop) * phi_i * phi_i;
+    v_rmsprop[i] = v_new;
+    
+    // ===== TRANSPORT =====
+    float effective_step = step_size * beta_factor;
+    float precond = rsqrtf(v_new + epsilon);
+    float drift = effective_step * phi_i * precond;
+    
+    float diffusion = 0.0f;
+    if (temperature > 1e-6f) {
+        float noise = curand_normal(&rng[i]);
+        diffusion = sqrtf(2.0f * effective_step * temperature) * noise;
+    }
+    
+    h[i] = clamp_logvol(h_i + drift + diffusion);
+}
+
+// =============================================================================
+// FUSED: Stein + Transport (Full Newton with kernel-weighted Hessian)
+// Implements Detommaso et al. (2018) Eq. 18 with mass lumping
+// 
+// Key difference from approximate Newton:
+//   - Approximate: Uses local Hessian H(xⱼ) for each particle j
+//   - Full: Uses kernel-weighted average Ĥᵢ = Σⱼ H(xⱼ)·K(xⱼ,xᵢ) for particle i
+//
+// The kernel-weighted averaging smooths the Hessian landscape, giving better
+// preconditioning when particles span regions with different curvatures.
+// =============================================================================
+
+__global__ void svpf_fused_stein_transport_full_newton_kernel(
+    float* __restrict__ h,
+    const float* __restrict__ grad,           // Raw combined gradient
+    const float* __restrict__ local_hessian,  // Local curvature Nπ(xⱼ) (NOT inverted)
+    float* __restrict__ v_rmsprop,
+    curandStatePhilox4_32_10_t* __restrict__ rng,
+    const float* __restrict__ d_bandwidth,
+    float step_size,
+    float beta_factor,
+    float temperature,
+    float rho_rmsprop,
+    float epsilon,
+    int n
+) {
+    extern __shared__ float smem[];
+    float* sh_h = smem;
+    float* sh_grad = smem + n;
+    float* sh_hess = smem + 2 * n;
+    
+    // Cooperative load
+    for (int k = threadIdx.x; k < n; k += blockDim.x) {
+        sh_h[k] = h[k];
+        sh_grad[k] = grad[k];
+        sh_hess[k] = local_hessian[k];
+    }
+    __syncthreads();
+    
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    
+    float h_i = sh_h[i];
+    float bandwidth = *d_bandwidth;
+    float bw_sq = bandwidth * bandwidth;
+    float inv_bw_sq = 1.0f / bw_sq;
+    float inv_n = 1.0f / (float)n;
+    
+    // ===== FUSED: Kernel-weighted Hessian + Stein operator in single O(N) pass =====
+    // For each particle i, we compute:
+    //   1. Ĥᵢ = Σⱼ [Nπ(xⱼ)·K(xⱼ,xᵢ) + Nk(xⱼ,xᵢ)]  (kernel-weighted Hessian)
+    //   2. φᵢ = Σⱼ [K·∇log π + ∇K] / Ĥᵢ           (preconditioned Stein direction)
+    
+    float H_weighted = 0.0f;
+    float K_sum_norm = 0.0f;
+    float k_grad_sum = 0.0f;
+    float gk_sum = 0.0f;
+    
+    #pragma unroll 4
+    for (int j = 0; j < n; j++) {
+        float diff = h_i - sh_h[j];
+        float dist_sq = diff * diff * inv_bw_sq;
+        
+        // IMQ kernel: K = 1/(1 + dist²)
+        float base = 1.0f + dist_sq;
+        float K = 1.0f / base;
+        float K_sq = K * K;
+        
+        // ----- Hessian accumulation -----
+        // Target Hessian: Nπ(xⱼ) · K(xⱼ, xᵢ)
+        H_weighted += sh_hess[j] * K;
+        
+        // Kernel Hessian (Gauss-Newton approx): Nk(xⱼ, xᵢ)
+        // For IMQ: d²K/dx² = (2/h²)·K²·(3·dist²/h² - 1)
+        // Use absolute value for positive semi-definiteness
+        float Nk = 2.0f * inv_bw_sq * K_sq * fabsf(3.0f * dist_sq - 1.0f);
+        H_weighted += Nk;
+        K_sum_norm += K;
+        
+        // ----- Stein direction accumulation (will be scaled by inv_H later) -----
+        // Gradient term: K · ∇log π(xⱼ)
+        k_grad_sum += K * sh_grad[j];
+        
+        // Repulsion term: ∇K(xⱼ, xᵢ)
+        // For IMQ: dK/dx = -2·diff/h²·K²
+        float dK = -2.0f * diff * inv_bw_sq * K_sq;
+        gk_sum += dK;
+    }
+    
+    // Normalize weighted Hessian
+    H_weighted = H_weighted / fmaxf(K_sum_norm, 1e-6f);
+    H_weighted = fminf(fmaxf(H_weighted, 0.1f), 100.0f);
+    float inv_H_i = 1.0f / H_weighted;
+    
+    // Apply preconditioning: φᵢ = Ĥᵢ⁻¹ · (gradient + repulsion)
+    float phi_i = (k_grad_sum + gk_sum) * inv_n * inv_H_i * 0.7f;
     
     // ===== RMSPROP =====
     float v_prev = v_rmsprop[i];
@@ -697,7 +818,7 @@ __global__ void svpf_fused_bandwidth_kernel(
         
         bw_sq *= scale;
         float bw = sqrtf(bw_sq);
-        bw = fmaxf(fminf(bw, 2.0f), 0.010f);
+        bw = fmaxf(fminf(bw, 2.0f), 0.01f);
         
         *d_bandwidth_sq = bw_sq;
         *d_bandwidth = bw;

@@ -310,6 +310,18 @@ __global__ void svpf_fused_stein_transport_newton_kernel(
     float rho_rmsprop, float epsilon, int n
 );
 
+// Full Newton with kernel-weighted Hessian (Detommaso et al. 2018)
+__global__ void svpf_fused_stein_transport_full_newton_kernel(
+    float* __restrict__ h,
+    const float* __restrict__ grad,           // Raw combined gradient
+    const float* __restrict__ local_hessian,  // Local curvature (NOT inverted)
+    float* __restrict__ v_rmsprop,
+    curandStatePhilox4_32_10_t* __restrict__ rng,
+    const float* __restrict__ d_bandwidth,
+    float step_size, float beta_factor, float temperature,
+    float rho_rmsprop, float epsilon, int n
+);
+
 __global__ void svpf_fused_outputs_kernel(
     const float* __restrict__ h,
     const float* __restrict__ log_w,

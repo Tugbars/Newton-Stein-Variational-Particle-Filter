@@ -157,6 +157,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     
     // === Newton-Stein defaults ===
     state->use_newton = 0;
+    state->use_full_newton = 0;  // 0=local Hessian (fast), 1=kernel-weighted (Detommaso 2018)
     
     // === Guided Prediction defaults ===
     state->use_guided = 0;
@@ -497,11 +498,22 @@ static void svpf_graph_capture_internal(SVPFState* state, const SVPFParams* para
             );
             
             if (state->use_newton) {
-                svpf_fused_stein_transport_newton_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
-                    state->h, opt->d_precond_grad, opt->d_inv_hessian,
-                    state->d_grad_v, state->rng_states, opt->d_bandwidth,
-                    base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps, n
-                );
+                if (state->use_full_newton) {
+                    // Full Newton: kernel-weighted Hessian averaging (Detommaso 2018)
+                    // Uses raw gradient and local curvature, computes weighted H in kernel
+                    svpf_fused_stein_transport_full_newton_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
+                        state->h, state->grad_log_p, opt->d_inv_hessian,
+                        state->d_grad_v, state->rng_states, opt->d_bandwidth,
+                        base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps, n
+                    );
+                } else {
+                    // Approximate Newton: local Hessian only (faster)
+                    svpf_fused_stein_transport_newton_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
+                        state->h, opt->d_precond_grad, opt->d_inv_hessian,
+                        state->d_grad_v, state->rng_states, opt->d_bandwidth,
+                        base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps, n
+                    );
+                }
             } else {
                 svpf_fused_stein_transport_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
                     state->h, state->grad_log_p, state->d_grad_v,

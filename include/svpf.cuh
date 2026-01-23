@@ -322,6 +322,14 @@ typedef struct {
     // Benefits: adaptive step size based on local curvature
     int use_newton;         // Enable Newton-Stein (0=standard SVGD, 1=Newton)
     
+    // Full Newton-Stein (Detommaso et al. 2018)
+    // When enabled, uses kernel-weighted Hessian averaging:
+    //   Ĥᵢ = Σⱼ [Nπ(xⱼ)·K(xⱼ,xᵢ) + Nk(xⱼ,xᵢ)]
+    // Instead of just local Hessian Nπ(xᵢ).
+    // Cost: ~1.2x per Stein step (fused into O(N²) loop)
+    // Benefit: Better preconditioning when particles span different curvature regions
+    int use_full_newton;    // 0 = local Hessian (fast), 1 = kernel-weighted (accurate)
+    
     // Guided Prediction config (Lookahead / APF-style)
     // Standard predict is REACTIVE: scatters blindly, then corrects.
     // Guided predict is PROACTIVE: peeks at y_t to know where to go.

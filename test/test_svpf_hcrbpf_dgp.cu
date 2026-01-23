@@ -557,6 +557,8 @@ static Metrics run_svpf_on_scenario(
         // Newton-Stein (Hessian preconditioning)
         // Adaptive step size based on local curvature: H^{-1} * grad
         filter->use_newton = 1;
+        filter->use_full_newton = 0;  // Enable Detommaso 2018 full Newton
+
         
         // Guided Prediction with INNOVATION GATING (FIXED)
         // - Bottom clamp prevents zero-return trap (log(0) → -inf)
