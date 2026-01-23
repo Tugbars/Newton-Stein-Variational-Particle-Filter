@@ -318,7 +318,8 @@ __global__ void svpf_fused_gradient_kernel(
     float beta,
     float nu,
     float student_t_const,
-    float lik_offset,      // NEW: Likelihood center offset (1.27 for Gaussian, 1/nu for Student-t approx)
+    float lik_offset,
+    float gamma,            // Leverage coefficient
     bool use_newton,
     int n
 ) {
@@ -326,11 +327,22 @@ __global__ void svpf_fused_gradient_kernel(
     float* sh_h_prev = smem;
     float* sh_mu_i = smem + n;
     
-    // Cooperative load: h_prev + precompute prior means
+    // Get y_prev for leverage calculation (y at t-1)
+    float y_prev = (y_idx > 0) ? d_y[y_idx - 1] : 0.0f;
+    
+    // Cooperative load: h_prev + precompute prior means WITH LEVERAGE
+    // Prior mean for component i: mu + rho*(h_prev[i] - mu) + leverage_i
+    // where leverage_i = gamma * y_prev / exp(h_prev[i]/2)
     for (int k = threadIdx.x; k < n; k += blockDim.x) {
         float hp = h_prev[k];
         sh_h_prev[k] = hp;
-        sh_mu_i[k] = mu + rho * (hp - mu);
+        
+        // Compute leverage for this prior component
+        float vol_prev_k = __expf(hp * 0.5f);
+        float leverage_k = gamma * y_prev / (vol_prev_k + 1e-8f);
+        
+        // Prior mean includes leverage (matches predict step)
+        sh_mu_i[k] = mu + rho * (hp - mu) + leverage_k;
     }
     __syncthreads();
     

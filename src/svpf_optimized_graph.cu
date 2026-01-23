@@ -494,7 +494,9 @@ static void svpf_graph_capture_internal(SVPFState* state, const SVPFParams* para
                 state->use_newton ? opt->d_precond_grad : nullptr,
                 state->use_newton ? opt->d_inv_hessian : nullptr,
                 opt->d_y_single, 1, params->rho, params->sigma_z, params->mu,
-                beta, state->nu, student_t_const, state->lik_offset, state->use_newton, n
+                beta, state->nu, student_t_const, state->lik_offset,
+                params->gamma,  // Leverage coefficient for prior consistency
+                state->use_newton, n
             );
             
             if (state->use_newton) {

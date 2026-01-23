@@ -286,6 +286,7 @@ __global__ void svpf_fused_gradient_kernel(
     float rho, float sigma_z, float mu,
     float beta, float nu, float student_t_const,
     float lik_offset,  // Likelihood center offset (1.27 for Gaussian)
+    float gamma,       // Leverage coefficient
     bool use_newton, int n
 );
 
