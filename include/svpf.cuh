@@ -178,6 +178,9 @@ typedef struct {
     // Updated via cudaMemcpyAsync before graph replay
     float* d_params_staging;  // Packed: [y_prev, y_t, guide_mean, beta, step_size, temp, ...]
     
+    // Burned-in mu at capture time (for graph invalidation check)
+    float mu_captured;
+    
     // Capacity tracking
     int allocated_n;
     bool initialized;
@@ -333,6 +336,20 @@ typedef struct {
     float guide_K;          // Kalman gain (for debugging)
     int guide_initialized;  // Whether guide has been initialized
     
+    // =========================================================================
+    // ADAPTIVE MU: 1D Kalman Filter on mean level
+    // =========================================================================
+    // Uses particle confidence (inverse bandwidth) to gate learning rate.
+    // - Calm market (low bandwidth): adapt mu quickly to track drift
+    // - Crisis (high bandwidth): freeze mu to ignore transient spikes
+    int use_adaptive_mu;        // Enable adaptive mu learning (default: 0)
+    float mu_state;             // Current mu estimate (Kalman state)
+    float mu_var;               // Current mu variance (Kalman P)
+    float mu_process_var;       // Process noise Q (how fast mu can drift)
+    float mu_obs_var_scale;     // Scale factor for measurement noise R = scale * bandwidth²
+    float mu_min;               // Lower bound for mu (e.g., -6.0)
+    float mu_max;               // Upper bound for mu (e.g., -1.0)
+    
     // Optimized backend (embedded for thread safety)
     SVPFOptimizedState opt_backend;
     
@@ -346,6 +363,7 @@ typedef struct {
     float vol_mean;           // E[exp(h/2)]
     float vol_std;            // Std[exp(h/2)]
     float h_mean;             // E[h]
+    float mu_estimate;        // Current adaptive mu (if enabled)
 } SVPFResult;
 
 // =============================================================================

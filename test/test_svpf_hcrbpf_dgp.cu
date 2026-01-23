@@ -570,6 +570,12 @@ static Metrics run_svpf_on_scenario(
         filter->use_guide = 1;
         filter->use_guide_preserving = 1;  // Variance-preserving shift (not contraction)
         filter->guide_strength = 0.05f;
+
+        filter->use_adaptive_mu = 1;
+        filter->mu_process_var = 0.001f;  // Q: how fast can mu drift
+        filter->mu_obs_var_scale = 11.5f; // R = scale * bw²
+        filter->mu_min = -4.0f;
+        filter->mu_max = -1.0f;
     } else {
         filter->use_svld = 0;
         filter->use_annealing = 0;

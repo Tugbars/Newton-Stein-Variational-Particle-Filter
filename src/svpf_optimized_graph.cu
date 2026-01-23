@@ -155,6 +155,15 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     state->delta_rho = 0.02f;
     state->delta_sigma = 0.1f;
     
+    // === Adaptive Mu (1D Kalman Filter) defaults ===
+    state->use_adaptive_mu = 0;          // Disabled by default
+    state->mu_state = -3.5f;             // Initial mu estimate
+    state->mu_var = 1.0f;                // Initial uncertainty (will shrink)
+    state->mu_process_var = 0.001f;      // Q: slow drift allowed (~0.03/step std)
+    state->mu_obs_var_scale = 10.0f;     // R = scale * bandwidth²
+    state->mu_min = -6.0f;               // Lower bound
+    state->mu_max = -1.0f;               // Upper bound
+    
     // Device scalars
     cudaMalloc(&state->d_scalar_max, sizeof(float));
     cudaMalloc(&state->d_scalar_sum, sizeof(float));
@@ -250,6 +259,12 @@ void svpf_initialize(SVPFState* state, const SVPFParams* params, unsigned long l
     state->guide_initialized = 0;
     state->guide_mean = params->mu;
     state->guide_var = stationary_var;
+    
+    // Initialize adaptive mu Kalman filter state
+    if (state->use_adaptive_mu) {
+        state->mu_state = params->mu;         // Start from provided mu
+        state->mu_var = 1.0f;                 // High initial uncertainty
+    }
     
     cudaMemset(state->d_grad_v, 0, n * sizeof(float));
     
@@ -482,6 +497,54 @@ static void svpf_graph_capture_internal(SVPFState* state, const SVPFParams* para
 }
 
 // =============================================================================
+// ADAPTIVE MU: 1D Kalman Filter Update
+// =============================================================================
+// 
+// Uses particle confidence (inverse bandwidth) to gate learning rate:
+// - Calm market (low bandwidth) → high confidence → adapt mu quickly
+// - Crisis (high bandwidth) → low confidence → freeze mu
+//
+// Kalman equations:
+//   Predict: mu_pred = mu, P_pred = P + Q
+//   Update:  K = P_pred / (P_pred + R)
+//            mu = mu_pred + K * (h_mean - mu_pred)
+//            P = (1 - K) * P_pred
+//
+// Where R = scale * bandwidth² (measurement noise from particle spread)
+
+static void svpf_adaptive_mu_update(
+    SVPFState* state,
+    float h_mean,       // Observation: particle mean
+    float bandwidth     // Particle spread → measurement noise
+) {
+    if (!state->use_adaptive_mu) return;
+    
+    // Kalman predict
+    float mu_pred = state->mu_state;
+    float P_pred = state->mu_var + state->mu_process_var;
+    
+    // Measurement noise: high bandwidth → high noise → ignore observation
+    float R = state->mu_obs_var_scale * bandwidth * bandwidth;
+    
+    // Kalman gain
+    float K = P_pred / (P_pred + R + 1e-8f);
+    
+    // Innovation
+    float innovation = h_mean - mu_pred;
+    
+    // Update
+    float mu_new = mu_pred + K * innovation;
+    float P_new = (1.0f - K) * P_pred;
+    
+    // Clamp mu to valid range
+    mu_new = fminf(fmaxf(mu_new, state->mu_min), state->mu_max);
+    
+    // Store
+    state->mu_state = mu_new;
+    state->mu_var = P_new;
+}
+
+// =============================================================================
 // PUBLIC API
 // =============================================================================
 
@@ -492,7 +555,21 @@ void svpf_step_graph(SVPFState* state, float y_t, float y_prev, const SVPFParams
     
     svpf_optimized_init(opt, n);
     
-    bool need_capture = !opt->graph_captured || opt->graph_n != n || opt->graph_n_stein != state->n_stein_steps;
+    // Determine effective mu (adaptive or fixed)
+    float effective_mu = state->use_adaptive_mu ? state->mu_state : params->mu;
+    
+    // Check if graph needs recapture
+    bool need_capture = !opt->graph_captured 
+                     || opt->graph_n != n 
+                     || opt->graph_n_stein != state->n_stein_steps;
+    
+    // If adaptive mu, also check if mu has drifted significantly from captured value
+    if (state->use_adaptive_mu && opt->graph_captured) {
+        float mu_drift = fabsf(effective_mu - opt->mu_captured);
+        if (mu_drift > 0.1f) {  // Recapture if mu drifted by more than 0.1
+            need_capture = true;
+        }
+    }
     
     if (need_capture) {
         if (opt->graph_captured) {
@@ -500,14 +577,27 @@ void svpf_step_graph(SVPFState* state, float y_t, float y_prev, const SVPFParams
             cudaGraphDestroy(opt->graph);
             opt->graph_captured = false;
         }
-        svpf_graph_capture_internal(state, params);
+        
+        // Create modified params with effective mu for capture
+        SVPFParams capture_params = *params;
+        if (state->use_adaptive_mu) {
+            capture_params.mu = effective_mu;
+        }
+        
+        svpf_graph_capture_internal(state, &capture_params);
+        opt->mu_captured = effective_mu;
     }
     
     float y_arr[2] = {y_prev, y_t};
     cudaMemcpyAsync(opt->d_y_single, y_arr, 2 * sizeof(float), cudaMemcpyHostToDevice, opt->graph_stream);
     
     if (state->use_guide) {
-        svpf_ekf_update(state, y_t, params);
+        // Use effective_mu for EKF update
+        SVPFParams guide_params = *params;
+        if (state->use_adaptive_mu) {
+            guide_params.mu = effective_mu;
+        }
+        svpf_ekf_update(state, y_t, &guide_params);
         cudaMemcpyAsync(opt->d_guide_mean, &state->guide_mean, sizeof(float), cudaMemcpyHostToDevice, opt->graph_stream);
     }
     
@@ -515,9 +605,26 @@ void svpf_step_graph(SVPFState* state, float y_t, float y_prev, const SVPFParams
     cudaGraphLaunch(opt->graph_exec, opt->graph_stream);
     cudaStreamSynchronize(opt->graph_stream);
     
+    // Read back results
+    float h_mean_local = 0.0f;
+    float bandwidth_local = 0.0f;
+    
     if (h_loglik_out) cudaMemcpy(h_loglik_out, opt->d_loglik_single, sizeof(float), cudaMemcpyDeviceToHost);
     if (h_vol_out) cudaMemcpy(h_vol_out, opt->d_vol_single, sizeof(float), cudaMemcpyDeviceToHost);
-    if (h_mean_out) cudaMemcpy(h_mean_out, opt->d_h_mean_prev, sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&h_mean_local, opt->d_h_mean_prev, sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&bandwidth_local, opt->d_bandwidth, sizeof(float), cudaMemcpyDeviceToHost);
+    
+    if (h_mean_out) *h_mean_out = h_mean_local;
+    
+    // =========================================================================
+    // ADAPTIVE MU: 1D Kalman Filter Update
+    // =========================================================================
+    // Signal: h_mean (particle posterior mean)
+    // Noise: bandwidth² (particle uncertainty)
+    // Effect: Fast adaptation in calm markets, freeze during crises
+    if (state->use_adaptive_mu && state->timestep > 10) {  // Skip warmup
+        svpf_adaptive_mu_update(state, h_mean_local, bandwidth_local);
+    }
     
     state->timestep++;
 }
@@ -535,6 +642,7 @@ void svpf_step(SVPFState* state, float y_t, const SVPFParams* params, SVPFResult
         result->vol_mean = vol;
         result->h_mean = h_mean;
         result->vol_std = 0.0f;
+        result->mu_estimate = state->use_adaptive_mu ? state->mu_state : params->mu;
     }
     state->y_prev = y_t;
 }
