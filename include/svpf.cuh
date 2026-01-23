@@ -9,25 +9,24 @@
  * - Student-t likelihood handles tail events
  * - Fewer particles needed vs bootstrap PF (500 vs 3000)
  * 
- * Usage:
- *   SVPFState* filter = svpf_create(512, 5, 5.0f, stream);
+ * Algorithm (Fan et al. 2021, arXiv:2106.10568):
+ * - Prior is Gaussian MIXTURE over all particles: p(h_t|Z_{t-1}) = (1/N) Σ_i p(h_t|h_{t-1}^i)
+ * - This requires O(N²) gradient computation per Stein iteration
+ * - Weights use exact Student-t likelihood for unbiased importance sampling
+ * - Gradients use log-squared approximation for robust linear transport
+ * 
+ * Usage (single-step, real-time):
+ *   SVPFState* filter = svpf_create(1024, 10, 5.0f, stream);
  *   svpf_initialize(filter, &params, seed);
  *   for each observation y_t:
- *       svpf_step(filter, y_t, &params, &result);
- *       // result.vol_mean is current volatility estimate
+ *       svpf_step_adaptive(filter, y_t, y_prev, &params, &loglik, &vol, &h_mean);
  *   svpf_destroy(filter);
- * 
- * For batch processing (faster - thread-safe, auto-initialized):
- *   svpf_run_sequence_optimized(filter, d_observations, T, &params, d_loglik, d_vol);
- * 
- * For maximum speed (CUDA Graph):
- *   svpf_run_sequence_graph(filter, d_observations, T, &params, d_loglik, d_vol);
  * 
  * Memory Layout: Structure of Arrays (SoA) for coalesced GPU access
  * 
  * References:
  * - Liu & Wang (2016): SVGD algorithm
- * - Fan et al. (2021): Stein Particle Filtering
+ * - Fan et al. (2021): Stein Particle Filtering (arXiv:2106.10568)
  */
 
 #ifndef SVPF_CUH
@@ -54,9 +53,73 @@ extern "C" {
 #define SVPF_H_MAX                 5.0f
 #define SVPF_BLOCK_SIZE            256
 
+// Threshold for small N optimizations (persistent CTA path)
+#define SVPF_SMALL_N_THRESHOLD     4096
+
+// Number of floats in graph parameter staging buffer
+#define SVPF_GRAPH_PARAMS_SIZE     32
+
 // =============================================================================
 // DATA STRUCTURES
 // =============================================================================
+
+/**
+ * @brief Device-side parameter staging for CUDA graph execution
+ * 
+ * Layout of d_params_staging buffer (32 floats):
+ * [0]  y_prev           - Previous observation
+ * [1]  y_t              - Current observation
+ * [2]  guide_mean       - EKF guide mean
+ * [3]  beta             - Current annealing factor
+ * [4]  step_size        - Stein step size
+ * [5]  temp             - SVLD temperature
+ * [6]  rho              - AR persistence
+ * [7]  sigma_z          - Innovation std
+ * [8]  mu               - Mean level
+ * [9]  gamma            - Leverage coefficient
+ * [10] nu               - Student-t degrees of freedom
+ * [11] student_t_const  - Precomputed Student-t normalizing constant
+ * [12] rho_up           - Asymmetric rho (up)
+ * [13] rho_down         - Asymmetric rho (down)
+ * [14] delta_rho        - Particle-local rho sensitivity
+ * [15] delta_sigma      - Particle-local sigma sensitivity
+ * [16] alpha_base       - Guided alpha (base)
+ * [17] alpha_shock      - Guided alpha (shock)
+ * [18] innovation_thresh - Guided innovation threshold
+ * [19] jump_prob        - MIM jump probability
+ * [20] jump_scale       - MIM jump scale
+ * [21] guide_strength   - Guide density strength
+ * [22] rmsprop_rho      - RMSProp decay
+ * [23] rmsprop_eps      - RMSProp epsilon
+ * [24-31] reserved      - Future use
+ */
+typedef struct {
+    float y_prev;
+    float y_t;
+    float guide_mean;
+    float beta;
+    float step_size;
+    float temp;
+    float rho;
+    float sigma_z;
+    float mu;
+    float gamma;
+    float nu;
+    float student_t_const;
+    float rho_up;
+    float rho_down;
+    float delta_rho;
+    float delta_sigma;
+    float alpha_base;
+    float alpha_shock;
+    float innovation_thresh;
+    float jump_prob;
+    float jump_scale;
+    float guide_strength;
+    float rmsprop_rho;
+    float rmsprop_eps;
+    float reserved[8];
+} SVPFGraphParams;
 
 /**
  * @brief Optimized backend state for batch/graph processing
@@ -75,34 +138,52 @@ typedef struct {
     float* d_bandwidth;
     float* d_bandwidth_sq;
     
-    // Device timestep counter (for CUDA Graph)
-    int* d_timestep;
-    
     // Stein computation buffers
     float* d_exp_w;
     float* d_phi;
     
-    // Staging buffers for CUDA Graph (fixed addresses)
-    float* d_obs_staging;
-    float* d_loglik_staging;
-    float* d_vol_staging;
+    // Mixture prior fix: separate likelihood gradient buffer
+    // Required for correct O(N²) mixture prior + O(N) likelihood decomposition
+    float* d_grad_lik;
+    
+    // Newton-Stein buffers (Hessian preconditioning)
+    float* d_precond_grad;    // H^{-1} * grad (preconditioned gradient)
+    float* d_inv_hessian;     // H^{-1} (inverse Hessian per particle)
+    
+    // Particle-local parameters: h_mean from previous step
+    float* d_h_mean_prev;
+    
+    // Guide mean and strength (device-side for graph compatibility)
+    float* d_guide_mean;
+    float* d_guide_strength;   // Adaptive guide strength
     
     // Single-step API buffers (avoid malloc in hot loop)
     float* d_y_single;
     float* d_loglik_single;
     float* d_vol_single;
     
-    // CUDA Graph state
+    // =========================================================================
+    // CUDA GRAPH SUPPORT
+    // For HFT: captures kernel sequence, replays with ~5μs overhead vs ~100μs+
+    // =========================================================================
+    
+    // Graph handles
     cudaGraph_t graph;
-    cudaGraphExec_t graphExec;
-    cudaStream_t graph_stream;  // Dedicated stream for graph capture (NULL/default doesn't work)
+    cudaGraphExec_t graph_exec;
+    cudaStream_t graph_stream;
     bool graph_captured;
-    int graph_n;        // N for which graph was captured
-    int graph_n_stein;  // n_stein for which graph was captured
+    int graph_n;              // N at capture time (recapture if changed)
+    int graph_n_stein;        // Stein steps at capture time
+    
+    // Device-side parameter staging (kernels read from here)
+    // Updated via cudaMemcpyAsync before graph replay
+    float* d_params_staging;  // Packed: [y_prev, y_t, guide_mean, beta, step_size, temp, ...]
+    
+    // Burned-in mu at capture time (for graph invalidation check)
+    float mu_captured;
     
     // Capacity tracking
     int allocated_n;
-    int staging_T;
     bool initialized;
 } SVPFOptimizedState;
 
@@ -123,6 +204,29 @@ typedef struct {
 
 /**
  * @brief SVPF filter state (SoA layout for GPU)
+ * 
+ * Key implementation notes:
+ * 
+ * MIXTURE PRIOR (Fan et al. 2021, Eq. 6):
+ *   The prior at time t is a Gaussian mixture:
+ *     p(h_t | Z_{t-1}) = (1/N) Σ_i N(h_t; μ_i, σ_z²)
+ *   where μ_i = μ + ρ(h_{t-1}^i - μ)
+ * 
+ *   This means each particle j feels attraction from ALL prior means,
+ *   not just its own. The gradient is:
+ *     ∇_h log p_prior(h_j) = Σ_i r_i(h_j) * (-(h_j - μ_i)/σ_z²)
+ *   where r_i is the responsibility (soft assignment to component i).
+ * 
+ *   This requires O(N²) computation but is essential for correct filtering.
+ * 
+ * HYBRID LIKELIHOOD STRATEGY:
+ *   - Weights: Exact Student-t (unbiased importance sampling)
+ *   - Gradients: Log-squared approximation (robust linear transport)
+ *   
+ *   The log-squared gradient provides a "parabolic bowl" that always
+ *   pulls particles toward the observation, even from far away.
+ *   The Student-t gradient creates a "volcano" that saturates for
+ *   large deviations, causing particles to get stuck.
  */
 typedef struct {
     // Particle states
@@ -131,7 +235,7 @@ typedef struct {
     float* h_pred;      // [N] Predicted particles (before Stein)
     
     // Stein computation workspace
-    float* grad_log_p;  // [N] Gradient of log posterior
+    float* grad_log_p;  // [N] Gradient of log posterior (prior + likelihood)
     float* kernel_sum;  // [N] Sum of kernel weights (attraction)
     float* grad_kernel_sum; // [N] Sum of kernel gradients (repulsion)
     
@@ -149,7 +253,6 @@ typedef struct {
     float* d_return_ema;   // Scalar: EMA of |returns|
     float* d_return_var;   // Scalar: EMA of return variance
     float* d_bw_alpha;     // Scalar: adaptive bandwidth alpha
-    // ===============================
     
     // RNG states
     curandStatePhilox4_32_10_t* rng_states;  // [N] CURAND Philox states
@@ -175,11 +278,18 @@ typedef struct {
     // Configuration
     int n_particles;
     int n_stein_steps;
-    float nu;
-    float student_t_const;
+    float nu;               // Student-t degrees of freedom
+    float student_t_const;  // Precomputed: lgamma((nu+1)/2) - lgamma(nu/2) - 0.5*log(pi*nu)
     int timestep;
     float y_prev;
     cudaStream_t stream;
+    
+    // Likelihood gradient config
+    // The log-squared gradient uses: grad = (log(y²) - h + lik_offset) / R_noise
+    // lik_offset corrects for E[log(y²)|h]:
+    //   - Gaussian observation: lik_offset = 1.27 (Euler-Mascheroni constant)
+    //   - Student-t(nu) approx: lik_offset = 1/nu
+    float lik_offset;       // Likelihood center offset (default: 1.27)
     
     // Adaptive SVPF config
     int use_svld;           // Enable SVLD (Langevin noise) - 0=SVGD, 1=SVLD
@@ -194,18 +304,71 @@ typedef struct {
     float mim_jump_prob;    // Probability of jump component (e.g., 0.05)
     float mim_jump_scale;   // Scale factor for jump component std (e.g., 5.0)
     
+    // Particle-local parameters config
+    // Key insight: DGP has θ(z), σ(z) — params depend on latent z
+    // We use h deviation from mean as proxy: high h → likely high z
+    int use_local_params;   // Enable particle-local ρ and σ
+    float delta_rho;        // Rho sensitivity to h deviation (e.g., 0.02)
+    float delta_sigma;      // Sigma sensitivity to |h deviation| (e.g., 0.1)
+    
     // Asymmetric persistence config
     int use_asymmetric_rho; // Enable asymmetric rho (vol spikes fast, decays slow)
     float rho_up;           // Persistence when vol increasing (e.g., 0.98)
     float rho_down;         // Persistence when vol decreasing (e.g., 0.93)
     
+    // Newton-Stein config (Hessian preconditioning)
+    // Moves particles along H^{-1} * grad instead of grad
+    // Benefits: adaptive step size based on local curvature
+    int use_newton;         // Enable Newton-Stein (0=standard SVGD, 1=Newton)
+    
+    // Guided Prediction config (Lookahead / APF-style)
+    // Standard predict is REACTIVE: scatters blindly, then corrects.
+    // Guided predict is PROACTIVE: peeks at y_t to know where to go.
+    // Proposal: h ~ N((1-α)μ_prior + α·μ_implied, σ²)
+    // where μ_implied = log(y_t²) + 1.27 (instantaneous implied vol)
+    //
+    // INNOVATION GATING: Only activate when model is SURPRISED
+    // - Model fits well: innovation low → α ≈ 0 → trust prior
+    // - Model lags: innovation high → α > 0 → use guidance
+    int use_guided;              // Enable guided predict (0=standard, 1=lookahead)
+    float guided_alpha_base;     // Alpha when model fits (e.g., 0.0 - trust prior)
+    float guided_alpha_shock;    // Alpha when model fails (e.g., 0.5 - trust observation)
+    float guided_innovation_threshold; // z-score threshold for "surprise" (e.g., 1.5)
+    
     // Guide density (EKF) config
     int use_guide;          // Enable EKF guide density
-    float guide_strength;   // How much to pull particles toward guide (0.1-0.3)
+    int use_guide_preserving; // Use variance-preserving guide (vs contraction)
+    float guide_strength;   // Base guide strength (0.05 default)
     float guide_mean;       // EKF posterior mean (m_t)
     float guide_var;        // EKF posterior variance (P_t)
     float guide_K;          // Kalman gain (for debugging)
     int guide_initialized;  // Whether guide has been initialized
+    
+    // =========================================================================
+    // ADAPTIVE GUIDE STRENGTH: Innovation-gated nudging
+    // =========================================================================
+    // When innovation is high (model surprised), boost guide strength to
+    // "teleport" particles toward EKF estimate. When innovation is low,
+    // use base strength to avoid over-correction.
+    int use_adaptive_guide;         // Enable adaptive guide strength (default: 0)
+    float guide_strength_base;      // Base strength when model fits (e.g., 0.05)
+    float guide_strength_max;       // Max strength during surprises (e.g., 0.30)
+    float guide_innovation_threshold; // Z-score threshold for boost (e.g., 1.0)
+    float vol_prev;                 // Previous vol estimate (for innovation calc)
+    
+    // =========================================================================
+    // ADAPTIVE MU: 1D Kalman Filter on mean level
+    // =========================================================================
+    // Uses particle confidence (inverse bandwidth) to gate learning rate.
+    // - Calm market (low bandwidth): adapt mu quickly to track drift
+    // - Crisis (high bandwidth): freeze mu to ignore transient spikes
+    int use_adaptive_mu;        // Enable adaptive mu learning (default: 0)
+    float mu_state;             // Current mu estimate (Kalman state)
+    float mu_var;               // Current mu variance (Kalman P)
+    float mu_process_var;       // Process noise Q (how fast mu can drift)
+    float mu_obs_var_scale;     // Scale factor for measurement noise R = scale * bandwidth²
+    float mu_min;               // Lower bound for mu (e.g., -6.0)
+    float mu_max;               // Upper bound for mu (e.g., -1.0)
     
     // Optimized backend (embedded for thread safety)
     SVPFOptimizedState opt_backend;
@@ -220,6 +383,7 @@ typedef struct {
     float vol_mean;           // E[exp(h/2)]
     float vol_std;            // Std[exp(h/2)]
     float h_mean;             // E[h]
+    float mu_estimate;        // Current adaptive mu (if enabled)
 } SVPFResult;
 
 // =============================================================================
@@ -307,35 +471,6 @@ void svpf_run_sequence_device(
 // =============================================================================
 
 /**
- * @brief OPTIMIZED: Run full sequence with 2D tiled Stein kernel
- * 
- * Key optimizations:
- * - 2D tiled grid for O(N²) Stein: guarantees SM saturation for any N
- * - Shared memory tiling for bandwidth-efficient access
- * - CUB reductions for log-sum-exp
- * - Small N path (N ≤ 4096): persistent CTA, all data in SMEM
- * - NO device→host copies in loop (CUDA Graph compatible)
- * - EMA bandwidth smoothing for stability
- * 
- * Thread-safe: Each SVPFState has its own optimization buffers.
- * 
- * @param state SVPF state
- * @param d_observations Device array [T]
- * @param T Number of observations
- * @param params Model parameters
- * @param d_loglik_out Device array [T] for log-likelihoods
- * @param d_vol_out Device array [T] for volatilities (can be NULL)
- */
-void svpf_run_sequence_optimized(
-    SVPFState* state,
-    const float* d_observations,
-    int T,
-    const SVPFParams* params,
-    float* d_loglik_out,
-    float* d_vol_out
-);
-
-/**
  * @brief OPTIMIZED: Single step (for real-time/HFT usage)
  * 
  * Uses pre-allocated buffers (zero malloc in hot loop).
@@ -359,12 +494,16 @@ void svpf_step_optimized(
 /**
  * @brief ADAPTIVE SVPF: Single step with all improvements
  * 
- * Implements Preconditioned Stein Variational Langevin Descent:
- *   1. Mixture Innovation Model (MIM) - fat-tailed predict for scout particles
- *   2. Asymmetric ρ - vol spikes fast (ρ_up), decays slow (ρ_down)
- *   3. Adaptive bandwidth α scaling (tighter kernel during high vol)
- *   4. Annealed Stein updates (β schedule: 0.3 → 0.65 → 1.0)
- *   5. Fused RMSProp + Langevin diffusion (SVLD for diversity)
+ * Implements Preconditioned Stein Variational Langevin Descent with
+ * CORRECT mixture prior (O(N²)) per Fan et al. 2021:
+ * 
+ *   1. Mixture Prior Gradient (O(N²)) - each particle feels pull from all prior means
+ *   2. Log-Squared Likelihood Gradient - robust linear transport (no volcano collapse)
+ *   3. Mixture Innovation Model (MIM) - fat-tailed predict for scout particles
+ *   4. Asymmetric ρ - vol spikes fast (ρ_up), decays slow (ρ_down)
+ *   5. Adaptive bandwidth α scaling (tighter kernel during high vol)
+ *   6. Annealed Stein updates (β schedule: 0.3 → 0.65 → 1.0)
+ *   7. Fused RMSProp + Langevin diffusion (SVLD for diversity)
  * 
  * Configure via SVPFState fields:
  *   - use_mim: Enable Mixture Innovation (default: 1)
@@ -396,28 +535,9 @@ void svpf_step_adaptive(
 );
 
 /**
- * @brief CUDA GRAPH: Fastest sequence runner (minimal launch overhead)
- * 
- * Captures one timestep as a CUDA Graph, then replays it T times.
- * Reduces per-step overhead from ~65μs to ~5-10μs.
- * 
- * Note: Graph is cached and reused. First call has capture overhead.
- * 
- * @param state SVPF state
- * @param d_observations Device array [T]
- * @param T Number of observations
- * @param params Model parameters
- * @param d_loglik_out Device array [T] for log-likelihoods
- * @param d_vol_out Device array [T] for volatilities (can be NULL)
+ * @brief Internal: Initialize optimized backend (called by svpf_create)
  */
-void svpf_run_sequence_graph(
-    SVPFState* state,
-    const float* d_observations,
-    int T,
-    const SVPFParams* params,
-    float* d_loglik_out,
-    float* d_vol_out
-);
+void svpf_optimized_init(SVPFState* state);
 
 /**
  * @brief Internal: Cleanup optimized backend (called by svpf_destroy)
@@ -437,6 +557,74 @@ void svpf_get_particles(const SVPFState* state, float* h_out);
  * @brief Get current particle statistics
  */
 void svpf_get_stats(const SVPFState* state, float* h_mean, float* h_std);
+
+/**
+ * @brief Get effective sample size (ESS) of current particle weights
+ * 
+ * ESS = 1 / Σ w_i² where w_i are normalized weights.
+ * ESS close to N means particles are well-distributed.
+ * ESS close to 1 means particle degeneracy (one particle dominates).
+ * 
+ * Note: SVPF with Stein transport should maintain high ESS without resampling.
+ */
+float svpf_get_ess(const SVPFState* state);
+
+// =============================================================================
+// CUDA GRAPH API (Low-latency for HFT)
+// =============================================================================
+
+/**
+ * @brief Graph-accelerated SVPF step
+ * 
+ * Captures the kernel sequence on first call, then replays with minimal
+ * CPU overhead (~5μs vs ~100μs+ for regular kernel launches).
+ * 
+ * Automatic recapture on:
+ *   - First call
+ *   - Particle count change
+ *   - Stein step count change
+ * 
+ * IMPORTANT: Model parameters (rho, sigma_z, mu, gamma) are "burned in" at
+ * capture time. If you change SVPFParams, you MUST call svpf_graph_invalidate()
+ * before the next step, or the graph will run with stale parameters!
+ * 
+ * Filter configuration flags (use_guided, use_newton, use_param_learning, etc.)
+ * are also burned in. Call svpf_graph_invalidate() after changing any configuration.
+ * 
+ * @param state     Filter state
+ * @param y_t       Current observation (staged to device before graph launch)
+ * @param y_prev    Previous observation (staged to device before graph launch)
+ * @param params    Model parameters (BURNED IN at capture - invalidate if changed!)
+ * @param h_loglik_out  Output: log-likelihood (optional, can be NULL)
+ * @param h_vol_out     Output: volatility estimate (optional, can be NULL)
+ * @param h_mean_out    Output: h mean (optional, can be NULL)
+ */
+void svpf_step_graph(
+    SVPFState* state,
+    float y_t,
+    float y_prev,
+    const SVPFParams* params,
+    float* h_loglik_out,
+    float* h_vol_out,
+    float* h_mean_out
+);
+
+/**
+ * @brief Check if graph is currently captured
+ */
+bool svpf_graph_is_captured(SVPFState* state);
+
+/**
+ * @brief Force graph recapture on next step
+ * 
+ * Call after changing:
+ *   - SVPFParams (rho, sigma_z, mu, gamma)
+ *   - Filter configuration (use_guided, use_newton, use_mim, etc.)
+ *   - Any other filter settings
+ * 
+ * The next svpf_step_graph() call will recapture with new parameters.
+ */
+void svpf_graph_invalidate(SVPFState* state);
 
 #ifdef __cplusplus
 }
