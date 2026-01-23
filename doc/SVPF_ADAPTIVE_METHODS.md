@@ -18,9 +18,10 @@ This document describes the adaptive methods implemented in the Stein Variationa
 | + Adaptive μ | 0.6217 | -10.0% | -10.0% |
 | + Adaptive Guide | 0.6074 | -2.3% | -12.1% |
 | + lik_offset Correction | 0.5625 | -7.4% | -18.6% |
-| + nu=30 + Adaptive σ_z | **0.5538** | -1.5% | **-19.9%** |
+| + nu=30 + Adaptive σ_z | 0.5538 | -1.5% | -19.9% |
+| + IMQ Kernel | **0.5507** | -0.6% | **-20.3%** |
 
-**Final bias:** Near-zero (range: -0.04 to +0.10)
+**Final bias:** Near-zero (range: -0.07 to +0.07)
 
 ---
 
@@ -241,6 +242,69 @@ filter->sigma_boost_max = 3.0f;        // Max 3x boost
 
 ---
 
+## Method 6: IMQ Kernel (Inverse Multiquadric)
+
+### Problem
+The Gaussian RBF kernel decays exponentially:
+```
+K_gaussian = exp(-r²)
+```
+
+When a particle explores the high-vol region during a crash (3-5σ from the group), the repulsive force drops to nearly zero. The particle gets "stranded" and stops contributing useful gradient information.
+
+### Solution: Inverse Multiquadric Kernel
+
+IMQ has polynomial (heavy-tailed) decay:
+```
+K_imq = 1 / (1 + r²)
+```
+
+This ensures particles "talk" to each other even across large distances.
+
+### Repulsion Comparison
+
+| Distance | Gaussian | IMQ |
+|----------|----------|-----|
+| 1σ | 0.61 | 0.50 |
+| 2σ | 0.14 | 0.20 |
+| 3σ | 0.01 | **0.10** |
+| 5σ | 0.00 | **0.04** |
+
+At 3σ distance, IMQ maintains 10x more repulsion than Gaussian.
+
+### Implementation
+
+```cpp
+// OLD: Gaussian RBF
+float K = __expf(-diff * diff * inv_2bw_sq);
+gk_sum -= K * diff * inv_bw_sq;
+
+// NEW: IMQ (Rational Quadratic)
+float dist_sq = diff * diff * inv_bw_sq;
+float base = 1.0f + dist_sq;
+float K = 1.0f / base;
+float K_sq = K * K;
+
+k_sum += K * sh_grad[j];
+gk_sum -= 2.0f * diff * inv_bw_sq * K_sq;  // Gradient: dK/dx = -2x/(1+x²)²
+```
+
+### Impact
+
+| Scenario | Before | After | Δ |
+|----------|--------|-------|---|
+| Slow Drift | 0.5987 | 0.5942 | -0.8% |
+| Stress Ramp | 0.6268 | 0.6233 | -0.6% |
+| OU-Matched | 0.4126 | 0.4105 | -0.5% |
+| Intermediate Band | 0.6459 | 0.6390 | **-1.1%** |
+| Spike+Recovery | 0.4773 | 0.4762 | -0.2% |
+| Wrong-Model | 0.5615 | 0.5611 | -0.1% |
+| **Average** | 0.5538 | **0.5507** | **-0.6%** |
+
+**Why it works:** Intermediate Band scenario improved most — that's where particles were getting stranded exploring regime boundaries. IMQ keeps them connected to the group.
+
+---
+
 ## Methods That Did NOT Work
 
 ### Elastic ρ (Surprise-Based Amnesia)
@@ -278,6 +342,7 @@ Every adaptive parameter directly modulates the gradient:
 | ↑ guide_strength | Likelihood pull ↑ | Snap to observation |
 | Fix lik_offset | Correct gradient direction | Unbiased flow |
 | ↑ nu | Sharper likelihood | More sensitive to shocks |
+| IMQ kernel | Polynomial repulsion decay | Particles stay connected at distance |
 
 When you change a parameter, you're not hoping particles randomly land correctly — you're **telling them where to go**.
 
@@ -288,6 +353,10 @@ When you change a parameter, you're not hoping particles randomly land correctly
 ```cpp
 // Student-t degrees of freedom (quasi-Gaussian)
 float nu = 30.0f;
+
+// Stein kernel: IMQ (Inverse Multiquadric) - hardcoded in svpf_opt_kernels.cu
+// K = 1/(1 + r²) instead of exp(-r²)
+// Provides polynomial decay for better particle communication at distance
 
 // Asymmetric persistence (vol spikes fast, decays slow)
 filter->use_asymmetric_rho = 1;
@@ -334,14 +403,14 @@ filter->sigma_boost_max = 3.0f;
 ```
 Scenario                   RMSE        MAE       Bias
 ────────────────────────────────────────────────────
-Slow Drift               0.5987     0.4764     0.0032
-Stress Ramp              0.6268     0.4998     0.0120
-OU-Matched               0.4126     0.3250     0.1004
-Intermediate Band        0.6459     0.5110     0.0053
-Spike+Recovery           0.4773     0.3802     0.0408
-Wrong-Model              0.5615     0.4487    -0.0401
+Slow Drift               0.5942     0.4726    -0.0209
+Stress Ramp              0.6233     0.4966    -0.0136
+OU-Matched               0.4105     0.3245     0.0742
+Intermediate Band        0.6390     0.5058    -0.0232
+Spike+Recovery           0.4762     0.3791     0.0179
+Wrong-Model              0.5611     0.4477    -0.0665
 ────────────────────────────────────────────────────
-AVERAGE RMSE             0.5538
+AVERAGE RMSE             0.5507
 ```
 
 ---
@@ -356,8 +425,10 @@ AVERAGE RMSE             0.5538
 ### Production Refactoring
 4. **Zero-Copy Oracle Params for σ_z** - Currently adaptive σ_z triggers graph recapture when it drifts > 0.05. For HFT, refactor kernels to read σ_z from device pointer (like we did for guide_strength) to eliminate recapture latency. Makes sense, try later when integrating with PMMH Oracle.
 
+5. **Guided Variance Inflation ("Searchlight")** - When adaptive guide activates during a spike, inflate proposal variance proportional to guide strength. Wide beam when moving fast, narrow beam when stationary. Makes sense, try later.
+
 ### Architecture
-5. **PMMH Oracle Integration** - Learn nu, rho_up, rho_down, sigma_z, mu, lik_offset via parallel PMMH (~100μs per iteration). See SVPF_PMMH_ORACLE.md.
+6. **PMMH Oracle Integration** - Learn nu, rho_up, rho_down, sigma_z, mu, lik_offset via parallel PMMH (~100μs per iteration). See SVPF_PMMH_ORACLE.md.
 
 ---
 
