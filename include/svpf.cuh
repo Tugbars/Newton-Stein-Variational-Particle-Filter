@@ -181,6 +181,7 @@ typedef struct {
     
     // Burned-in mu at capture time (for graph invalidation check)
     float mu_captured;
+    float sigma_z_captured;
     
     // Capacity tracking
     int allocated_n;
@@ -369,6 +370,16 @@ typedef struct {
     float mu_obs_var_scale;     // Scale factor for measurement noise R = scale * bandwidth²
     float mu_min;               // Lower bound for mu (e.g., -6.0)
     float mu_max;               // Upper bound for mu (e.g., -1.0)
+    
+    // =========================================================================
+    // ADAPTIVE SIGMA_Z: Innovation-gated vol-of-vol ("Breathing Filter")
+    // =========================================================================
+    // When innovation is high, particles need to spread faster to catch up.
+    // Boost sigma_z proportional to innovation magnitude.
+    int use_adaptive_sigma;         // Enable adaptive sigma_z (default: 0)
+    float sigma_boost_threshold;    // Z-score threshold to start boosting (e.g., 1.0)
+    float sigma_boost_max;          // Maximum boost multiplier (e.g., 3.0 = 3x base)
+    float sigma_z_effective;        // Current effective sigma_z (for graph capture)
     
     // Optimized backend (embedded for thread safety)
     SVPFOptimizedState opt_backend;

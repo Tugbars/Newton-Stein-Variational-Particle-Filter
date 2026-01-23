@@ -440,19 +440,30 @@ __global__ void svpf_fused_stein_transport_kernel(
     float bandwidth = *d_bandwidth;
     float bw_sq = bandwidth * bandwidth;
     float inv_bw_sq = 1.0f / bw_sq;
-    float inv_2bw_sq = 0.5f * inv_bw_sq;
     float inv_n = 1.0f / (float)n;
     
-    // ===== STEIN OPERATOR (inline) =====
+    // ===== STEIN OPERATOR with IMQ Kernel =====
+    // IMQ (Inverse Multiquadric) has polynomial decay instead of exponential.
+    // This keeps distant particles "talking" - critical during vol spikes.
+    // Gaussian: K = exp(-r²), decays to 0 at distance
+    // IMQ: K = 1/(1+r²), decays polynomially, maintains repulsion
     float k_sum = 0.0f;
     float gk_sum = 0.0f;
     
     #pragma unroll 8
     for (int j = 0; j < n; j++) {
         float diff = h_i - sh_h[j];
-        float K = __expf(-diff * diff * inv_2bw_sq);
+        float dist_sq = diff * diff * inv_bw_sq;
+        
+        // IMQ kernel: K = (1 + dist_sq)^(-1)
+        float base = 1.0f + dist_sq;
+        float K = 1.0f / base;
+        float K_sq = K * K;
+        
         k_sum += K * sh_grad[j];
-        gk_sum -= K * diff * inv_bw_sq;  // Original sign
+        
+        // IMQ gradient: dK/dh_i = -2 * diff * inv_bw_sq * K²
+        gk_sum -= 2.0f * diff * inv_bw_sq * K_sq;
     }
     
     float phi_i = (k_sum + gk_sum) * inv_n;
@@ -514,19 +525,27 @@ __global__ void svpf_fused_stein_transport_newton_kernel(
     float bandwidth = *d_bandwidth;
     float bw_sq = bandwidth * bandwidth;
     float inv_bw_sq = 1.0f / bw_sq;
-    float inv_2bw_sq = 0.5f * inv_bw_sq;
     float inv_n = 1.0f / (float)n;
     
-    // ===== NEWTON-STEIN OPERATOR =====
+    // ===== NEWTON-STEIN OPERATOR with IMQ Kernel =====
+    // IMQ maintains repulsion at distance - prevents particle stranding during spikes
     float k_sum = 0.0f;
     float gk_sum = 0.0f;
     
     #pragma unroll 8
     for (int j = 0; j < n; j++) {
         float diff = h_i - sh_h[j];
-        float K = __expf(-diff * diff * inv_2bw_sq);
+        float dist_sq = diff * diff * inv_bw_sq;
+        
+        // IMQ kernel: K = (1 + dist_sq)^(-1)
+        float base = 1.0f + dist_sq;
+        float K = 1.0f / base;
+        float K_sq = K * K;
+        
         k_sum += K * sh_precond_grad[j];
-        gk_sum -= K * diff * inv_bw_sq * sh_inv_hess[j];  // Original sign
+        
+        // IMQ gradient with Hessian preconditioning
+        gk_sum -= 2.0f * diff * inv_bw_sq * K_sq * sh_inv_hess[j];
     }
     
     float phi_i = (k_sum + gk_sum) * inv_n;
@@ -678,7 +697,7 @@ __global__ void svpf_fused_bandwidth_kernel(
         
         bw_sq *= scale;
         float bw = sqrtf(bw_sq);
-        bw = fmaxf(fminf(bw, 2.0f), 0.01f);
+        bw = fmaxf(fminf(bw, 2.0f), 0.010f);
         
         *d_bandwidth_sq = bw_sq;
         *d_bandwidth = bw;

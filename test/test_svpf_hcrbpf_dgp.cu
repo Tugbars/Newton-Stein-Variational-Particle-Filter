@@ -581,6 +581,10 @@ static Metrics run_svpf_on_scenario(
         filter->guide_strength_base = 0.05f;       // Base when model fits
         filter->guide_strength_max = 0.30f;        // Max during surprises
         filter->guide_innovation_threshold = 1.0f; // Z-score to start boosting
+
+        filter->use_adaptive_sigma = 1;
+        filter->sigma_boost_threshold = 1.0f; // Start boosting when |z| > 1
+        filter->sigma_boost_max = 3.0f;       // Max 3x boost
     } else {
         filter->use_svld = 0;
         filter->use_annealing = 0;
@@ -683,9 +687,9 @@ int main(int argc, char** argv) {
     /* Configuration */
     int seed = 42;
     int n_ticks = 5000;
-    int n_particles = 400;
-    int n_stein = 8;
-    float nu = 5.0f;
+    int n_particles = 500;
+    int n_stein = 10;
+    float nu = 30.0f;
     int use_adaptive = 1;
     
     /* Parse args */

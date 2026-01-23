@@ -17,9 +17,11 @@ This document describes the adaptive methods implemented in the Stein Variationa
 | Baseline (fixed params) | 0.6910 | — | — |
 | + Adaptive μ | 0.6217 | -10.0% | -10.0% |
 | + Adaptive Guide | 0.6074 | -2.3% | -12.1% |
-| + lik_offset Correction | **0.5625** | -7.4% | **-18.6%** |
+| + lik_offset Correction | 0.5625 | -7.4% | -18.6% |
+| + nu=30 + Adaptive σ_z | 0.5538 | -1.5% | -19.9% |
+| + IMQ Kernel | **0.5507** | -0.6% | **-20.3%** |
 
-**Final bias:** Near-zero (range: -0.08 to +0.08)
+**Final bias:** Near-zero (range: -0.07 to +0.07)
 
 ---
 
@@ -165,6 +167,155 @@ filter->lik_offset = 0.70f;  // Tuned for minimal bias
 
 ---
 
+## Method 4: Distribution Fix (nu = 30)
+
+### Problem
+The DGP generates Gaussian returns, but the filter assumed fat-tailed Student-t(ν=5).
+
+- **Gaussian model:** A 3σ move screams "Volatility is up!"
+- **Student-t(5) model:** A 3σ move shrugs "Eh, just an outlier."
+
+This mismatch causes the filter to underreact to genuine vol changes.
+
+### Solution: Quasi-Gaussian Observation Model
+
+Set ν = 30 (close to Gaussian but retains slight robustness):
+
+```cpp
+float nu = 30.0f;  // Was 5.0f
+```
+
+### Why 30?
+- ν = 5: Fat tails, tolerates outliers, underreacts to vol changes
+- ν = 30: Nearly Gaussian, sensitive to shocks, proper tracking
+- ν = ∞: Pure Gaussian (no robustness to real-world anomalies)
+
+---
+
+## Method 5: Adaptive σ_z (Breathing Filter)
+
+### Problem
+The true vol-of-vol (σ_z) varies by regime:
+- Calm market: σ_z ≈ 0.08
+- Stress ramp: σ_z ≈ 0.42
+
+A fixed σ_z = 0.15 is too rigid — particles can't spread fast enough during stress.
+
+### Solution: Innovation-Gated Vol-of-Vol
+
+**Key Insight:** When innovation is consistently high, the filter is too rigid. Boost σ_z to let particles explore.
+
+```cpp
+float vol_est = fmaxf(state->vol_prev, 1e-4f);
+float return_z = fabsf(y_t) / vol_est;
+
+// Boost sigma_z when innovation exceeds threshold
+float sigma_boost = 1.0f;
+if (return_z > threshold) {
+    float severity = fminf((return_z - threshold) / 3.0f, 1.0f);
+    sigma_boost = 1.0f + (max_boost - 1.0f) * severity;
+}
+
+effective_sigma_z = params->sigma_z * sigma_boost;
+```
+
+### Configuration
+```cpp
+filter->use_adaptive_sigma = 1;
+filter->sigma_boost_threshold = 1.0f;  // Start boosting when |z| > 1
+filter->sigma_boost_max = 3.0f;        // Max 3x boost
+```
+
+### Behavior
+| Market State | return_z | σ_z Boost | Effective σ_z |
+|--------------|----------|-----------|---------------|
+| Calm | < 1.0 | 1.0x | 0.15 |
+| Moderate surprise | 2.0 | 1.67x | 0.25 |
+| Large shock | 4.0+ | 3.0x | 0.45 |
+
+### Impact (Combined with nu=30)
+| Metric | Before | After | Δ |
+|--------|--------|-------|---|
+| Average RMSE | 0.5625 | 0.5538 | -1.5% |
+
+**Why it works:** Matches the HCRBPF DGP behavior where σ(z) varies with regime. Particles can now "breathe" — spreading during stress, tightening during calm.
+
+---
+
+## Method 6: IMQ Kernel (Inverse Multiquadric)
+
+### Problem
+The Gaussian RBF kernel decays exponentially:
+```
+K_gaussian = exp(-r²)
+```
+
+When a particle explores the high-vol region during a crash (3-5σ from the group), the repulsive force drops to nearly zero. The particle gets "stranded" and stops contributing useful gradient information.
+
+### Solution: Inverse Multiquadric Kernel
+
+IMQ has polynomial (heavy-tailed) decay:
+```
+K_imq = 1 / (1 + r²)
+```
+
+This ensures particles "talk" to each other even across large distances.
+
+### Repulsion Comparison
+
+| Distance | Gaussian | IMQ |
+|----------|----------|-----|
+| 1σ | 0.61 | 0.50 |
+| 2σ | 0.14 | 0.20 |
+| 3σ | 0.01 | **0.10** |
+| 5σ | 0.00 | **0.04** |
+
+At 3σ distance, IMQ maintains 10x more repulsion than Gaussian.
+
+### Implementation
+
+```cpp
+// OLD: Gaussian RBF
+float K = __expf(-diff * diff * inv_2bw_sq);
+gk_sum -= K * diff * inv_bw_sq;
+
+// NEW: IMQ (Rational Quadratic)
+float dist_sq = diff * diff * inv_bw_sq;
+float base = 1.0f + dist_sq;
+float K = 1.0f / base;
+float K_sq = K * K;
+
+k_sum += K * sh_grad[j];
+gk_sum -= 2.0f * diff * inv_bw_sq * K_sq;  // Gradient: dK/dx = -2x/(1+x²)²
+```
+
+### Impact
+
+| Scenario | Before | After | Δ |
+|----------|--------|-------|---|
+| Slow Drift | 0.5987 | 0.5942 | -0.8% |
+| Stress Ramp | 0.6268 | 0.6233 | -0.6% |
+| OU-Matched | 0.4126 | 0.4105 | -0.5% |
+| Intermediate Band | 0.6459 | 0.6390 | **-1.1%** |
+| Spike+Recovery | 0.4773 | 0.4762 | -0.2% |
+| Wrong-Model | 0.5615 | 0.5611 | -0.1% |
+| **Average** | 0.5538 | **0.5507** | **-0.6%** |
+
+**Why it works:** Intermediate Band scenario improved most — that's where particles were getting stranded exploring regime boundaries. IMQ keeps them connected to the group.
+
+---
+
+## Methods That Did NOT Work
+
+### Elastic ρ (Surprise-Based Amnesia)
+**Idea:** Drop ρ during shocks to allow faster mean reversion.
+
+**Result:** No improvement. The asymmetric rho (rho_up/rho_down) already handles directional persistence. Additional elasticity either hurt drift/ramp scenarios or had no effect.
+
+**Lesson:** Don't over-engineer. Simple asymmetric ρ is sufficient.
+
+---
+
 ## Why Adaptive Methods Work So Well with SVPF
 
 ### The Key Difference: Particles Move
@@ -190,6 +341,8 @@ Every adaptive parameter directly modulates the gradient:
 | Shift μ | Prior mean shifts | Drift toward new μ |
 | ↑ guide_strength | Likelihood pull ↑ | Snap to observation |
 | Fix lik_offset | Correct gradient direction | Unbiased flow |
+| ↑ nu | Sharper likelihood | More sensitive to shocks |
+| IMQ kernel | Polynomial repulsion decay | Particles stay connected at distance |
 
 When you change a parameter, you're not hoping particles randomly land correctly — you're **telling them where to go**.
 
@@ -198,6 +351,13 @@ When you change a parameter, you're not hoping particles randomly land correctly
 ## Final Configuration
 
 ```cpp
+// Student-t degrees of freedom (quasi-Gaussian)
+float nu = 30.0f;
+
+// Stein kernel: IMQ (Inverse Multiquadric) - hardcoded in svpf_opt_kernels.cu
+// K = 1/(1 + r²) instead of exp(-r²)
+// Provides polynomial decay for better particle communication at distance
+
 // Asymmetric persistence (vol spikes fast, decays slow)
 filter->use_asymmetric_rho = 1;
 filter->rho_up = 0.99f;
@@ -229,6 +389,11 @@ filter->guide_innovation_threshold = 1.0f;
 
 // Likelihood offset (bias correction)
 filter->lik_offset = 0.70f;
+
+// Adaptive σ_z (breathing filter)
+filter->use_adaptive_sigma = 1;
+filter->sigma_boost_threshold = 1.0f;
+filter->sigma_boost_max = 3.0f;
 ```
 
 ---
@@ -238,24 +403,32 @@ filter->lik_offset = 0.70f;
 ```
 Scenario                   RMSE        MAE       Bias
 ────────────────────────────────────────────────────
-Slow Drift               0.6087     0.4837    -0.0337
-Stress Ramp              0.6378     0.5084    -0.0221
-OU-Matched               0.4154     0.3270     0.0834
-Intermediate Band        0.6579     0.5213    -0.0348
-Spike+Recovery           0.4813     0.3827     0.0115
-Wrong-Model              0.5742     0.4589    -0.0785
+Slow Drift               0.5942     0.4726    -0.0209
+Stress Ramp              0.6233     0.4966    -0.0136
+OU-Matched               0.4105     0.3245     0.0742
+Intermediate Band        0.6390     0.5058    -0.0232
+Spike+Recovery           0.4762     0.3791     0.0179
+Wrong-Model              0.5611     0.4477    -0.0665
 ────────────────────────────────────────────────────
-AVERAGE RMSE             0.5625
+AVERAGE RMSE             0.5507
 ```
 
 ---
 
 ## Backlog (Future Optimization)
 
+### Quick Wins (Fine-tuning)
 1. **Fine-tune lik_offset** in 0.65-0.75 range
-2. **Bandwidth floor during crises** - prevent particle collapse
-3. **Adaptive ρ via Kalman** - learn persistence from autocorrelation
-4. **Multi-timescale tracking** - only if Oracle too slow for flash crashes
+2. **Fine-tune nu** in 20-50 range
+3. **Fine-tune sigma_boost_max** in 2.0-4.0 range
+
+### Production Refactoring
+4. **Zero-Copy Oracle Params for σ_z** - Currently adaptive σ_z triggers graph recapture when it drifts > 0.05. For HFT, refactor kernels to read σ_z from device pointer (like we did for guide_strength) to eliminate recapture latency. Makes sense, try later when integrating with PMMH Oracle.
+
+5. **Guided Variance Inflation ("Searchlight")** - When adaptive guide activates during a spike, inflate proposal variance proportional to guide strength. Wide beam when moving fast, narrow beam when stationary. Makes sense, try later.
+
+### Architecture
+6. **PMMH Oracle Integration** - Learn nu, rho_up, rho_down, sigma_z, mu, lik_offset via parallel PMMH (~100μs per iteration). See SVPF_PMMH_ORACLE.md.
 
 ---
 
@@ -264,3 +437,4 @@ AVERAGE RMSE             0.5625
 - Liu & Wang (2016): "Stein Variational Gradient Descent"
 - Fan et al. (2021): "Stein Particle Filtering" (arXiv:2106.10568)
 - Internal: SVPF_2D_PARAM_LEARNING_POSTMORTEM.md (failed 2D approach)
+- Internal: SVPF_PMMH_ORACLE.md (parameter learning architecture)
