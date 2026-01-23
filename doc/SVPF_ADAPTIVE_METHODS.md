@@ -17,9 +17,10 @@ This document describes the adaptive methods implemented in the Stein Variationa
 | Baseline (fixed params) | 0.6910 | — | — |
 | + Adaptive μ | 0.6217 | -10.0% | -10.0% |
 | + Adaptive Guide | 0.6074 | -2.3% | -12.1% |
-| + lik_offset Correction | **0.5625** | -7.4% | **-18.6%** |
+| + lik_offset Correction | 0.5625 | -7.4% | -18.6% |
+| + nu=30 + Adaptive σ_z | **0.5538** | -1.5% | **-19.9%** |
 
-**Final bias:** Near-zero (range: -0.08 to +0.08)
+**Final bias:** Near-zero (range: -0.04 to +0.10)
 
 ---
 
@@ -165,6 +166,92 @@ filter->lik_offset = 0.70f;  // Tuned for minimal bias
 
 ---
 
+## Method 4: Distribution Fix (nu = 30)
+
+### Problem
+The DGP generates Gaussian returns, but the filter assumed fat-tailed Student-t(ν=5).
+
+- **Gaussian model:** A 3σ move screams "Volatility is up!"
+- **Student-t(5) model:** A 3σ move shrugs "Eh, just an outlier."
+
+This mismatch causes the filter to underreact to genuine vol changes.
+
+### Solution: Quasi-Gaussian Observation Model
+
+Set ν = 30 (close to Gaussian but retains slight robustness):
+
+```cpp
+float nu = 30.0f;  // Was 5.0f
+```
+
+### Why 30?
+- ν = 5: Fat tails, tolerates outliers, underreacts to vol changes
+- ν = 30: Nearly Gaussian, sensitive to shocks, proper tracking
+- ν = ∞: Pure Gaussian (no robustness to real-world anomalies)
+
+---
+
+## Method 5: Adaptive σ_z (Breathing Filter)
+
+### Problem
+The true vol-of-vol (σ_z) varies by regime:
+- Calm market: σ_z ≈ 0.08
+- Stress ramp: σ_z ≈ 0.42
+
+A fixed σ_z = 0.15 is too rigid — particles can't spread fast enough during stress.
+
+### Solution: Innovation-Gated Vol-of-Vol
+
+**Key Insight:** When innovation is consistently high, the filter is too rigid. Boost σ_z to let particles explore.
+
+```cpp
+float vol_est = fmaxf(state->vol_prev, 1e-4f);
+float return_z = fabsf(y_t) / vol_est;
+
+// Boost sigma_z when innovation exceeds threshold
+float sigma_boost = 1.0f;
+if (return_z > threshold) {
+    float severity = fminf((return_z - threshold) / 3.0f, 1.0f);
+    sigma_boost = 1.0f + (max_boost - 1.0f) * severity;
+}
+
+effective_sigma_z = params->sigma_z * sigma_boost;
+```
+
+### Configuration
+```cpp
+filter->use_adaptive_sigma = 1;
+filter->sigma_boost_threshold = 1.0f;  // Start boosting when |z| > 1
+filter->sigma_boost_max = 3.0f;        // Max 3x boost
+```
+
+### Behavior
+| Market State | return_z | σ_z Boost | Effective σ_z |
+|--------------|----------|-----------|---------------|
+| Calm | < 1.0 | 1.0x | 0.15 |
+| Moderate surprise | 2.0 | 1.67x | 0.25 |
+| Large shock | 4.0+ | 3.0x | 0.45 |
+
+### Impact (Combined with nu=30)
+| Metric | Before | After | Δ |
+|--------|--------|-------|---|
+| Average RMSE | 0.5625 | 0.5538 | -1.5% |
+
+**Why it works:** Matches the HCRBPF DGP behavior where σ(z) varies with regime. Particles can now "breathe" — spreading during stress, tightening during calm.
+
+---
+
+## Methods That Did NOT Work
+
+### Elastic ρ (Surprise-Based Amnesia)
+**Idea:** Drop ρ during shocks to allow faster mean reversion.
+
+**Result:** No improvement. The asymmetric rho (rho_up/rho_down) already handles directional persistence. Additional elasticity either hurt drift/ramp scenarios or had no effect.
+
+**Lesson:** Don't over-engineer. Simple asymmetric ρ is sufficient.
+
+---
+
 ## Why Adaptive Methods Work So Well with SVPF
 
 ### The Key Difference: Particles Move
@@ -190,6 +277,7 @@ Every adaptive parameter directly modulates the gradient:
 | Shift μ | Prior mean shifts | Drift toward new μ |
 | ↑ guide_strength | Likelihood pull ↑ | Snap to observation |
 | Fix lik_offset | Correct gradient direction | Unbiased flow |
+| ↑ nu | Sharper likelihood | More sensitive to shocks |
 
 When you change a parameter, you're not hoping particles randomly land correctly — you're **telling them where to go**.
 
@@ -198,6 +286,9 @@ When you change a parameter, you're not hoping particles randomly land correctly
 ## Final Configuration
 
 ```cpp
+// Student-t degrees of freedom (quasi-Gaussian)
+float nu = 30.0f;
+
 // Asymmetric persistence (vol spikes fast, decays slow)
 filter->use_asymmetric_rho = 1;
 filter->rho_up = 0.99f;
@@ -229,6 +320,11 @@ filter->guide_innovation_threshold = 1.0f;
 
 // Likelihood offset (bias correction)
 filter->lik_offset = 0.70f;
+
+// Adaptive σ_z (breathing filter)
+filter->use_adaptive_sigma = 1;
+filter->sigma_boost_threshold = 1.0f;
+filter->sigma_boost_max = 3.0f;
 ```
 
 ---
@@ -238,24 +334,30 @@ filter->lik_offset = 0.70f;
 ```
 Scenario                   RMSE        MAE       Bias
 ────────────────────────────────────────────────────
-Slow Drift               0.6087     0.4837    -0.0337
-Stress Ramp              0.6378     0.5084    -0.0221
-OU-Matched               0.4154     0.3270     0.0834
-Intermediate Band        0.6579     0.5213    -0.0348
-Spike+Recovery           0.4813     0.3827     0.0115
-Wrong-Model              0.5742     0.4589    -0.0785
+Slow Drift               0.5987     0.4764     0.0032
+Stress Ramp              0.6268     0.4998     0.0120
+OU-Matched               0.4126     0.3250     0.1004
+Intermediate Band        0.6459     0.5110     0.0053
+Spike+Recovery           0.4773     0.3802     0.0408
+Wrong-Model              0.5615     0.4487    -0.0401
 ────────────────────────────────────────────────────
-AVERAGE RMSE             0.5625
+AVERAGE RMSE             0.5538
 ```
 
 ---
 
 ## Backlog (Future Optimization)
 
+### Quick Wins (Fine-tuning)
 1. **Fine-tune lik_offset** in 0.65-0.75 range
-2. **Bandwidth floor during crises** - prevent particle collapse
-3. **Adaptive ρ via Kalman** - learn persistence from autocorrelation
-4. **Multi-timescale tracking** - only if Oracle too slow for flash crashes
+2. **Fine-tune nu** in 20-50 range
+3. **Fine-tune sigma_boost_max** in 2.0-4.0 range
+
+### Production Refactoring
+4. **Zero-Copy Oracle Params for σ_z** - Currently adaptive σ_z triggers graph recapture when it drifts > 0.05. For HFT, refactor kernels to read σ_z from device pointer (like we did for guide_strength) to eliminate recapture latency. Makes sense, try later when integrating with PMMH Oracle.
+
+### Architecture
+5. **PMMH Oracle Integration** - Learn nu, rho_up, rho_down, sigma_z, mu, lik_offset via parallel PMMH (~100μs per iteration). See SVPF_PMMH_ORACLE.md.
 
 ---
 
@@ -264,3 +366,4 @@ AVERAGE RMSE             0.5625
 - Liu & Wang (2016): "Stein Variational Gradient Descent"
 - Fan et al. (2021): "Stein Particle Filtering" (arXiv:2106.10568)
 - Internal: SVPF_2D_PARAM_LEARNING_POSTMORTEM.md (failed 2D approach)
+- Internal: SVPF_PMMH_ORACLE.md (parameter learning architecture)
