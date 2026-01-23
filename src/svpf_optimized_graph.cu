@@ -124,6 +124,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     //     - Raw exact gradient has ~+0.30 positive bias at equilibrium
     //     - Tuned value: ~0.25-0.30 to center gradient around zero
     state->lik_offset = 0.34f;  // For surrogate. Try 0.25-0.30 for exact gradient.
+    // @NOTE: Athis is now a learnable parameter,add it to the PMMH list and let it self-tune per asset/regime.
     
     // Exact vs Surrogate gradient selection:
     //   - 0 = Surrogate (log-squared), needs lik_offset tuning, no saturation

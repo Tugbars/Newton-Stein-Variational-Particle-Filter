@@ -6,7 +6,6 @@ set(SVPF_SOURCES
     svpf_finite_diff.cu
     svpf_optimized_graph.cu
     svpf_opt_kernels.cu
-    svpf_2d_kernels.cu
 )
 # =============================================================================
 # Static Library
