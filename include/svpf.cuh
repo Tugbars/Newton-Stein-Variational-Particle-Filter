@@ -281,6 +281,11 @@ typedef struct {
     int n_stein_steps;
     float nu;               // Student-t degrees of freedom
     float student_t_const;  // Precomputed: lgamma((nu+1)/2) - lgamma(nu/2) - 0.5*log(pi*nu)
+    float student_t_implied_offset;  // Precomputed offset for implied h from observation:
+                                     //   For Student-t: h_implied = log(y²) - E[log(t²_ν)]
+                                     //   E[log(t²_ν)] = log(ν) + ψ(1/2) - ψ(ν/2)
+                                     //   We store the negated value so: h_implied = log(y²) + offset
+                                     //   For ν→∞ (Gaussian), this approaches 1.27
     int timestep;
     float y_prev;
     cudaStream_t stream;
@@ -344,7 +349,7 @@ typedef struct {
     // Standard predict is REACTIVE: scatters blindly, then corrects.
     // Guided predict is PROACTIVE: peeks at y_t to know where to go.
     // Proposal: h ~ N((1-α)μ_prior + α·μ_implied, σ²)
-    // where μ_implied = log(y_t²) + 1.27 (instantaneous implied vol)
+    // where μ_implied = log(y_t²) + student_t_implied_offset
     //
     // INNOVATION GATING: Only activate when model is SURPRISED
     // - Model fits well: innovation low → α ≈ 0 → trust prior

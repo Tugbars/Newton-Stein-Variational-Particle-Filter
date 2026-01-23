@@ -175,6 +175,7 @@ __global__ void svpf_predict_guided_kernel(
     float delta_rho, float delta_sigma,
     float alpha_base, float alpha_shock,
     float innovation_threshold,
+    float implied_offset,  // Student-t implied h offset (replaces hardcoded 1.27)
     int n
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -207,7 +208,7 @@ __global__ void svpf_predict_guided_kernel(
 
     float y_curr = d_y[t];
     float log_y2 = __logf(y_curr * y_curr + 1e-10f);
-    float mean_implied = fmaxf(log_y2 + 1.27f, -5.0f);
+    float mean_implied = fmaxf(log_y2 + implied_offset, -5.0f);
 
     float innovation = mean_implied - mean_prior;
     float total_std = 2.5f;

@@ -85,6 +85,32 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
                            - lgammaf(nu / 2.0f) 
                            - 0.5f * logf((float)M_PI * nu);
     
+    // Compute student_t_implied_offset for observation-to-h mapping
+    // For Student-t(ν), E[log(y²)|h] = h + E[log(t²_ν)]
+    // where E[log(t²_ν)] = log(ν) + ψ(1/2) - ψ(ν/2)
+    // We want: h_implied = log(y²) + offset, so offset = -E[log(t²_ν)]
+    //
+    // Digamma function approximations:
+    //   ψ(1/2) = -γ - 2*ln(2) ≈ -1.9635100260214235  (exact)
+    //   ψ(x) ≈ ln(x) - 1/(2x) - 1/(12x²)  for x > 1  (asymptotic)
+    {
+        const float psi_half = -1.9635100260214235f;  // ψ(1/2) exact
+        float nu_half = nu / 2.0f;
+        float psi_nu_half;
+        if (nu_half >= 1.0f) {
+            // Asymptotic expansion for ψ(x) when x >= 1
+            psi_nu_half = logf(nu_half) - 1.0f/(2.0f*nu_half) - 1.0f/(12.0f*nu_half*nu_half);
+        } else {
+            // For small ν, use recurrence: ψ(x+1) = ψ(x) + 1/x
+            // ψ(1) = -γ ≈ -0.5772
+            psi_nu_half = -0.5772156649f - 1.0f/nu_half;  // Rough approximation for small ν
+        }
+        float expected_log_t_sq = logf(nu) + psi_half - psi_nu_half;
+        state->student_t_implied_offset = -expected_log_t_sq;
+        // For ν=30: offset ≈ 1.24
+        // For ν→∞: offset → 1.27 (Gaussian limit)
+    }
+    
     int n = n_particles;
     
     // Particle arrays
@@ -123,14 +149,13 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     //     - Bias correction subtracted from exact gradient
     //     - Raw exact gradient has ~+0.30 positive bias at equilibrium
     //     - Tuned value: ~0.25-0.30 to center gradient around zero
-    state->lik_offset = 0.34f;  // For surrogate. Try 0.25-0.30 for exact gradient.
-    // @NOTE: Athis is now a learnable parameter,add it to the PMMH list and let it self-tune per asset/regime.
+    state->lik_offset = 0.70f;  // For surrogate. Try 0.25-0.30 for exact gradient.
     
     // Exact vs Surrogate gradient selection:
     //   - 0 = Surrogate (log-squared), needs lik_offset tuning, no saturation
     //   - 1 = Exact Student-t, consistent with weights/Hessian, saturates at ±nu/2
     // Recommended: use_exact_gradient=1 when nu >= 30, with lik_offset ≈ 0.27
-    state->use_exact_gradient = 1;  // Default to legacy for backward compatibility
+    state->use_exact_gradient = 0;  // Default to legacy for backward compatibility
     
     // === ADAPTIVE SVPF: Configuration defaults ===
     state->use_svld = 1;
@@ -454,7 +479,8 @@ static void svpf_graph_capture_internal(SVPFState* state, const SVPFParams* para
             state->mim_jump_prob, state->mim_jump_scale,
             delta_rho, delta_sigma,
             state->guided_alpha_base, state->guided_alpha_shock,
-            state->guided_innovation_threshold, n
+            state->guided_innovation_threshold, 
+            state->student_t_implied_offset, n
         );
     } else if (state->use_mim) {
         svpf_predict_mim_kernel<<<nb, BLOCK_SIZE, 0, cs>>>(
@@ -695,8 +721,8 @@ void svpf_step_graph(SVPFState* state, float y_t, float y_prev, const SVPFParams
         // Return z-score: magnitude of surprise
         float return_z = fabsf(y_t) / vol_est;
         
-        // Implied h from observation: log(y²) + 1.27
-        float implied_h = logf(y_t * y_t + 1e-8f) + 1.27f;
+        // Implied h from observation: log(y²) + student_t_implied_offset
+        float implied_h = logf(y_t * y_t + 1e-8f) + state->student_t_implied_offset;
         
         // h_prev is our current estimate (from last step's h_mean)
         float h_est = logf(vol_est * vol_est + 1e-8f);  // Convert vol back to h

@@ -572,7 +572,7 @@ static Metrics run_svpf_on_scenario(
         filter->use_guide = 1;
         filter->use_guide_preserving = 1;  // Variance-preserving shift (not contraction)
         filter->guide_strength = 0.05f;
-
+      
         filter->use_adaptive_mu = 1;
         filter->mu_process_var = 0.001f;  // Q: how fast can mu drift
         filter->mu_obs_var_scale = 11.0f; // R = scale * bw²
@@ -587,6 +587,10 @@ static Metrics run_svpf_on_scenario(
         filter->use_adaptive_sigma = 1;
         filter->sigma_boost_threshold = 1.0f; // Start boosting when |z| > 1
         filter->sigma_boost_max = 3.0f;       // Max 3x boost
+
+
+        filter->use_exact_gradient = 1;
+filter->lik_offset = 0.34f;  // No correction - test if model is now consistent
     } else {
         filter->use_svld = 0;
         filter->use_annealing = 0;

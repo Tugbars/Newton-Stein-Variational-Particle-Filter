@@ -69,6 +69,7 @@ __global__ void svpf_predict_guided_kernel(
     float delta_rho, float delta_sigma,
     float alpha_base, float alpha_shock,
     float innovation_threshold,
+    float implied_offset,  // Student-t implied h offset (replaces hardcoded 1.27)
     int n
 );
 
@@ -362,7 +363,9 @@ static inline void svpf_ekf_update(
     float P_pred = p->rho * p->rho * state->guide_var + p->sigma_z * p->sigma_z;
     
     float log_y2 = logf(y_t * y_t + 1e-8f);
-    float obs_offset = -1.27f;
+    // Observation model: log(y²) = h + E[log(ε²)]
+    // For Student-t: E[log(y²)|h] = h - student_t_implied_offset
+    float obs_offset = -state->student_t_implied_offset;
     float obs_var = 4.93f + 2.0f;
     
     float H = 1.0f;
