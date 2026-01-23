@@ -565,8 +565,8 @@ static Metrics run_svpf_on_scenario(
         // - Asymmetric gating only activates on UPWARD shocks (spikes)
         filter->use_guided = 1;
         filter->guided_alpha_base = 0.0f;             // 0% when model fits
-        filter->guided_alpha_shock = 0.55f;            // 50% when model fails
-        filter->guided_innovation_threshold = 1.42f;   // 1.5σ = "surprised"
+        filter->guided_alpha_shock = 0.50f;            // 50% when model fails
+        filter->guided_innovation_threshold = 1.5f;   // 1.5σ = "surprised"
         
         // EKF Guide density
         filter->use_guide = 1;
@@ -574,10 +574,10 @@ static Metrics run_svpf_on_scenario(
         filter->guide_strength = 0.05f;
 
         filter->use_adaptive_mu = 1;
-        filter->mu_process_var = 0.0015f;  // Q: how fast can mu drift
-        filter->mu_obs_var_scale = 11.5f; // R = scale * bw²
+        filter->mu_process_var = 0.001f;  // Q: how fast can mu drift
+        filter->mu_obs_var_scale = 11.0f; // R = scale * bw²
         filter->mu_min = -4.0f;
-        filter->mu_max = -1.2f;
+        filter->mu_max = -1.0f;
 
         filter->use_adaptive_guide = 1;
         filter->guide_strength_base = 0.05f;       // Base when model fits
