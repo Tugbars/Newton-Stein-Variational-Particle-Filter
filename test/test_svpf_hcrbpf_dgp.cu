@@ -557,7 +557,7 @@ static Metrics run_svpf_on_scenario(
         // Newton-Stein (Hessian preconditioning)
         // Adaptive step size based on local curvature: H^{-1} * grad
         filter->use_newton = 1;
-        filter->use_full_newton = 0;  // Enable Detommaso 2018 full Newton
+        filter->use_full_newton = 1;  // Enable Detommaso 2018 full Newton
 
         
         // Guided Prediction with INNOVATION GATING (FIXED)
@@ -565,8 +565,8 @@ static Metrics run_svpf_on_scenario(
         // - Asymmetric gating only activates on UPWARD shocks (spikes)
         filter->use_guided = 1;
         filter->guided_alpha_base = 0.0f;             // 0% when model fits
-        filter->guided_alpha_shock = 0.5f;            // 50% when model fails
-        filter->guided_innovation_threshold = 1.5f;   // 1.5σ = "surprised"
+        filter->guided_alpha_shock = 0.55f;            // 50% when model fails
+        filter->guided_innovation_threshold = 1.42f;   // 1.5σ = "surprised"
         
         // EKF Guide density
         filter->use_guide = 1;
@@ -574,10 +574,10 @@ static Metrics run_svpf_on_scenario(
         filter->guide_strength = 0.05f;
 
         filter->use_adaptive_mu = 1;
-        filter->mu_process_var = 0.001f;  // Q: how fast can mu drift
+        filter->mu_process_var = 0.0015f;  // Q: how fast can mu drift
         filter->mu_obs_var_scale = 11.5f; // R = scale * bw²
         filter->mu_min = -4.0f;
-        filter->mu_max = -1.0f;
+        filter->mu_max = -1.2f;
 
         filter->use_adaptive_guide = 1;
         filter->guide_strength_base = 0.05f;       // Base when model fits
@@ -689,9 +689,9 @@ int main(int argc, char** argv) {
     /* Configuration */
     int seed = 42;
     int n_ticks = 5000;
-    int n_particles = 500;
-    int n_stein = 10;
-    float nu = 30.0f;
+    int n_particles = 400;
+    int n_stein = 8;
+    float nu = 40.0f;
     int use_adaptive = 1;
     
     /* Parse args */
