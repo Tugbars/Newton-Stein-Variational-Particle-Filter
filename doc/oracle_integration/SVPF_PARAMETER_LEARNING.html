@@ -1,0 +1,1353 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SVPF Parameter Learning Specification</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,400;8..60,600;8..60,700&family=Source+Sans+3:wght@400;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --text-primary: #1a1a1a;
+            --text-secondary: #555;
+            --text-muted: #777;
+            --bg-primary: #fefefe;
+            --bg-secondary: #f8f9fa;
+            --bg-code: #f4f4f4;
+            --accent-blue: #2563eb;
+            --accent-green: #059669;
+            --accent-red: #dc2626;
+            --accent-purple: #7c3aed;
+            --accent-orange: #d97706;
+            --accent-teal: #0d9488;
+            --border: #e5e7eb;
+            --border-dark: #d1d5db;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Source Serif 4', Georgia, serif;
+            font-size: 11pt;
+            line-height: 1.6;
+            color: var(--text-primary);
+            background: var(--bg-primary);
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 2rem 1.5rem;
+        }
+
+        h1, h2, h3, h4 {
+            font-family: 'Source Sans 3', sans-serif;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+
+        h1 {
+            font-size: 1.8rem;
+            text-align: center;
+            margin-bottom: 0.5rem;
+            line-height: 1.3;
+        }
+
+        .subtitle {
+            text-align: center;
+            font-size: 1rem;
+            color: var(--text-secondary);
+            margin-bottom: 1.5rem;
+        }
+
+        .abstract {
+            background: var(--bg-secondary);
+            border-left: 4px solid var(--accent-blue);
+            padding: 1rem 1.25rem;
+            margin: 1.5rem 0;
+            font-size: 0.95rem;
+        }
+
+        .abstract-title {
+            font-family: 'Source Sans 3', sans-serif;
+            font-weight: 600;
+            font-size: 0.9rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 0.5rem;
+            color: var(--accent-blue);
+        }
+
+        h2 {
+            font-size: 1.25rem;
+            margin: 2rem 0 1rem;
+            padding-bottom: 0.25rem;
+            border-bottom: 1px solid var(--border);
+        }
+
+        h2 .section-number {
+            color: var(--accent-blue);
+            margin-right: 0.5rem;
+        }
+
+        h3 {
+            font-size: 1.05rem;
+            margin: 1.5rem 0 0.75rem;
+            color: var(--text-secondary);
+        }
+
+        p {
+            margin-bottom: 1rem;
+            text-align: justify;
+        }
+
+        .equation {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            padding: 1rem;
+            margin: 1rem 0;
+            text-align: center;
+            font-family: 'Source Serif 4', Georgia, serif;
+            font-style: italic;
+            overflow-x: auto;
+        }
+
+        .equation-number {
+            float: right;
+            color: var(--text-muted);
+            font-style: normal;
+        }
+
+        .inline-math {
+            font-family: 'Source Serif 4', Georgia, serif;
+            font-style: italic;
+            white-space: nowrap;
+        }
+
+        code {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.85em;
+            background: var(--bg-code);
+            padding: 0.15rem 0.35rem;
+            border-radius: 3px;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 1rem 0;
+            font-size: 0.9rem;
+        }
+
+        th, td {
+            padding: 0.5rem 0.75rem;
+            text-align: left;
+            border: 1px solid var(--border);
+        }
+
+        th {
+            background: var(--bg-secondary);
+            font-family: 'Source Sans 3', sans-serif;
+            font-weight: 600;
+        }
+
+        caption {
+            font-family: 'Source Sans 3', sans-serif;
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            margin-bottom: 0.5rem;
+            text-align: left;
+        }
+
+        figure {
+            margin: 1.5rem 0;
+            text-align: center;
+        }
+
+        figcaption {
+            font-family: 'Source Sans 3', sans-serif;
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            margin-top: 0.75rem;
+            text-align: left;
+        }
+
+        figcaption strong {
+            color: var(--text-primary);
+        }
+
+        /* Visualization containers */
+        .viz-container {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 1.5rem;
+            margin: 1rem 0;
+        }
+
+        .viz-title {
+            font-family: 'Source Sans 3', sans-serif;
+            font-size: 0.9rem;
+            font-weight: 600;
+            color: var(--text-secondary);
+            margin-bottom: 1rem;
+            text-align: center;
+        }
+
+        /* Tier boxes */
+        .tier-box {
+            border-radius: 8px;
+            padding: 1rem;
+            margin: 1rem 0;
+        }
+
+        .tier-1 {
+            background: linear-gradient(135deg, #fef2f2 0%, #fee2e2 100%);
+            border: 1px solid #fca5a5;
+        }
+
+        .tier-2 {
+            background: linear-gradient(135deg, #fefce8 0%, #fef3c7 100%);
+            border: 1px solid #fcd34d;
+        }
+
+        .tier-3 {
+            background: linear-gradient(135deg, #f0fdf4 0%, #dcfce7 100%);
+            border: 1px solid #86efac;
+        }
+
+        .tier-label {
+            font-family: 'Source Sans 3', sans-serif;
+            font-weight: 600;
+            font-size: 0.85rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 0.5rem;
+        }
+
+        .tier-1 .tier-label { color: #b91c1c; }
+        .tier-2 .tier-label { color: #a16207; }
+        .tier-3 .tier-label { color: #15803d; }
+
+        /* Parameter cards */
+        .param-card {
+            background: white;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            margin: 1.5rem 0;
+            overflow: hidden;
+        }
+
+        .param-header {
+            background: var(--bg-secondary);
+            padding: 1rem;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+
+        .param-name {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: var(--accent-blue);
+        }
+
+        .param-desc {
+            font-family: 'Source Sans 3', sans-serif;
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+        }
+
+        .param-body {
+            padding: 1rem;
+        }
+
+        .param-meta {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 1rem;
+            margin-bottom: 1rem;
+            font-size: 0.85rem;
+        }
+
+        .param-meta-item {
+            background: var(--bg-code);
+            padding: 0.5rem;
+            border-radius: 4px;
+            text-align: center;
+        }
+
+        .param-meta-label {
+            font-family: 'Source Sans 3', sans-serif;
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            text-transform: uppercase;
+        }
+
+        .param-meta-value {
+            font-family: 'JetBrains Mono', monospace;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+
+        /* Animation container */
+        .anim-container {
+            background: white;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 1rem;
+            margin: 1rem 0;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .anim-label {
+            position: absolute;
+            top: 0.5rem;
+            right: 0.5rem;
+            background: var(--accent-blue);
+            color: white;
+            font-family: 'Source Sans 3', sans-serif;
+            font-size: 0.7rem;
+            padding: 0.2rem 0.5rem;
+            border-radius: 4px;
+        }
+
+        /* SVG animations */
+        svg {
+            max-width: 100%;
+            height: auto;
+        }
+
+        /* RHO animation - particle tracking */
+        @keyframes trackHighRho {
+            0% { transform: translateX(0); }
+            100% { transform: translateX(300px); }
+        }
+
+        @keyframes trackLowRho {
+            0% { transform: translateX(0); }
+            20% { transform: translateX(100px); }
+            40% { transform: translateX(120px); }
+            60% { transform: translateX(100px); }
+            80% { transform: translateX(60px); }
+            100% { transform: translateX(0); }
+        }
+
+        .rho-high-particle {
+            animation: trackHighRho 4s ease-in-out infinite alternate;
+        }
+
+        .rho-low-particle {
+            animation: trackLowRho 4s ease-in-out infinite;
+        }
+
+        /* SIGMA animation - particle spread */
+        @keyframes spreadLow {
+            0%, 100% { transform: scale(1); }
+            50% { transform: scale(1.1); }
+        }
+
+        @keyframes spreadHigh {
+            0%, 100% { transform: scale(1); }
+            50% { transform: scale(1.8); }
+        }
+
+        .sigma-low-cloud {
+            animation: spreadLow 3s ease-in-out infinite;
+            transform-origin: center;
+        }
+
+        .sigma-high-cloud {
+            animation: spreadHigh 3s ease-in-out infinite;
+            transform-origin: center;
+        }
+
+        /* MU animation - level shift */
+        @keyframes muShift {
+            0%, 100% { transform: translateY(0); }
+            50% { transform: translateY(-40px); }
+        }
+
+        .mu-shifting {
+            animation: muShift 4s ease-in-out infinite;
+        }
+
+        /* NU animation - tail thickness */
+        @keyframes nuPulse {
+            0%, 100% { opacity: 0.3; }
+            50% { opacity: 0.8; }
+        }
+
+        .nu-tails {
+            animation: nuPulse 2s ease-in-out infinite;
+        }
+
+        /* Offset animation - gradient crossing */
+        @keyframes offsetShift {
+            0%, 100% { transform: translateX(0); }
+            50% { transform: translateX(30px); }
+        }
+
+        .offset-line {
+            animation: offsetShift 3s ease-in-out infinite;
+        }
+
+        /* Guide strength animation */
+        @keyframes guideBoost {
+            0%, 30% { r: 4; fill: #3b82f6; }
+            50% { r: 8; fill: #059669; }
+            70%, 100% { r: 4; fill: #3b82f6; }
+        }
+
+        .guide-particle {
+            animation: guideBoost 3s ease-in-out infinite;
+        }
+
+        /* Breathing animation */
+        @keyframes breathe {
+            0%, 100% { transform: scale(1); opacity: 0.6; }
+            50% { transform: scale(2); opacity: 0.3; }
+        }
+
+        .breathing-cloud {
+            animation: breathe 2.5s ease-in-out infinite;
+            transform-origin: center;
+        }
+
+        /* Comparison side-by-side */
+        .comparison-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1rem;
+            margin: 1rem 0;
+        }
+
+        @media (max-width: 600px) {
+            .comparison-row {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .comparison-item {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 1rem;
+            text-align: center;
+        }
+
+        .comparison-label {
+            font-family: 'Source Sans 3', sans-serif;
+            font-size: 0.8rem;
+            font-weight: 600;
+            margin-bottom: 0.5rem;
+        }
+
+        /* Insight boxes */
+        .insight-box {
+            background: #faf5ff;
+            border: 1px solid #e9d5ff;
+            border-left: 4px solid var(--accent-purple);
+            padding: 1rem;
+            margin: 1rem 0;
+        }
+
+        .insight-title {
+            font-family: 'Source Sans 3', sans-serif;
+            font-weight: 600;
+            font-size: 0.9rem;
+            color: var(--accent-purple);
+            margin-bottom: 0.5rem;
+        }
+
+        .warning-box {
+            background: #fef2f2;
+            border: 1px solid #fecaca;
+            border-left: 4px solid var(--accent-red);
+            padding: 1rem;
+            margin: 1rem 0;
+        }
+
+        .warning-title {
+            font-family: 'Source Sans 3', sans-serif;
+            font-weight: 600;
+            font-size: 0.9rem;
+            color: var(--accent-red);
+            margin-bottom: 0.5rem;
+        }
+
+        /* Summary table */
+        .summary-table {
+            font-size: 0.85rem;
+        }
+
+        .summary-table th {
+            background: var(--accent-blue);
+            color: white;
+        }
+
+        .summary-table tr:nth-child(even) {
+            background: var(--bg-secondary);
+        }
+
+        .priority-critical { color: var(--accent-red); font-weight: 600; }
+        .priority-high { color: var(--accent-orange); font-weight: 600; }
+        .priority-medium { color: var(--accent-green); font-weight: 600; }
+
+        /* Footer */
+        footer {
+            margin-top: 3rem;
+            padding-top: 1rem;
+            border-top: 1px solid var(--border);
+            font-size: 0.85rem;
+            color: var(--text-muted);
+            text-align: center;
+        }
+
+        /* Animated value display */
+        .value-display {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 1.2rem;
+            font-weight: 600;
+            color: var(--accent-blue);
+            text-align: center;
+            margin: 0.5rem 0;
+        }
+
+        @keyframes valueChange {
+            0%, 100% { content: "0.97"; }
+            50% { content: "0.85"; }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>SVPF Parameter Learning Specification</h1>
+        <p class="subtitle">Which Parameters to Learn and Why They Matter</p>
+    </header>
+
+    <!-- Abstract -->
+    <div class="abstract">
+        <div class="abstract-title">Overview</div>
+        <p style="margin-bottom: 0;">
+            This document specifies the parameters that should be learned for the Stein Variational 
+            Particle Filter (SVPF) in stochastic volatility applications. We identify 
+            <strong>5 critical parameters</strong> for PMMH-based online learning, organized into 
+            three tiers by impact and learnability. Each parameter's effect on particle dynamics 
+            is visualized to build intuition for the learning targets.
+        </p>
+    </div>
+
+    <!-- Section 1: Parameter Overview -->
+    <h2><span class="section-number">1</span>Parameter Hierarchy</h2>
+
+    <p>
+        Not all parameters are equally important or equally learnable. We organize them into three 
+        tiers based on their impact on filter performance and their suitability for online learning.
+    </p>
+
+    <!-- Tier 1 -->
+    <div class="tier-box tier-1">
+        <div class="tier-label">Tier 1: Core SV Dynamics (Critical)</div>
+        <p style="margin: 0; font-size: 0.95rem;">
+            These parameters directly control the state-space model. Getting them wrong causes 
+            fundamental tracking failures. <strong>Must learn.</strong>
+        </p>
+        <div style="margin-top: 0.75rem; display: flex; gap: 1rem; flex-wrap: wrap;">
+            <code>ρ (rho)</code>
+            <code>σ_z (sigma_z)</code>
+            <code>μ (mu)</code>
+        </div>
+    </div>
+
+    <!-- Tier 2 -->
+    <div class="tier-box tier-2">
+        <div class="tier-label">Tier 2: Observation Model (High Impact)</div>
+        <p style="margin: 0; font-size: 0.95rem;">
+            These control how observations map to gradients. Miscalibration causes systematic bias 
+            or under/over-reaction to shocks. <strong>Should learn.</strong>
+        </p>
+        <div style="margin-top: 0.75rem; display: flex; gap: 1rem; flex-wrap: wrap;">
+            <code>ν (nu)</code>
+            <code>lik_offset</code>
+        </div>
+    </div>
+
+    <!-- Tier 3 -->
+    <div class="tier-box tier-3">
+        <div class="tier-label">Tier 3: Adaptive Tuning (Moderate Impact)</div>
+        <p style="margin: 0; font-size: 0.95rem;">
+            Fine-tuning parameters that improve performance but have reasonable defaults. 
+            <strong>Can learn if budget allows.</strong>
+        </p>
+        <div style="margin-top: 0.75rem; display: flex; gap: 1rem; flex-wrap: wrap;">
+            <code>guide_strength_max</code>
+            <code>sigma_boost_max</code>
+            <code>mu_obs_var_scale</code>
+        </div>
+    </div>
+
+    <!-- Section 2: Tier 1 Parameters -->
+    <h2><span class="section-number">2</span>Tier 1: Core SV Dynamics</h2>
+
+    <!-- RHO -->
+    <div class="param-card">
+        <div class="param-header">
+            <span class="param-name">ρ (rho)</span>
+            <span class="param-desc">Persistence / Mean Reversion Speed</span>
+        </div>
+        <div class="param-body">
+            <div class="param-meta">
+                <div class="param-meta-item">
+                    <div class="param-meta-label">Range</div>
+                    <div class="param-meta-value">[0.85, 0.995]</div>
+                </div>
+                <div class="param-meta-item">
+                    <div class="param-meta-label">Default</div>
+                    <div class="param-meta-value">0.97</div>
+                </div>
+                <div class="param-meta-item">
+                    <div class="param-meta-label">Priority</div>
+                    <div class="param-meta-value" style="color: var(--accent-red);">CRITICAL</div>
+                </div>
+            </div>
+
+            <div class="equation">
+                h<sub>t</sub> = μ + <strong style="color: var(--accent-red);">ρ</strong>(h<sub>t−1</sub> − μ) + σ<sub>z</sub>ε<sub>t</sub>
+                <span class="equation-number">(1)</span>
+            </div>
+
+            <p>
+                <strong>What it controls:</strong> How quickly volatility reverts to its mean level. 
+                High ρ (→1) means volatility shocks persist for a long time. Low ρ (→0) means rapid 
+                mean reversion.
+            </p>
+
+            <div class="anim-container">
+                <span class="anim-label">ANIMATED</span>
+                <div class="viz-title">Effect of ρ on Volatility Tracking</div>
+                <svg viewBox="0 0 600 220" style="width: 100%;">
+                    <!-- Background -->
+                    <rect x="0" y="0" width="600" height="220" fill="#fafafa"/>
+                    
+                    <!-- Y-axis labels -->
+                    <text x="40" y="55" text-anchor="end" font-family="Source Sans 3" font-size="9" fill="#666">High vol</text>
+                    <text x="40" y="155" text-anchor="end" font-family="Source Sans 3" font-size="9" fill="#666">Low vol</text>
+                    
+                    <!-- Time axis -->
+                    <line x1="50" y1="180" x2="550" y2="180" stroke="#ccc" stroke-width="1"/>
+                    <text x="300" y="200" text-anchor="middle" font-family="Source Sans 3" font-size="10" fill="#666">Time</text>
+                    
+                    <!-- Phase labels -->
+                    <text x="100" y="195" text-anchor="middle" font-family="Source Sans 3" font-size="8" fill="#999">Calm</text>
+                    <text x="200" y="195" text-anchor="middle" font-family="Source Sans 3" font-size="8" fill="#999">Spike</text>
+                    <text x="350" y="195" text-anchor="middle" font-family="Source Sans 3" font-size="8" fill="#999">Post-spike</text>
+                    <text x="500" y="195" text-anchor="middle" font-family="Source Sans 3" font-size="8" fill="#999">Later</text>
+                    
+                    <!-- True volatility path (spike then slow decay) -->
+                    <path d="M 50 150 L 120 150 L 160 50 L 220 55 L 280 70 L 340 90 L 400 110 L 460 130 L 550 145" 
+                          stroke="#666" stroke-width="2.5" fill="none" stroke-dasharray="6,4"/>
+                    <text x="565" y="145" font-family="Source Sans 3" font-size="9" fill="#666">True h</text>
+                    
+                    <!-- High rho particle path (tracks well, slow decay) -->
+                    <path id="highRhoPath" d="M 50 150 L 120 150 L 160 55 L 220 60 L 280 75 L 340 95 L 400 115 L 460 132 L 550 147" 
+                          stroke="none" fill="none"/>
+                    <circle r="6" fill="#059669">
+                        <animateMotion dur="5s" repeatCount="indefinite">
+                            <mpath href="#highRhoPath"/>
+                        </animateMotion>
+                    </circle>
+                    
+                    <!-- Low rho particle path (snaps back too fast) -->
+                    <path id="lowRhoPath" d="M 50 150 L 120 150 L 160 70 L 220 120 L 280 140 L 340 148 L 400 150 L 460 150 L 550 150" 
+                          stroke="#dc2626" stroke-width="1.5" fill="none" opacity="0.3"/>
+                    <circle r="6" fill="#dc2626">
+                        <animateMotion dur="5s" repeatCount="indefinite">
+                            <mpath href="#lowRhoPath"/>
+                        </animateMotion>
+                    </circle>
+                    
+                    <!-- Legend -->
+                    <rect x="420" y="15" width="130" height="55" rx="4" fill="white" stroke="#ccc"/>
+                    <circle cx="435" cy="30" r="5" fill="#059669"/>
+                    <text x="445" y="34" font-family="Source Sans 3" font-size="9" fill="#059669">ρ = 0.99 (tracks)</text>
+                    <circle cx="435" cy="50" r="5" fill="#dc2626"/>
+                    <text x="445" y="54" font-family="Source Sans 3" font-size="9" fill="#dc2626">ρ = 0.85 (snaps back)</text>
+                </svg>
+            </div>
+
+            <div class="comparison-row">
+                <div class="comparison-item" style="border-color: var(--accent-red);">
+                    <div class="comparison-label" style="color: var(--accent-red);">ρ Too Low</div>
+                    <p style="font-size: 0.85rem; margin: 0;">
+                        Particles revert to μ too quickly → miss prolonged high-vol regimes → 
+                        <strong>underestimate risk</strong>
+                    </p>
+                </div>
+                <div class="comparison-item" style="border-color: var(--accent-green);">
+                    <div class="comparison-label" style="color: var(--accent-green);">ρ Too High</div>
+                    <p style="font-size: 0.85rem; margin: 0;">
+                        Particles never revert → lag persists after spike ends → 
+                        <strong>overestimate risk</strong>
+                    </p>
+                </div>
+            </div>
+
+            <div class="insight-box">
+                <div class="insight-title">Asymmetric ρ</div>
+                <p style="margin: 0; font-size: 0.9rem;">
+                    We currently use <code>ρ_up = 0.99</code> and <code>ρ_down = 0.92</code> to capture 
+                    the empirical asymmetry: volatility spikes fast but decays slowly. PMMH could 
+                    learn both values separately.
+                </p>
+            </div>
+        </div>
+    </div>
+
+    <!-- SIGMA_Z -->
+    <div class="param-card">
+        <div class="param-header">
+            <span class="param-name">σ<sub>z</sub> (sigma_z)</span>
+            <span class="param-desc">Volatility-of-Volatility</span>
+        </div>
+        <div class="param-body">
+            <div class="param-meta">
+                <div class="param-meta-item">
+                    <div class="param-meta-label">Range</div>
+                    <div class="param-meta-value">[0.05, 0.50]</div>
+                </div>
+                <div class="param-meta-item">
+                    <div class="param-meta-label">Default</div>
+                    <div class="param-meta-value">0.15</div>
+                </div>
+                <div class="param-meta-item">
+                    <div class="param-meta-label">Priority</div>
+                    <div class="param-meta-value" style="color: var(--accent-red);">CRITICAL</div>
+                </div>
+            </div>
+
+            <div class="equation">
+                h<sub>t</sub> = μ + ρ(h<sub>t−1</sub> − μ) + <strong style="color: var(--accent-red);">σ<sub>z</sub></strong>ε<sub>t</sub>
+                <span class="equation-number">(2)</span>
+            </div>
+
+            <p>
+                <strong>What it controls:</strong> How much volatility itself fluctuates. This directly 
+                determines <em>how spread out particles should be</em> after the predict step. Too low 
+                → particles clump (miss outliers). Too high → particles scatter (noisy estimates).
+            </p>
+
+            <div class="anim-container">
+                <span class="anim-label">ANIMATED</span>
+                <div class="viz-title">Effect of σ<sub>z</sub> on Particle Spread</div>
+                <svg viewBox="0 0 600 180" style="width: 100%;">
+                    <!-- Background -->
+                    <rect x="0" y="0" width="600" height="180" fill="#fafafa"/>
+                    
+                    <!-- Left: Low sigma -->
+                    <g transform="translate(150, 90)">
+                        <ellipse rx="25" ry="35" fill="#3b82f6" opacity="0.3" class="sigma-low-cloud"/>
+                        <circle cx="-8" cy="-10" r="4" fill="#3b82f6"/>
+                        <circle cx="5" cy="-5" r="4" fill="#3b82f6"/>
+                        <circle cx="-3" cy="8" r="4" fill="#3b82f6"/>
+                        <circle cx="8" cy="5" r="4" fill="#3b82f6"/>
+                        <circle cx="0" cy="0" r="4" fill="#3b82f6"/>
+                    </g>
+                    <text x="150" y="150" text-anchor="middle" font-family="Source Sans 3" font-size="11" fill="#3b82f6" font-weight="600">σ_z = 0.08</text>
+                    <text x="150" y="165" text-anchor="middle" font-family="Source Sans 3" font-size="9" fill="#666">Tight cloud</text>
+                    
+                    <!-- Right: High sigma -->
+                    <g transform="translate(450, 90)">
+                        <ellipse rx="25" ry="35" fill="#dc2626" opacity="0.2" class="sigma-high-cloud"/>
+                        <circle cx="-20" cy="-25" r="4" fill="#dc2626"/>
+                        <circle cx="25" cy="-15" r="4" fill="#dc2626"/>
+                        <circle cx="-15" cy="20" r="4" fill="#dc2626"/>
+                        <circle cx="20" cy="25" r="4" fill="#dc2626"/>
+                        <circle cx="0" cy="0" r="4" fill="#dc2626"/>
+                    </g>
+                    <text x="450" y="150" text-anchor="middle" font-family="Source Sans 3" font-size="11" fill="#dc2626" font-weight="600">σ_z = 0.40</text>
+                    <text x="450" y="165" text-anchor="middle" font-family="Source Sans 3" font-size="9" fill="#666">Wide spread</text>
+                    
+                    <!-- Arrow -->
+                    <path d="M 220 90 L 380 90" stroke="#666" stroke-width="2" marker-end="url(#arrowGray)"/>
+                    <text x="300" y="80" text-anchor="middle" font-family="Source Sans 3" font-size="10" fill="#666">Increasing σ_z</text>
+                    
+                    <defs>
+                        <marker id="arrowGray" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+                            <polygon points="0 0, 10 3.5, 0 7" fill="#666"/>
+                        </marker>
+                    </defs>
+                </svg>
+            </div>
+
+            <div class="warning-box">
+                <div class="warning-title">Critical Interaction</div>
+                <p style="margin: 0; font-size: 0.9rem;">
+                    σ<sub>z</sub> interacts strongly with the prior gradient strength. If σ<sub>z</sub> 
+                    is underestimated, the prior gradient becomes too strong, causing particles to 
+                    collapse toward the prior mean and miss genuine volatility moves.
+                </p>
+            </div>
+        </div>
+    </div>
+
+    <!-- MU -->
+    <div class="param-card">
+        <div class="param-header">
+            <span class="param-name">μ (mu)</span>
+            <span class="param-desc">Long-Run Mean Log-Volatility</span>
+        </div>
+        <div class="param-body">
+            <div class="param-meta">
+                <div class="param-meta-item">
+                    <div class="param-meta-label">Range</div>
+                    <div class="param-meta-value">[-6.0, -1.0]</div>
+                </div>
+                <div class="param-meta-item">
+                    <div class="param-meta-label">Default</div>
+                    <div class="param-meta-value">-3.5</div>
+                </div>
+                <div class="param-meta-item">
+                    <div class="param-meta-label">Priority</div>
+                    <div class="param-meta-value" style="color: var(--accent-red);">CRITICAL</div>
+                </div>
+            </div>
+
+            <div class="equation">
+                h<sub>t</sub> = <strong style="color: var(--accent-red);">μ</strong> + ρ(h<sub>t−1</sub> − <strong style="color: var(--accent-red);">μ</strong>) + σ<sub>z</sub>ε<sub>t</sub>
+                <span class="equation-number">(3)</span>
+            </div>
+
+            <p>
+                <strong>What it controls:</strong> The "attractor" for volatility — where particles 
+                eventually revert to. This maps to annualized volatility roughly as:
+                vol ≈ exp(μ/2). For μ = -3.5, vol ≈ 17%.
+            </p>
+
+            <div class="anim-container">
+                <span class="anim-label">ANIMATED</span>
+                <div class="viz-title">Effect of μ on Particle Attractor</div>
+                <svg viewBox="0 0 600 180" style="width: 100%;">
+                    <!-- Background -->
+                    <rect x="0" y="0" width="600" height="180" fill="#fafafa"/>
+                    
+                    <!-- Y-axis (volatility levels) -->
+                    <line x1="80" y1="30" x2="80" y2="150" stroke="#ccc" stroke-width="1"/>
+                    <text x="70" y="40" text-anchor="end" font-family="Source Sans 3" font-size="9" fill="#666">μ = -1.5</text>
+                    <text x="70" y="90" text-anchor="end" font-family="Source Sans 3" font-size="9" fill="#666">μ = -3.5</text>
+                    <text x="70" y="140" text-anchor="end" font-family="Source Sans 3" font-size="9" fill="#666">μ = -5.0</text>
+                    
+                    <!-- Volatility labels -->
+                    <text x="30" y="40" text-anchor="end" font-family="Source Sans 3" font-size="8" fill="#999">(47%)</text>
+                    <text x="30" y="90" text-anchor="end" font-family="Source Sans 3" font-size="8" fill="#999">(17%)</text>
+                    <text x="30" y="140" text-anchor="end" font-family="Source Sans 3" font-size="8" fill="#999">(8%)</text>
+                    
+                    <!-- Attractor lines -->
+                    <line x1="80" y1="40" x2="550" y2="40" stroke="#fca5a5" stroke-width="1" stroke-dasharray="3,3"/>
+                    <line x1="80" y1="90" x2="550" y2="90" stroke="#86efac" stroke-width="2"/>
+                    <line x1="80" y1="140" x2="550" y2="140" stroke="#93c5fd" stroke-width="1" stroke-dasharray="3,3"/>
+                    
+                    <!-- Particle cloud shifting -->
+                    <g class="mu-shifting">
+                        <ellipse cx="300" cy="90" rx="60" ry="20" fill="#3b82f6" opacity="0.2"/>
+                        <circle cx="270" cy="85" r="5" fill="#3b82f6"/>
+                        <circle cx="290" cy="92" r="5" fill="#3b82f6"/>
+                        <circle cx="310" cy="88" r="5" fill="#3b82f6"/>
+                        <circle cx="330" cy="95" r="5" fill="#3b82f6"/>
+                        <circle cx="300" cy="90" r="5" fill="#3b82f6"/>
+                    </g>
+                    
+                    <!-- Labels -->
+                    <text x="300" y="170" text-anchor="middle" font-family="Source Sans 3" font-size="10" fill="#666">
+                        Particles pulled toward μ attractor
+                    </text>
+                </svg>
+            </div>
+
+            <p>
+                <strong>Note:</strong> We already have adaptive μ tracking via Kalman filter. PMMH 
+                learning would provide a <em>prior</em> on μ, with the Kalman filter handling 
+                short-term deviations.
+            </p>
+        </div>
+    </div>
+
+    <!-- Section 3: Tier 2 Parameters -->
+    <h2><span class="section-number">3</span>Tier 2: Observation Model</h2>
+
+    <!-- NU -->
+    <div class="param-card">
+        <div class="param-header">
+            <span class="param-name">ν (nu)</span>
+            <span class="param-desc">Student-t Degrees of Freedom</span>
+        </div>
+        <div class="param-body">
+            <div class="param-meta">
+                <div class="param-meta-item">
+                    <div class="param-meta-label">Range</div>
+                    <div class="param-meta-value">[3, 100]</div>
+                </div>
+                <div class="param-meta-item">
+                    <div class="param-meta-label">Default</div>
+                    <div class="param-meta-value">30</div>
+                </div>
+                <div class="param-meta-item">
+                    <div class="param-meta-label">Priority</div>
+                    <div class="param-meta-value" style="color: var(--accent-orange);">HIGH</div>
+                </div>
+            </div>
+
+            <div class="equation">
+                y<sub>t</sub> = exp(h<sub>t</sub>/2) · η<sub>t</sub>, &nbsp;&nbsp;&nbsp; 
+                η<sub>t</sub> ~ Student-t(<strong style="color: var(--accent-orange);">ν</strong>)
+                <span class="equation-number">(4)</span>
+            </div>
+
+            <p>
+                <strong>What it controls:</strong> How sensitive the filter is to large returns. 
+                Low ν (heavy tails) → "extreme returns are normal" → under-react to spikes. 
+                High ν (light tails → Gaussian) → "extreme returns signal vol change" → react quickly.
+            </p>
+
+            <div class="anim-container">
+                <span class="anim-label">ANIMATED</span>
+                <div class="viz-title">Student-t Distribution: Effect of ν on Tail Weight</div>
+                <svg viewBox="0 0 600 180" style="width: 100%;">
+                    <!-- Background -->
+                    <rect x="0" y="0" width="600" height="180" fill="#fafafa"/>
+                    
+                    <!-- Axes -->
+                    <line x1="50" y1="140" x2="550" y2="140" stroke="#ccc" stroke-width="1"/>
+                    <line x1="300" y1="140" x2="300" y2="20" stroke="#ccc" stroke-width="1"/>
+                    
+                    <!-- Low nu distribution (heavy tails) -->
+                    <path d="M 80 140 Q 150 135, 200 120 Q 250 80, 300 40 Q 350 80, 400 120 Q 450 135, 520 140" 
+                          fill="none" stroke="#dc2626" stroke-width="2"/>
+                    <!-- Tails emphasized -->
+                    <ellipse cx="100" cy="138" rx="30" ry="8" fill="#dc2626" opacity="0.3" class="nu-tails"/>
+                    <ellipse cx="500" cy="138" rx="30" ry="8" fill="#dc2626" opacity="0.3" class="nu-tails"/>
+                    
+                    <!-- High nu distribution (light tails) -->
+                    <path d="M 120 140 Q 180 138, 230 125 Q 270 70, 300 30 Q 330 70, 370 125 Q 420 138, 480 140" 
+                          fill="none" stroke="#059669" stroke-width="2"/>
+                    
+                    <!-- Labels -->
+                    <rect x="80" y="20" width="100" height="30" rx="4" fill="#fef2f2" stroke="#dc2626"/>
+                    <text x="130" y="38" text-anchor="middle" font-family="Source Sans 3" font-size="10" fill="#dc2626" font-weight="600">ν = 5 (heavy)</text>
+                    
+                    <rect x="420" y="20" width="100" height="30" rx="4" fill="#f0fdf4" stroke="#059669"/>
+                    <text x="470" y="38" text-anchor="middle" font-family="Source Sans 3" font-size="10" fill="#059669" font-weight="600">ν = 30 (light)</text>
+                    
+                    <!-- Tail annotation -->
+                    <text x="100" y="165" text-anchor="middle" font-family="Source Sans 3" font-size="8" fill="#dc2626">
+                        Heavy tail: "outliers expected"
+                    </text>
+                    <text x="500" y="165" text-anchor="middle" font-family="Source Sans 3" font-size="8" fill="#059669">
+                        Light tail: "outliers = signal"
+                    </text>
+                </svg>
+            </div>
+
+            <div class="insight-box">
+                <div class="insight-title">Interaction with lik_offset</div>
+                <p style="margin: 0; font-size: 0.9rem;">
+                    ν and lik_offset are coupled: the theoretical offset depends on ν. When learning 
+                    ν, you may need to re-calibrate lik_offset. Consider learning them jointly or 
+                    using a functional relationship.
+                </p>
+            </div>
+        </div>
+    </div>
+
+    <!-- LIK_OFFSET -->
+    <div class="param-card">
+        <div class="param-header">
+            <span class="param-name">lik_offset</span>
+            <span class="param-desc">Likelihood Gradient Bias Correction</span>
+        </div>
+        <div class="param-body">
+            <div class="param-meta">
+                <div class="param-meta-item">
+                    <div class="param-meta-label">Range</div>
+                    <div class="param-meta-value">[0.2, 1.3]</div>
+                </div>
+                <div class="param-meta-item">
+                    <div class="param-meta-label">Default</div>
+                    <div class="param-meta-value">0.70</div>
+                </div>
+                <div class="param-meta-item">
+                    <div class="param-meta-label">Priority</div>
+                    <div class="param-meta-value" style="color: var(--accent-orange);">HIGH</div>
+                </div>
+            </div>
+
+            <div class="equation">
+                ∇<sub>h</sub> log p(y|h) ∝ (log y² − h + <strong style="color: var(--accent-orange);">offset</strong>) / R
+                <span class="equation-number">(5)</span>
+            </div>
+
+            <p>
+                <strong>What it controls:</strong> Where the likelihood gradient equals zero — the 
+                "target" that particles are pulled toward. Wrong offset → systematic bias in all 
+                volatility estimates.
+            </p>
+
+            <div class="anim-container">
+                <span class="anim-label">ANIMATED</span>
+                <div class="viz-title">Likelihood Gradient Zero-Crossing vs. Offset</div>
+                <svg viewBox="0 0 600 160" style="width: 100%;">
+                    <!-- Background -->
+                    <rect x="0" y="0" width="600" height="160" fill="#fafafa"/>
+                    
+                    <!-- Axes -->
+                    <line x1="50" y1="80" x2="550" y2="80" stroke="#ccc" stroke-width="1"/>
+                    <text x="555" y="84" font-family="Source Sans 3" font-size="9" fill="#666">h</text>
+                    
+                    <!-- True zero crossing -->
+                    <line x1="300" y1="40" x2="300" y2="120" stroke="#059669" stroke-width="2"/>
+                    <circle cx="300" cy="80" r="5" fill="#059669"/>
+                    <text x="300" y="135" text-anchor="middle" font-family="Source Sans 3" font-size="9" fill="#059669">h_true</text>
+                    
+                    <!-- Wrong offset zero crossing (animated) -->
+                    <g class="offset-line">
+                        <line x1="230" y1="50" x2="230" y2="110" stroke="#dc2626" stroke-width="2" stroke-dasharray="4,2"/>
+                        <circle cx="230" cy="80" r="4" fill="#dc2626"/>
+                    </g>
+                    
+                    <!-- Gradient lines -->
+                    <line x1="100" y1="120" x2="500" y2="40" stroke="#666" stroke-width="1.5"/>
+                    
+                    <!-- Labels -->
+                    <text x="150" y="30" font-family="Source Sans 3" font-size="9" fill="#dc2626">Wrong offset:</text>
+                    <text x="150" y="42" font-family="Source Sans 3" font-size="9" fill="#dc2626">zero-crossing shifts</text>
+                    
+                    <!-- Bias arrow -->
+                    <path d="M 230 95 L 295 95" stroke="#7c3aed" stroke-width="1.5" marker-end="url(#arrowPurple)"/>
+                    <text x="262" y="110" text-anchor="middle" font-family="Source Sans 3" font-size="8" fill="#7c3aed">bias</text>
+                    
+                    <defs>
+                        <marker id="arrowPurple" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+                            <polygon points="0 0, 8 3, 0 6" fill="#7c3aed"/>
+                        </marker>
+                    </defs>
+                </svg>
+            </div>
+        </div>
+    </div>
+
+    <!-- Section 4: Tier 3 Parameters -->
+    <h2><span class="section-number">4</span>Tier 3: Adaptive Tuning</h2>
+
+    <p>
+        These parameters control the adaptive mechanisms we've built into SVPF. They have reasonable 
+        defaults but could benefit from data-driven tuning.
+    </p>
+
+    <!-- GUIDE_STRENGTH_MAX -->
+    <div class="param-card">
+        <div class="param-header">
+            <span class="param-name">guide_strength_max</span>
+            <span class="param-desc">Maximum EKF Nudge During Surprises</span>
+        </div>
+        <div class="param-body">
+            <div class="param-meta">
+                <div class="param-meta-item">
+                    <div class="param-meta-label">Range</div>
+                    <div class="param-meta-value">[0.15, 0.50]</div>
+                </div>
+                <div class="param-meta-item">
+                    <div class="param-meta-label">Default</div>
+                    <div class="param-meta-value">0.30</div>
+                </div>
+                <div class="param-meta-item">
+                    <div class="param-meta-label">Priority</div>
+                    <div class="param-meta-value" style="color: var(--accent-green);">MEDIUM</div>
+                </div>
+            </div>
+
+            <p>
+                <strong>What it controls:</strong> How aggressively particles "teleport" toward the 
+                EKF estimate when the model is surprised by a large innovation.
+            </p>
+
+            <div class="anim-container">
+                <span class="anim-label">ANIMATED</span>
+                <div class="viz-title">Guide Strength During Volatility Spike</div>
+                <svg viewBox="0 0 600 140" style="width: 100%;">
+                    <!-- Background -->
+                    <rect x="0" y="0" width="600" height="140" fill="#fafafa"/>
+                    
+                    <!-- Timeline -->
+                    <line x1="50" y1="100" x2="550" y2="100" stroke="#ccc" stroke-width="1"/>
+                    
+                    <!-- Calm period -->
+                    <rect x="50" y="10" width="180" height="20" rx="4" fill="#dcfce7"/>
+                    <text x="140" y="24" text-anchor="middle" font-family="Source Sans 3" font-size="9" fill="#059669">Calm: guide = 0.05</text>
+                    
+                    <!-- Spike period -->
+                    <rect x="230" y="10" width="140" height="20" rx="4" fill="#fef2f2"/>
+                    <text x="300" y="24" text-anchor="middle" font-family="Source Sans 3" font-size="9" fill="#dc2626">Spike: guide → 0.30</text>
+                    
+                    <!-- Recovery -->
+                    <rect x="370" y="10" width="180" height="20" rx="4" fill="#dcfce7"/>
+                    <text x="460" y="24" text-anchor="middle" font-family="Source Sans 3" font-size="9" fill="#059669">Recovery: guide = 0.05</text>
+                    
+                    <!-- Particles -->
+                    <circle cx="100" cy="70" r="4" fill="#3b82f6"/>
+                    <circle cx="120" cy="68" r="4" fill="#3b82f6"/>
+                    <circle cx="140" cy="72" r="4" fill="#3b82f6"/>
+                    
+                    <!-- Spike particles (animated) -->
+                    <circle cx="280" cy="55" r="4" fill="#3b82f6" class="guide-particle"/>
+                    <circle cx="300" cy="50" r="4" fill="#3b82f6" class="guide-particle" style="animation-delay: 0.2s;"/>
+                    <circle cx="320" cy="58" r="4" fill="#3b82f6" class="guide-particle" style="animation-delay: 0.4s;"/>
+                    
+                    <!-- Recovery particles -->
+                    <circle cx="440" cy="70" r="4" fill="#3b82f6"/>
+                    <circle cx="460" cy="68" r="4" fill="#3b82f6"/>
+                    <circle cx="480" cy="72" r="4" fill="#3b82f6"/>
+                    
+                    <!-- EKF target -->
+                    <line x1="280" y1="45" x2="320" y2="45" stroke="#059669" stroke-width="2" stroke-dasharray="3,2"/>
+                    <text x="340" y="48" font-family="Source Sans 3" font-size="8" fill="#059669">EKF target</text>
+                </svg>
+            </div>
+        </div>
+    </div>
+
+    <!-- SIGMA_BOOST_MAX -->
+    <div class="param-card">
+        <div class="param-header">
+            <span class="param-name">sigma_boost_max</span>
+            <span class="param-desc">Maximum Vol-of-Vol Multiplier ("Breathing")</span>
+        </div>
+        <div class="param-body">
+            <div class="param-meta">
+                <div class="param-meta-item">
+                    <div class="param-meta-label">Range</div>
+                    <div class="param-meta-value">[1.5, 5.0]</div>
+                </div>
+                <div class="param-meta-item">
+                    <div class="param-meta-label">Default</div>
+                    <div class="param-meta-value">3.0</div>
+                </div>
+                <div class="param-meta-item">
+                    <div class="param-meta-label">Priority</div>
+                    <div class="param-meta-value" style="color: var(--accent-green);">MEDIUM</div>
+                </div>
+            </div>
+
+            <p>
+                <strong>What it controls:</strong> How much particles can "breathe" (spread out) 
+                during high-innovation periods. Multiplies the base σ<sub>z</sub>.
+            </p>
+
+            <div class="anim-container">
+                <span class="anim-label">ANIMATED</span>
+                <div class="viz-title">Breathing Filter: σ<sub>z</sub> × boost</div>
+                <svg viewBox="0 0 600 120" style="width: 100%;">
+                    <!-- Background -->
+                    <rect x="0" y="0" width="600" height="120" fill="#fafafa"/>
+                    
+                    <!-- Base cloud -->
+                    <ellipse cx="150" cy="60" rx="30" ry="25" fill="#3b82f6" opacity="0.4"/>
+                    <text x="150" y="105" text-anchor="middle" font-family="Source Sans 3" font-size="9" fill="#3b82f6">σ_z × 1.0</text>
+                    
+                    <!-- Breathing cloud -->
+                    <g transform="translate(450, 60)">
+                        <ellipse rx="30" ry="25" fill="#dc2626" opacity="0.2" class="breathing-cloud"/>
+                    </g>
+                    <text x="450" y="105" text-anchor="middle" font-family="Source Sans 3" font-size="9" fill="#dc2626">σ_z × 3.0</text>
+                    
+                    <!-- Arrow -->
+                    <path d="M 200 60 L 380 60" stroke="#666" stroke-width="2" marker-end="url(#arrowGray2)"/>
+                    <text x="290" y="50" text-anchor="middle" font-family="Source Sans 3" font-size="9" fill="#666">High innovation</text>
+                    
+                    <defs>
+                        <marker id="arrowGray2" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+                            <polygon points="0 0, 10 3.5, 0 7" fill="#666"/>
+                        </marker>
+                    </defs>
+                </svg>
+            </div>
+        </div>
+    </div>
+
+    <!-- Section 5: Summary Table -->
+    <h2><span class="section-number">5</span>Summary: PMMH Learning Targets</h2>
+
+    <p>
+        For PMMH-based online parameter learning with ~100 particles, we recommend focusing on 
+        the 5 most impactful parameters:
+    </p>
+
+    <table class="summary-table">
+        <caption><strong>Table 1:</strong> Recommended PMMH Learning Targets</caption>
+        <thead>
+            <tr>
+                <th>Parameter</th>
+                <th>Symbol</th>
+                <th>Range</th>
+                <th>Default</th>
+                <th>Priority</th>
+                <th>Learn?</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Persistence</td>
+                <td><code>ρ</code></td>
+                <td>[0.85, 0.995]</td>
+                <td>0.97</td>
+                <td class="priority-critical">CRITICAL</td>
+                <td>✅ Yes</td>
+            </tr>
+            <tr>
+                <td>Vol-of-vol</td>
+                <td><code>σ_z</code></td>
+                <td>[0.05, 0.50]</td>
+                <td>0.15</td>
+                <td class="priority-critical">CRITICAL</td>
+                <td>✅ Yes</td>
+            </tr>
+            <tr>
+                <td>Mean level</td>
+                <td><code>μ</code></td>
+                <td>[-6.0, -1.0]</td>
+                <td>-3.5</td>
+                <td class="priority-critical">CRITICAL</td>
+                <td>✅ Yes</td>
+            </tr>
+            <tr>
+                <td>Tail DoF</td>
+                <td><code>ν</code></td>
+                <td>[3, 100]</td>
+                <td>30</td>
+                <td class="priority-high">HIGH</td>
+                <td>✅ Yes</td>
+            </tr>
+            <tr>
+                <td>Gradient offset</td>
+                <td><code>lik_offset</code></td>
+                <td>[0.2, 1.3]</td>
+                <td>0.70</td>
+                <td class="priority-high">HIGH</td>
+                <td>✅ Yes</td>
+            </tr>
+            <tr style="background: #f5f5f5;">
+                <td>Guide strength</td>
+                <td><code>guide_max</code></td>
+                <td>[0.15, 0.50]</td>
+                <td>0.30</td>
+                <td class="priority-medium">MEDIUM</td>
+                <td>⚪ Optional</td>
+            </tr>
+            <tr style="background: #f5f5f5;">
+                <td>Breathing factor</td>
+                <td><code>sigma_boost</code></td>
+                <td>[1.5, 5.0]</td>
+                <td>3.0</td>
+                <td class="priority-medium">MEDIUM</td>
+                <td>⚪ Optional</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="insight-box">
+        <div class="insight-title">PMMH Configuration</div>
+        <p style="margin: 0; font-size: 0.9rem;">
+            <strong>Recommended:</strong> 5 parameters (ρ, σ<sub>z</sub>, μ, ν, lik_offset)<br>
+            <strong>Particles:</strong> 100-200 for likelihood estimation<br>
+            <strong>MCMC:</strong> Random walk Metropolis with adaptive covariance<br>
+            <strong>Update frequency:</strong> Every 50-100 observations (batch mode)
+        </p>
+    </div>
+
+    <!-- Section 6: Parameter Interactions -->
+    <h2><span class="section-number">6</span>Parameter Interactions</h2>
+
+    <figure>
+        <div class="viz-container">
+            <div class="viz-title">Parameter Interaction Graph</div>
+            <svg viewBox="0 0 600 300" style="width: 100%;">
+                <!-- Background -->
+                <rect x="0" y="0" width="600" height="300" fill="#fafafa"/>
+                
+                <!-- Parameter nodes -->
+                <!-- Tier 1 -->
+                <circle cx="150" cy="80" r="35" fill="#fee2e2" stroke="#dc2626" stroke-width="2"/>
+                <text x="150" y="85" text-anchor="middle" font-family="JetBrains Mono" font-size="12" fill="#b91c1c">ρ</text>
+                
+                <circle cx="300" cy="80" r="35" fill="#fee2e2" stroke="#dc2626" stroke-width="2"/>
+                <text x="300" y="85" text-anchor="middle" font-family="JetBrains Mono" font-size="12" fill="#b91c1c">σ_z</text>
+                
+                <circle cx="450" cy="80" r="35" fill="#fee2e2" stroke="#dc2626" stroke-width="2"/>
+                <text x="450" y="85" text-anchor="middle" font-family="JetBrains Mono" font-size="12" fill="#b91c1c">μ</text>
+                
+                <!-- Tier 2 -->
+                <circle cx="200" cy="180" r="30" fill="#fef3c7" stroke="#d97706" stroke-width="2"/>
+                <text x="200" y="185" text-anchor="middle" font-family="JetBrains Mono" font-size="11" fill="#a16207">ν</text>
+                
+                <circle cx="400" cy="180" r="30" fill="#fef3c7" stroke="#d97706" stroke-width="2"/>
+                <text x="400" y="177" text-anchor="middle" font-family="JetBrains Mono" font-size="9" fill="#a16207">lik_</text>
+                <text x="400" y="190" text-anchor="middle" font-family="JetBrains Mono" font-size="9" fill="#a16207">offset</text>
+                
+                <!-- Tier 3 -->
+                <circle cx="300" cy="260" r="25" fill="#dcfce7" stroke="#059669" stroke-width="2"/>
+                <text x="300" y="257" text-anchor="middle" font-family="JetBrains Mono" font-size="8" fill="#15803d">guide_</text>
+                <text x="300" y="268" text-anchor="middle" font-family="JetBrains Mono" font-size="8" fill="#15803d">max</text>
+                
+                <!-- Interaction lines -->
+                <!-- ρ ↔ σ_z: strong -->
+                <line x1="185" y1="80" x2="265" y2="80" stroke="#dc2626" stroke-width="3"/>
+                
+                <!-- σ_z ↔ μ: moderate -->
+                <line x1="335" y1="80" x2="415" y2="80" stroke="#dc2626" stroke-width="2"/>
+                
+                <!-- ν ↔ lik_offset: strong coupling -->
+                <line x1="230" y1="180" x2="370" y2="180" stroke="#d97706" stroke-width="3"/>
+                <text x="300" y="170" text-anchor="middle" font-family="Source Sans 3" font-size="8" fill="#d97706">strong coupling</text>
+                
+                <!-- σ_z ↔ ν: weak -->
+                <line x1="280" y1="110" x2="220" y2="155" stroke="#999" stroke-width="1" stroke-dasharray="3,3"/>
+                
+                <!-- σ_z ↔ guide_max -->
+                <line x1="300" y1="115" x2="300" y2="235" stroke="#999" stroke-width="1" stroke-dasharray="3,3"/>
+                
+                <!-- Legend -->
+                <rect x="480" y="230" width="110" height="60" rx="4" fill="white" stroke="#ccc"/>
+                <line x1="490" y1="245" x2="520" y2="245" stroke="#333" stroke-width="3"/>
+                <text x="530" y="248" font-family="Source Sans 3" font-size="8" fill="#666">Strong</text>
+                <line x1="490" y1="260" x2="520" y2="260" stroke="#333" stroke-width="2"/>
+                <text x="530" y="263" font-family="Source Sans 3" font-size="8" fill="#666">Moderate</text>
+                <line x1="490" y1="275" x2="520" y2="275" stroke="#999" stroke-width="1" stroke-dasharray="3,3"/>
+                <text x="530" y="278" font-family="Source Sans 3" font-size="8" fill="#666">Weak</text>
+            </svg>
+        </div>
+        <figcaption>
+            <strong>Figure 6:</strong> Parameter interaction graph. Strong interactions (thick lines) 
+            indicate parameters that should be learned jointly. The ν–lik_offset coupling is 
+            particularly important: changing ν affects the optimal offset.
+        </figcaption>
+    </figure>
+
+    <div class="warning-box">
+        <div class="warning-title">Identifiability Concern</div>
+        <p style="margin: 0; font-size: 0.9rem;">
+            The pair (ρ, σ<sub>z</sub>) can trade off against each other: high persistence with 
+            low vol-of-vol can look similar to moderate persistence with higher vol-of-vol. 
+            Consider using informative priors or learning them sequentially.
+        </p>
+    </div>
+
+    <!-- Footer -->
+    <footer>
+        <p>SVPF Parameter Learning Specification • January 2026</p>
+    </footer>
+</body>
+</html>
