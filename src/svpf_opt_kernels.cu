@@ -443,7 +443,7 @@ __global__ void svpf_fused_stein_transport_kernel(
         float diff = h_i - sh_h[j];
         float K = __expf(-diff * diff * inv_2bw_sq);
         k_sum += K * sh_grad[j];
-        gk_sum -= K * diff * inv_bw_sq;
+        gk_sum += K * diff * inv_bw_sq;  // FIXED: + not - (repulsion)
     }
     
     float phi_i = (k_sum + gk_sum) * inv_n;
@@ -517,7 +517,7 @@ __global__ void svpf_fused_stein_transport_newton_kernel(
         float diff = h_i - sh_h[j];
         float K = __expf(-diff * diff * inv_2bw_sq);
         k_sum += K * sh_precond_grad[j];
-        gk_sum -= K * diff * inv_bw_sq * sh_inv_hess[j];
+        gk_sum += K * diff * inv_bw_sq * sh_inv_hess[j];  // FIXED: + not - (repulsion)
     }
     
     float phi_i = (k_sum + gk_sum) * inv_n;
