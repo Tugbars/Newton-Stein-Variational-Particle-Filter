@@ -522,13 +522,14 @@ static Metrics run_svpf_on_scenario(
      * This is intentional - tests SVPF robustness to misspecification.
      */
     SVPFParams params;
-    params.rho = 0.97f;        /* Fixed, but DGP has θ(z) ∈ [0.007, 0.127] */
-    params.sigma_z = 0.15f;    /* Fixed, but DGP has σ(z) ∈ [0.08, 0.50] */
-    params.mu = -3.5f;         /* Fixed, but DGP has μ(z) ∈ [-4.5, -1.0] */
-    params.gamma = 0.0f;       /* No leverage in this DGP */
-    
+    params.rho = 0.97f;     /* Fixed, but DGP has θ(z) ∈ [0.007, 0.127] */
+    params.sigma_z = 0.15f; /* Fixed, but DGP has σ(z) ∈ [0.08, 0.50] */
+    params.mu = -3.5f;      /* Fixed, but DGP has μ(z) ∈ [-4.5, -1.0] */
+    params.gamma = 0.0f;    /* No leverage in this DGP */
+
+    // IMPORTANT: Re-initialize to set up lambda particles
     svpf_initialize(filter, &params, seed);
-    
+
     /* Configure adaptive settings */
     if (use_adaptive) {
         filter->use_svld = 1;

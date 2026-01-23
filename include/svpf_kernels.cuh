@@ -3,7 +3,7 @@
  * @brief CUDA kernel declarations for SVPF
  * 
  * This header contains kernel DECLARATIONS only.
- * Definitions are in svpf_kernels.cu, svpf_opt_kernels.cu, svpf_2d_kernels.cu
+ * Definitions are in svpf_kernels.cu, svpf_opt_kernels.cu
  */
 
 #ifndef SVPF_KERNELS_CUH
@@ -144,23 +144,6 @@ __global__ void svpf_bandwidth_kernel(
 // =============================================================================
 // Kernel Declarations - Stein (Legacy)
 // =============================================================================
-
-__global__ void svpf_stein_2d_kernel(
-    const float* __restrict__ h,
-    const float* __restrict__ grad,
-    float* __restrict__ phi,
-    const float* __restrict__ d_bandwidth,
-    int n
-);
-
-__global__ void svpf_stein_newton_2d_kernel(
-    const float* __restrict__ h,
-    const float* __restrict__ precond_grad,
-    const float* __restrict__ inv_hessian,
-    float* __restrict__ phi,
-    const float* __restrict__ d_bandwidth,
-    int n
-);
 
 __global__ void svpf_stein_persistent_kernel(
     const float* __restrict__ h,
@@ -343,86 +326,6 @@ __global__ void svpf_fused_bandwidth_kernel(
     float* __restrict__ d_return_ema,
     float* __restrict__ d_return_var,
     int y_idx, float alpha_bw, float alpha_ret, int n
-);
-
-// =============================================================================
-// 2D PARAMETER LEARNING KERNEL DECLARATIONS (svpf_2d_kernels.cu)
-// State: (h, lambda) where lambda = log(sigma_z)
-// =============================================================================
-
-// 2D Predict with parameter jittering
-__global__ void svpf_predict_2d_kernel(
-    float* __restrict__ h,
-    float* __restrict__ h_prev,
-    float* __restrict__ lambda,
-    float* __restrict__ lambda_prev,
-    curandStatePhilox4_32_10_t* __restrict__ rng,
-    const float* __restrict__ d_y,
-    const float* __restrict__ d_h_mean,
-    int t,
-    float rho, float mu, float gamma,
-    float lambda_jitter,
-    int n
-);
-
-// 2D Fused gradient (h and lambda)
-__global__ void svpf_fused_gradient_2d_kernel(
-    const float* __restrict__ h,
-    const float* __restrict__ h_prev,
-    const float* __restrict__ lambda,
-    float* __restrict__ grad_h,
-    float* __restrict__ grad_lambda,
-    float* __restrict__ log_w,
-    const float* __restrict__ d_y,
-    int y_idx,
-    float rho, float mu,
-    float beta, float nu, float student_t_const,
-    float lambda_prior_mean, float lambda_prior_std,
-    int n
-);
-
-// 2D Fused Stein + Transport
-__global__ void svpf_fused_stein_transport_2d_kernel(
-    float* __restrict__ h,
-    float* __restrict__ lambda,
-    const float* __restrict__ grad_h,
-    const float* __restrict__ grad_lambda,
-    float* __restrict__ v_h,
-    float* __restrict__ v_lambda,
-    curandStatePhilox4_32_10_t* __restrict__ rng,
-    const float* __restrict__ d_bw_h,
-    const float* __restrict__ d_bw_lambda,
-    float step_size, float beta_factor, float temperature,
-    float rho_rmsprop, float epsilon,
-    int n
-);
-
-// 2D Bandwidth computation (separate for h and lambda)
-__global__ void svpf_fused_bandwidth_2d_kernel(
-    const float* __restrict__ h,
-    const float* __restrict__ lambda,
-    const float* __restrict__ d_y,
-    float* __restrict__ d_bw_h,
-    float* __restrict__ d_bw_h_sq,
-    float* __restrict__ d_bw_lambda,
-    float* __restrict__ d_bw_lambda_sq,
-    float* __restrict__ d_return_ema,
-    float* __restrict__ d_return_var,
-    int y_idx,
-    float alpha_bw_h, float alpha_bw_lambda, float alpha_ret,
-    int n
-);
-
-// 2D Outputs (includes sigma_z mean estimate)
-__global__ void svpf_fused_outputs_2d_kernel(
-    const float* __restrict__ h,
-    const float* __restrict__ lambda,
-    const float* __restrict__ log_w,
-    float* __restrict__ d_loglik,
-    float* __restrict__ d_vol,
-    float* __restrict__ d_h_mean,
-    float* __restrict__ d_sigma_mean,
-    int t_out, int n
 );
 
 // =============================================================================

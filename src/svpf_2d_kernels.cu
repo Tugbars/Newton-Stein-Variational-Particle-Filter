@@ -20,9 +20,9 @@ __device__ __forceinline__ float clamp_logvol(float h) {
 }
 
 __device__ __forceinline__ float clamp_lambda(float lam) {
-    // lambda = log(sigma_z), clamp sigma_z to [0.01, 1.0]
-    // log(0.01) ≈ -4.6, log(1.0) = 0
-    return fminf(fmaxf(lam, -4.6f), 0.0f);
+    // lambda = log(sigma_z), clamp sigma_z to [0.01, 0.5]
+    // log(0.01) ≈ -4.6, log(0.5) ≈ -0.69
+    return fminf(fmaxf(lam, -4.6f), -0.69f);
 }
 
 __device__ __forceinline__ float warp_reduce_sum(float val) {
@@ -343,16 +343,17 @@ __global__ void svpf_fused_stein_transport_2d_kernel(
         float diff_h = h_i - sh_h[j];
         float diff_lam = lam_i - sh_lam[j];
         
-        // Product kernel - compute combined exponent for precision
+        // Product kernel: compute combined exponent for precision
+        // K = exp(-diff_h²/2bw_h² - diff_lam²/2bw_lam²)
         float dist_h = diff_h * diff_h * inv_2bw_h_sq;
         float dist_lam = diff_lam * diff_lam * inv_2bw_lam_sq;
         float K = expf(-(dist_h + dist_lam));  // Standard exp for precision
         
-        // Stein for h: K * grad_h + grad_K (repulsive: pushes i away from j)
-        // grad_K w.r.t. x_j acting on x_i is +diff/bw² (positive = repulsion)
+        // Stein for h: K * grad_h + grad_K
+        // grad_K should push 'i' AWAY from 'j' (direction diff_h)
         phi_h += K * sh_gh[j] + K * diff_h * inv_bw_h_sq;
         
-        // Stein for lambda: K * grad_lambda + grad_K
+        // Stein for lambda
         phi_lam += K * sh_glam[j] + K * diff_lam * inv_bw_lam_sq;
     }
     
@@ -377,8 +378,11 @@ __global__ void svpf_fused_stein_transport_2d_kernel(
     float precond_h = rsqrtf(v_h_new + epsilon);
     float precond_lam = rsqrtf(v_lam_new + epsilon);
     
+    // Lambda learns much slower to prevent drift
+    float lam_step_scale = 0.01f;  // Supervisor: reduce from 0.5 to 0.01
+    
     float drift_h = effective_step * phi_h * precond_h;
-    float drift_lam = effective_step * phi_lam * precond_lam * 0.5f;  // Slower learning rate for params
+    float drift_lam = effective_step * phi_lam * precond_lam * lam_step_scale;
     
     // SVLD diffusion
     float diff_h_noise = 0.0f;
@@ -387,7 +391,7 @@ __global__ void svpf_fused_stein_transport_2d_kernel(
         float2 noise = curand_normal2(&rng[i]);
         float noise_scale = __fsqrt_rn(2.0f * effective_step * temperature);
         diff_h_noise = noise_scale * noise.x;
-        diff_lam_noise = noise_scale * noise.y * 0.5f;  // Less noise for params
+        diff_lam_noise = noise_scale * noise.y * lam_step_scale;  // Match drift scaling
     }
     
     h[i] = clamp_logvol(h_i + drift_h + diff_h_noise);

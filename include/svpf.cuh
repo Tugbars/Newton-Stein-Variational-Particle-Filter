@@ -8,7 +8,6 @@
  * - Stein transport prevents particle degeneracy
  * - Student-t likelihood handles tail events
  * - Fewer particles needed vs bootstrap PF (500 vs 3000)
- * - Online parameter learning (sigma_z)
  * 
  * Algorithm (Fan et al. 2021, arXiv:2106.10568):
  * - Prior is Gaussian MIXTURE over all particles: p(h_t|Z_{t-1}) = (1/N) Σ_i p(h_t|h_{t-1}^i)
@@ -151,13 +150,6 @@ typedef struct {
     float* d_precond_grad;    // H^{-1} * grad (preconditioned gradient)
     float* d_inv_hessian;     // H^{-1} (inverse Hessian per particle)
     
-    // =========================================================================
-    // 2D PARAMETER LEARNING BUFFERS
-    // =========================================================================
-    float* d_bw_lambda;       // Scalar: bandwidth for lambda dimension
-    float* d_bw_lambda_sq;    // Scalar: bandwidth squared (EMA state)
-    float* d_sigma_mean;      // Scalar: output estimated sigma_z
-    
     // Particle-local parameters: h_mean from previous step
     float* d_h_mean_prev;
     
@@ -258,14 +250,6 @@ typedef struct {
     float* d_return_var;   // Scalar: EMA of return variance
     float* d_bw_alpha;     // Scalar: adaptive bandwidth alpha
     
-    // =========================================================================
-    // 2D PARAMETER LEARNING: (h, lambda) where lambda = log(sigma_z)
-    // =========================================================================
-    float* d_lambda;          // [N] Current log(sigma_z) particles
-    float* d_lambda_prev;     // [N] Previous lambda (for jittering)
-    float* d_grad_lambda;     // [N] Gradient w.r.t. lambda
-    float* d_v_lambda;        // [N] RMSProp momentum for lambda
-    
     // RNG states
     curandStatePhilox4_32_10_t* rng_states;  // [N] CURAND Philox states
     
@@ -349,19 +333,6 @@ typedef struct {
     float guide_K;          // Kalman gain (for debugging)
     int guide_initialized;  // Whether guide has been initialized
     
-    // =========================================================================
-    // 2D PARAMETER LEARNING CONFIG
-    // State: (h, λ) where λ = log(σ_z)
-    // Learns vol-of-vol online via state augmentation
-    // =========================================================================
-    int use_param_learning;     // Enable online sigma_z learning (0=fixed, 1=learn)
-    float lambda_jitter;        // Jitter std for lambda random walk (e.g., 0.02)
-    float lambda_init;          // Initial lambda = log(sigma_z) (e.g., -1.9 for sigma=0.15)
-    float lambda_prior_mean;    // Prior mean for lambda (e.g., -1.9)
-    float lambda_prior_std;     // Prior std for lambda (e.g., 0.5)
-    float bw_lambda_alpha;      // Bandwidth EMA for lambda (slower, e.g., 0.1)
-    float sigma_z_estimate;     // Output: current estimated sigma_z (mean of exp(lambda))
-    
     // Optimized backend (embedded for thread safety)
     SVPFOptimizedState opt_backend;
     
@@ -375,7 +346,6 @@ typedef struct {
     float vol_mean;           // E[exp(h/2)]
     float vol_std;            // Std[exp(h/2)]
     float h_mean;             // E[h]
-    float sigma_z_estimate;   // E[exp(lambda)] - learned vol-of-vol (if use_param_learning)
 } SVPFResult;
 
 // =============================================================================
@@ -496,7 +466,6 @@ void svpf_step_optimized(
  *   5. Adaptive bandwidth α scaling (tighter kernel during high vol)
  *   6. Annealed Stein updates (β schedule: 0.3 → 0.65 → 1.0)
  *   7. Fused RMSProp + Langevin diffusion (SVLD for diversity)
- *   8. Online σ_z learning (2D state augmentation, if enabled)
  * 
  * Configure via SVPFState fields:
  *   - use_mim: Enable Mixture Innovation (default: 1)
@@ -508,7 +477,6 @@ void svpf_step_optimized(
  *   - use_svld: Enable SVLD noise (default: 1)
  *   - use_annealing: Enable/disable annealing (default: 1)
  *   - temperature: 0=SVGD, 1=SVLD, >1=extra exploration
- *   - use_param_learning: Enable online sigma_z learning (default: 0)
  * 
  * @param state SVPF state
  * @param y_t Current observation
@@ -613,7 +581,7 @@ bool svpf_graph_is_captured(SVPFState* state);
  * 
  * Call after changing:
  *   - SVPFParams (rho, sigma_z, mu, gamma)
- *   - Filter configuration (use_guided, use_newton, use_mim, use_param_learning, etc.)
+ *   - Filter configuration (use_guided, use_newton, use_mim, etc.)
  *   - Any other filter settings
  * 
  * The next svpf_step_graph() call will recapture with new parameters.

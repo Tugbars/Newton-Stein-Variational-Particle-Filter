@@ -5,13 +5,12 @@
  * Single implementation file containing:
  * - State management (svpf_create/destroy/initialize)
  * - Basic utility kernels
- * - Graph capture (1D and 2D paths)
+ * - Graph capture
  * - Public API (svpf_step_graph, svpf_step_adaptive, svpf_run_sequence)
  * - Diagnostics (svpf_get_particles, svpf_get_stats, svpf_get_ess)
  * 
  * External kernel files:
- * - svpf_opt_kernels.cu: Fused 1D kernels
- * - svpf_2d_kernels.cu: Fused 2D kernels (parameter learning)
+ * - svpf_opt_kernels.cu: Fused kernels (gradient, Stein, bandwidth, outputs)
  */
 
 #include "svpf_kernels.cuh"
@@ -62,31 +61,6 @@ __global__ void svpf_copy_kernel(const float* src, float* dst, int n) {
     if (idx < n) {
         dst[idx] = src[idx];
     }
-}
-
-__global__ void svpf_init_lambda_kernel(
-    float* __restrict__ lambda,
-    float* __restrict__ lambda_prev,
-    float* __restrict__ v_lambda,
-    float* __restrict__ grad_lambda,
-    curandStatePhilox4_32_10_t* __restrict__ rng,
-    float lambda_init,
-    float lambda_spread,
-    int n
-) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    
-    float noise = curand_normal(&rng[i]);
-    float lam = lambda_init + lambda_spread * noise * 0.5f;
-    
-    // Clamp to valid range: sigma in [0.01, 1.0] -> lambda in [-4.6, 0]
-    lam = fminf(fmaxf(lam, -4.6f), 0.0f);
-    
-    lambda[i] = lam;
-    lambda_prev[i] = lam;
-    v_lambda[i] = 0.0f;
-    grad_lambda[i] = 0.0f;
 }
 
 // =============================================================================
@@ -140,14 +114,6 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     cudaMemcpy(state->d_return_var, &init_ema, sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(state->d_bw_alpha, &init_alpha, sizeof(float), cudaMemcpyHostToDevice);
     
-    // === 2D PARAMETER LEARNING: lambda = log(sigma_z) ===
-    cudaMalloc(&state->d_lambda, n * sizeof(float));
-    cudaMalloc(&state->d_lambda_prev, n * sizeof(float));
-    cudaMalloc(&state->d_grad_lambda, n * sizeof(float));
-    cudaMalloc(&state->d_v_lambda, n * sizeof(float));
-    cudaMemset(state->d_v_lambda, 0, n * sizeof(float));
-    cudaMemset(state->d_grad_lambda, 0, n * sizeof(float));
-    
     // === ADAPTIVE SVPF: Configuration defaults ===
     state->use_svld = 1;
     state->use_annealing = 1;
@@ -188,15 +154,6 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     state->use_local_params = 0;
     state->delta_rho = 0.02f;
     state->delta_sigma = 0.1f;
-    
-    // === 2D PARAMETER LEARNING: Configuration defaults ===
-    state->use_param_learning = 0;
-    state->lambda_jitter = 0.02f;
-    state->lambda_init = -1.897f;       // log(0.15)
-    state->lambda_prior_mean = -1.897f;
-    state->lambda_prior_std = 0.5f;
-    state->bw_lambda_alpha = 0.1f;
-    state->sigma_z_estimate = 0.15f;
     
     // Device scalars
     cudaMalloc(&state->d_scalar_max, sizeof(float));
@@ -247,11 +204,6 @@ void svpf_destroy(SVPFState* state) {
     cudaFree(state->d_return_var);
     cudaFree(state->d_bw_alpha);
     
-    cudaFree(state->d_lambda);
-    cudaFree(state->d_lambda_prev);
-    cudaFree(state->d_grad_lambda);
-    cudaFree(state->d_v_lambda);
-    
     cudaFree(state->d_scalar_max);
     cudaFree(state->d_scalar_sum);
     cudaFree(state->d_scalar_mean);
@@ -295,29 +247,11 @@ void svpf_initialize(SVPFState* state, const SVPFParams* params, unsigned long l
         state->h, state->h_prev, n
     );
     
-    if (state->use_param_learning) {
-        if (state->lambda_init < -4.5f || state->lambda_init > 0.1f) {
-            state->lambda_init = logf(params->sigma_z);
-            state->lambda_prior_mean = state->lambda_init;
-        }
-        
-        svpf_init_lambda_kernel<<<grid, SVPF_BLOCK_SIZE, 0, state->stream>>>(
-            state->d_lambda, state->d_lambda_prev,
-            state->d_v_lambda, state->d_grad_lambda,
-            state->rng_states, state->lambda_init, 0.1f, n
-        );
-        
-        state->sigma_z_estimate = expf(state->lambda_init);
-    }
-    
     state->guide_initialized = 0;
     state->guide_mean = params->mu;
     state->guide_var = stationary_var;
     
     cudaMemset(state->d_grad_v, 0, n * sizeof(float));
-    if (state->use_param_learning) {
-        cudaMemset(state->d_v_lambda, 0, n * sizeof(float));
-    }
     
     svpf_graph_invalidate(state);
     cudaStreamSynchronize(state->stream);
@@ -379,11 +313,6 @@ static void svpf_optimized_init(SVPFOptimizedState* opt, int n) {
     opt->graph_n = 0;
     opt->graph_n_stein = 0;
     
-    cudaMalloc(&opt->d_bw_lambda, sizeof(float));
-    cudaMalloc(&opt->d_bw_lambda_sq, sizeof(float));
-    cudaMalloc(&opt->d_sigma_mean, sizeof(float));
-    cudaMemcpy(opt->d_bw_lambda_sq, &zero, sizeof(float), cudaMemcpyHostToDevice);
-    
     opt->allocated_n = n;
     opt->initialized = true;
 }
@@ -407,9 +336,6 @@ static void svpf_optimized_cleanup(SVPFOptimizedState* opt) {
     cudaFree(opt->d_loglik_single);
     cudaFree(opt->d_vol_single);
     cudaFree(opt->d_params_staging);
-    cudaFree(opt->d_bw_lambda);
-    cudaFree(opt->d_bw_lambda_sq);
-    cudaFree(opt->d_sigma_mean);
     
     if (opt->graph_captured) {
         cudaGraphExecDestroy(opt->graph_exec);
@@ -556,99 +482,6 @@ static void svpf_graph_capture_internal(SVPFState* state, const SVPFParams* para
 }
 
 // =============================================================================
-// GRAPH CAPTURE: 2D Path (Parameter Learning)
-// =============================================================================
-
-static void svpf_graph_capture_2d_internal(SVPFState* state, const SVPFParams* params) {
-    SVPFOptimizedState* opt = get_opt(state);
-    int n = state->n_particles;
-    cudaStream_t cs = opt->graph_stream;
-    
-    float student_t_const = lgammaf((state->nu + 1.0f) / 2.0f)
-                          - lgammaf(state->nu / 2.0f)
-                          - 0.5f * logf((float)M_PI * state->nu);
-    
-    int nb = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    size_t grad_2d_smem = 4 * n * sizeof(float);
-    size_t stein_2d_smem = 4 * n * sizeof(float);
-    
-    int n_anneal = state->use_annealing ? state->n_anneal_steps : 1;
-    float beta_schedule[3] = {0.3f, 0.65f, 1.0f};
-    float base_step = SVPF_STEIN_STEP_SIZE * (state->use_guide ? 0.5f : 1.0f);
-    
-    cudaStreamBeginCapture(cs, cudaStreamCaptureModeGlobal);
-    
-    // 2D PREDICT
-    svpf_predict_2d_kernel<<<nb, BLOCK_SIZE, 0, cs>>>(
-        state->h, state->h_prev, state->d_lambda, state->d_lambda_prev,
-        state->rng_states, opt->d_y_single, opt->d_h_mean_prev, 1,
-        params->rho, params->mu, params->gamma, state->lambda_jitter, n
-    );
-    
-    // GUIDE
-    if (state->use_guide) {
-        if (state->use_guide_preserving) {
-            svpf_apply_guide_preserving_kernel_graph<<<nb, BLOCK_SIZE, 0, cs>>>(
-                state->h, opt->d_h_mean_prev, opt->d_guide_mean, state->guide_strength, n
-            );
-        } else {
-            svpf_apply_guide_kernel_graph<<<nb, BLOCK_SIZE, 0, cs>>>(
-                state->h, opt->d_guide_mean, state->guide_strength, n
-            );
-        }
-    }
-    
-    // 2D BANDWIDTH
-    svpf_fused_bandwidth_2d_kernel<<<1, BLOCK_SIZE, 0, cs>>>(
-        state->h, state->d_lambda, opt->d_y_single,
-        opt->d_bandwidth, opt->d_bandwidth_sq,
-        opt->d_bw_lambda, opt->d_bw_lambda_sq,
-        state->d_return_ema, state->d_return_var,
-        1, 0.3f, state->bw_lambda_alpha, 0.05f, n
-    );
-    
-    // 2D STEIN ITERATIONS
-    for (int ai = 0; ai < n_anneal; ai++) {
-        float beta = state->use_annealing ? beta_schedule[ai % 3] : 1.0f;
-        float beta_factor = sqrtf(beta);
-        float temp = state->use_svld ? state->temperature : 0.0f;
-        
-        int si = state->n_stein_steps / n_anneal;
-        if (ai == n_anneal - 1) si = state->n_stein_steps - si * (n_anneal - 1);
-        
-        for (int s = 0; s < si; s++) {
-            svpf_fused_gradient_2d_kernel<<<nb, BLOCK_SIZE, grad_2d_smem, cs>>>(
-                state->h, state->h_prev, state->d_lambda,
-                state->grad_log_p, state->d_grad_lambda, state->log_weights,
-                opt->d_y_single, 1, params->rho, params->mu,
-                beta, state->nu, student_t_const,
-                state->lambda_prior_mean, state->lambda_prior_std, n
-            );
-            
-            svpf_fused_stein_transport_2d_kernel<<<nb, BLOCK_SIZE, stein_2d_smem, cs>>>(
-                state->h, state->d_lambda, state->grad_log_p, state->d_grad_lambda,
-                state->d_grad_v, state->d_v_lambda, state->rng_states,
-                opt->d_bandwidth, opt->d_bw_lambda,
-                base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps, n
-            );
-        }
-    }
-    
-    // 2D OUTPUTS
-    svpf_fused_outputs_2d_kernel<<<1, BLOCK_SIZE, 0, cs>>>(
-        state->h, state->d_lambda, state->log_weights,
-        opt->d_loglik_single, opt->d_vol_single, opt->d_h_mean_prev, opt->d_sigma_mean, 0, n
-    );
-    
-    cudaStreamEndCapture(cs, &opt->graph);
-    cudaGraphInstantiate(&opt->graph_exec, opt->graph, NULL, NULL, 0);
-    
-    opt->graph_captured = true;
-    opt->graph_n = n;
-    opt->graph_n_stein = state->n_stein_steps;
-}
-
-// =============================================================================
 // PUBLIC API
 // =============================================================================
 
@@ -667,8 +500,7 @@ void svpf_step_graph(SVPFState* state, float y_t, float y_prev, const SVPFParams
             cudaGraphDestroy(opt->graph);
             opt->graph_captured = false;
         }
-        if (state->use_param_learning) svpf_graph_capture_2d_internal(state, params);
-        else svpf_graph_capture_internal(state, params);
+        svpf_graph_capture_internal(state, params);
     }
     
     float y_arr[2] = {y_prev, y_t};
@@ -686,7 +518,6 @@ void svpf_step_graph(SVPFState* state, float y_t, float y_prev, const SVPFParams
     if (h_loglik_out) cudaMemcpy(h_loglik_out, opt->d_loglik_single, sizeof(float), cudaMemcpyDeviceToHost);
     if (h_vol_out) cudaMemcpy(h_vol_out, opt->d_vol_single, sizeof(float), cudaMemcpyDeviceToHost);
     if (h_mean_out) cudaMemcpy(h_mean_out, opt->d_h_mean_prev, sizeof(float), cudaMemcpyDeviceToHost);
-    if (state->use_param_learning) cudaMemcpy(&state->sigma_z_estimate, opt->d_sigma_mean, sizeof(float), cudaMemcpyDeviceToHost);
     
     state->timestep++;
 }
@@ -704,7 +535,6 @@ void svpf_step(SVPFState* state, float y_t, const SVPFParams* params, SVPFResult
         result->vol_mean = vol;
         result->h_mean = h_mean;
         result->vol_std = 0.0f;
-        result->sigma_z_estimate = state->sigma_z_estimate;
     }
     state->y_prev = y_t;
 }
