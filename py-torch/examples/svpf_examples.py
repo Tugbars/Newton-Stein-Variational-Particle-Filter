@@ -9,7 +9,7 @@ Demonstrates:
 """
 
 import numpy as np
-import svpf
+import pysvpf as svpf
 
 # =============================================================================
 # Example 1: Basic Usage

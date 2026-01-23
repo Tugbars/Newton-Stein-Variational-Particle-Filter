@@ -99,6 +99,36 @@ add_subdirectory(src)
 add_subdirectory(test)
 
 # =============================================================================
+# Python Bindings (requires pybind11)
+# =============================================================================
+# Use modern Python finder first
+set(PYBIND11_FINDPYTHON ON)
+find_package(Python3 COMPONENTS Interpreter Development QUIET)
+
+# Auto-detect pybind11 from Python installation
+if(Python3_FOUND)
+    execute_process(
+        COMMAND ${Python3_EXECUTABLE} -c "import pybind11; print(pybind11.get_cmake_dir())"
+        OUTPUT_VARIABLE PYBIND11_CMAKE_DIR
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+        RESULT_VARIABLE PYBIND11_RESULT
+    )
+    if(PYBIND11_RESULT EQUAL 0 AND PYBIND11_CMAKE_DIR)
+        list(APPEND CMAKE_PREFIX_PATH "${PYBIND11_CMAKE_DIR}")
+    endif()
+endif()
+
+find_package(pybind11 QUIET)
+if(pybind11_FOUND)
+    add_subdirectory(py-torch)
+    set(PYTHON_BINDINGS_STATUS "ENABLED")
+else()
+    message(WARNING "pybind11 not found - Python bindings disabled. Install with: pip install pybind11")
+    set(PYTHON_BINDINGS_STATUS "DISABLED (pybind11 not found)")
+endif()
+
+# =============================================================================
 # Summary
 # =============================================================================
 message(STATUS "")
@@ -108,5 +138,6 @@ message(STATUS "  CUDA Compiler:   ${CMAKE_CUDA_COMPILER}")
 message(STATUS "  CUDA Version:    ${CUDAToolkit_VERSION}")
 message(STATUS "  CUDA Arch:       sm_${CUDA_ARCH}")
 message(STATUS "  Build Type:      ${CMAKE_BUILD_TYPE}")
+message(STATUS "  Python Bindings: ${PYTHON_BINDINGS_STATUS}")
 message(STATUS "================================")
 message(STATUS "")

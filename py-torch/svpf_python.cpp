@@ -17,6 +17,11 @@
  *       print(result.vol_mean)
  */
 
+// Windows doesn't define M_PI by default
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
@@ -399,7 +404,7 @@ private:
 // PyBind11 Module Definition
 // =============================================================================
 
-PYBIND11_MODULE(svpf, m) {
+PYBIND11_MODULE(pysvpf, m) {
     m.doc() = "SVPF: Stein Variational Particle Filter for Stochastic Volatility";
     
     // Result struct
