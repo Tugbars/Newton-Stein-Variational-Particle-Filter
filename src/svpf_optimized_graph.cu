@@ -178,6 +178,12 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     state->mu_min = -6.0f;               // Lower bound
     state->mu_max = -1.0f;               // Upper bound
     
+    // === Adaptive Sigma_Z (Breathing Filter) defaults ===
+    state->use_adaptive_sigma = 0;       // Disabled by default
+    state->sigma_boost_threshold = 1.0f; // Start boosting when |z| > 1
+    state->sigma_boost_max = 3.0f;       // Max 3x boost
+    state->sigma_z_effective = 0.15f;    // Initial effective sigma_z
+    
     // Device scalars
     cudaMalloc(&state->d_scalar_max, sizeof(float));
     cudaMalloc(&state->d_scalar_sum, sizeof(float));
@@ -278,6 +284,11 @@ void svpf_initialize(SVPFState* state, const SVPFParams* params, unsigned long l
     if (state->use_adaptive_mu) {
         state->mu_state = params->mu;         // Start from provided mu
         state->mu_var = 1.0f;                 // High initial uncertainty
+    }
+    
+    // Initialize adaptive sigma_z state
+    if (state->use_adaptive_sigma) {
+        state->sigma_z_effective = params->sigma_z;
     }
     
     cudaMemset(state->d_grad_v, 0, n * sizeof(float));
@@ -577,15 +588,44 @@ void svpf_step_graph(SVPFState* state, float y_t, float y_prev, const SVPFParams
     // Determine effective mu (adaptive or fixed)
     float effective_mu = state->use_adaptive_mu ? state->mu_state : params->mu;
     
+    // =========================================================================
+    // ADAPTIVE SIGMA_Z: Innovation-gated vol-of-vol ("Breathing Filter")
+    // =========================================================================
+    // Boost sigma_z when innovation is high to allow particles to spread faster
+    float effective_sigma_z = params->sigma_z;
+    
+    if (state->use_adaptive_sigma && state->timestep > 0) {
+        float vol_est = fmaxf(state->vol_prev, 1e-4f);
+        float return_z = fabsf(y_t) / vol_est;
+        
+        // Boost sigma_z when innovation exceeds threshold
+        float sigma_boost = 1.0f;
+        if (return_z > state->sigma_boost_threshold) {
+            float severity = fminf((return_z - state->sigma_boost_threshold) / 3.0f, 1.0f);
+            sigma_boost = 1.0f + (state->sigma_boost_max - 1.0f) * severity;
+        }
+        
+        effective_sigma_z = params->sigma_z * sigma_boost;
+        state->sigma_z_effective = effective_sigma_z;
+    }
+    
     // Check if graph needs recapture
     bool need_capture = !opt->graph_captured 
                      || opt->graph_n != n 
                      || opt->graph_n_stein != state->n_stein_steps;
     
-    // If adaptive mu, also check if mu has drifted significantly from captured value
+    // If adaptive mu, check if mu has drifted significantly from captured value
     if (state->use_adaptive_mu && opt->graph_captured) {
         float mu_drift = fabsf(effective_mu - opt->mu_captured);
-        if (mu_drift > 0.1f) {  // Recapture if mu drifted by more than 0.1
+        if (mu_drift > 0.1f) {
+            need_capture = true;
+        }
+    }
+    
+    // If adaptive sigma_z, check if it has drifted significantly
+    if (state->use_adaptive_sigma && opt->graph_captured) {
+        float sigma_drift = fabsf(effective_sigma_z - opt->sigma_z_captured);
+        if (sigma_drift > 0.05f) {  // Recapture if sigma_z changed by more than 0.05
             need_capture = true;
         }
     }
@@ -597,14 +637,18 @@ void svpf_step_graph(SVPFState* state, float y_t, float y_prev, const SVPFParams
             opt->graph_captured = false;
         }
         
-        // Create modified params with effective mu for capture
+        // Create modified params for capture
         SVPFParams capture_params = *params;
         if (state->use_adaptive_mu) {
             capture_params.mu = effective_mu;
         }
+        if (state->use_adaptive_sigma) {
+            capture_params.sigma_z = effective_sigma_z;
+        }
         
         svpf_graph_capture_internal(state, &capture_params);
         opt->mu_captured = effective_mu;
+        opt->sigma_z_captured = effective_sigma_z;
     }
     
     float y_arr[2] = {y_prev, y_t};
@@ -676,8 +720,8 @@ void svpf_step_graph(SVPFState* state, float y_t, float y_prev, const SVPFParams
     
     if (h_mean_out) *h_mean_out = h_mean_local;
     
-    // Update vol_prev for next step's adaptive guide calculation
-    state->vol_prev = vol_local;
+    // Update state for next step
+    state->vol_prev = vol_local;              // For adaptive guide and adaptive sigma
     
     // =========================================================================
     // ADAPTIVE MU: 1D Kalman Filter Update
