@@ -8,6 +8,16 @@ Demonstrates:
 4. Real-time usage pattern
 """
 
+import os
+import sys
+
+# Add CUDA DLLs to path (Windows)
+if sys.platform == 'win32':
+    cuda_path = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1\bin"
+    if os.path.exists(cuda_path):
+        os.add_dll_directory(cuda_path)
+        os.environ['PATH'] = cuda_path + ';' + os.environ.get('PATH', '')
+
 import numpy as np
 import pysvpf as svpf
 
