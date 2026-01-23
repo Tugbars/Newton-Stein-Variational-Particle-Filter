@@ -193,7 +193,7 @@ __global__ void svpf_apply_guide_kernel(
 __global__ void svpf_apply_guide_kernel_graph(
     float* __restrict__ h,
     const float* __restrict__ d_guide_mean,
-    float guide_strength,
+    const float* __restrict__ d_guide_strength,  // Adaptive strength from device
     int n
 );
 
@@ -209,7 +209,7 @@ __global__ void svpf_apply_guide_preserving_kernel_graph(
     float* __restrict__ h,
     const float* __restrict__ d_h_mean,
     const float* __restrict__ d_guide_mean,
-    float guide_strength,
+    const float* __restrict__ d_guide_strength,  // Adaptive strength from device
     int n
 );
 

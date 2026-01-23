@@ -135,11 +135,18 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     // === Guide density (EKF) defaults ===
     state->use_guide = 1;
     state->use_guide_preserving = 1;
-    state->guide_strength = 0.2f;
+    state->guide_strength = 0.05f;  // Base strength
     state->guide_mean = 0.0f;
     state->guide_var = 0.0f;
     state->guide_K = 0.0f;
     state->guide_initialized = 0;
+    
+    // === Adaptive Guide Strength defaults ===
+    state->use_adaptive_guide = 0;           // Disabled by default
+    state->guide_strength_base = 0.05f;      // Base when model fits
+    state->guide_strength_max = 0.30f;       // Max during surprises
+    state->guide_innovation_threshold = 1.0f; // Z-score threshold for boost
+    state->vol_prev = 0.05f;                 // Initial vol estimate
     
     // === Newton-Stein defaults ===
     state->use_newton = 0;
@@ -318,6 +325,10 @@ static void svpf_optimized_init(SVPFOptimizedState* opt, int n) {
     cudaMalloc(&opt->d_guide_mean, sizeof(float));
     cudaMemcpy(opt->d_guide_mean, &init_h_mean, sizeof(float), cudaMemcpyHostToDevice);
     
+    cudaMalloc(&opt->d_guide_strength, sizeof(float));
+    float init_guide_strength = 0.05f;
+    cudaMemcpy(opt->d_guide_strength, &init_guide_strength, sizeof(float), cudaMemcpyHostToDevice);
+    
     cudaMalloc(&opt->d_y_single, 2 * sizeof(float));
     cudaMalloc(&opt->d_loglik_single, sizeof(float));
     cudaMalloc(&opt->d_vol_single, sizeof(float));
@@ -347,6 +358,7 @@ static void svpf_optimized_cleanup(SVPFOptimizedState* opt) {
     cudaFree(opt->d_inv_hessian);
     cudaFree(opt->d_h_mean_prev);
     cudaFree(opt->d_guide_mean);
+    cudaFree(opt->d_guide_strength);
     cudaFree(opt->d_y_single);
     cudaFree(opt->d_loglik_single);
     cudaFree(opt->d_vol_single);
@@ -433,11 +445,11 @@ static void svpf_graph_capture_internal(SVPFState* state, const SVPFParams* para
     if (state->use_guide) {
         if (state->use_guide_preserving) {
             svpf_apply_guide_preserving_kernel_graph<<<nb, BLOCK_SIZE, 0, cs>>>(
-                state->h, opt->d_h_mean_prev, opt->d_guide_mean, state->guide_strength, n
+                state->h, opt->d_h_mean_prev, opt->d_guide_mean, opt->d_guide_strength, n
             );
         } else {
             svpf_apply_guide_kernel_graph<<<nb, BLOCK_SIZE, 0, cs>>>(
-                state->h, opt->d_guide_mean, state->guide_strength, n
+                state->h, opt->d_guide_mean, opt->d_guide_strength, n
             );
         }
     }
@@ -591,6 +603,32 @@ void svpf_step_graph(SVPFState* state, float y_t, float y_prev, const SVPFParams
     float y_arr[2] = {y_prev, y_t};
     cudaMemcpyAsync(opt->d_y_single, y_arr, 2 * sizeof(float), cudaMemcpyHostToDevice, opt->graph_stream);
     
+    // =========================================================================
+    // ADAPTIVE GUIDE STRENGTH: Innovation-gated nudging
+    // =========================================================================
+    // Compute on CPU before graph launch (uses vol_prev from last step)
+    float current_guide_strength = state->guide_strength_base;
+    
+    if (state->use_guide && state->use_adaptive_guide && state->timestep > 0) {
+        // Use previous vol estimate as proxy for prediction
+        float vol_est = fmaxf(state->vol_prev, 1e-4f);
+        
+        // Innovation z-score: how surprised is the model?
+        float innovation_z = fabsf(y_t / vol_est);
+        
+        // Linear ramp from base to max:
+        // Z < threshold -> base strength
+        // Z > threshold + 3 -> max strength
+        float boost_range = 3.0f;
+        float boost_frac = fminf(fmaxf(innovation_z - state->guide_innovation_threshold, 0.0f) / boost_range, 1.0f);
+        float boost = (state->guide_strength_max - state->guide_strength_base) * boost_frac;
+        
+        current_guide_strength = state->guide_strength_base + boost;
+    }
+    
+    // Upload adaptive guide strength to device
+    cudaMemcpyAsync(opt->d_guide_strength, &current_guide_strength, sizeof(float), cudaMemcpyHostToDevice, opt->graph_stream);
+    
     if (state->use_guide) {
         // Use effective_mu for EKF update
         SVPFParams guide_params = *params;
@@ -608,13 +646,18 @@ void svpf_step_graph(SVPFState* state, float y_t, float y_prev, const SVPFParams
     // Read back results
     float h_mean_local = 0.0f;
     float bandwidth_local = 0.0f;
+    float vol_local = 0.0f;
     
     if (h_loglik_out) cudaMemcpy(h_loglik_out, opt->d_loglik_single, sizeof(float), cudaMemcpyDeviceToHost);
-    if (h_vol_out) cudaMemcpy(h_vol_out, opt->d_vol_single, sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&vol_local, opt->d_vol_single, sizeof(float), cudaMemcpyDeviceToHost);
+    if (h_vol_out) *h_vol_out = vol_local;
     cudaMemcpy(&h_mean_local, opt->d_h_mean_prev, sizeof(float), cudaMemcpyDeviceToHost);
     cudaMemcpy(&bandwidth_local, opt->d_bandwidth, sizeof(float), cudaMemcpyDeviceToHost);
     
     if (h_mean_out) *h_mean_out = h_mean_local;
+    
+    // Update vol_prev for next step's adaptive guide calculation
+    state->vol_prev = vol_local;
     
     // =========================================================================
     // ADAPTIVE MU: 1D Kalman Filter Update

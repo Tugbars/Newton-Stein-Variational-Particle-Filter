@@ -576,6 +576,11 @@ static Metrics run_svpf_on_scenario(
         filter->mu_obs_var_scale = 11.5f; // R = scale * bw²
         filter->mu_min = -4.0f;
         filter->mu_max = -1.0f;
+
+        filter->use_adaptive_guide = 1;
+        filter->guide_strength_base = 0.05f;       // Base when model fits
+        filter->guide_strength_max = 0.30f;        // Max during surprises
+        filter->guide_innovation_threshold = 1.0f; // Z-score to start boosting
     } else {
         filter->use_svld = 0;
         filter->use_annealing = 0;

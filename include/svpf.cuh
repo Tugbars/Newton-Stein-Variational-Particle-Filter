@@ -153,8 +153,9 @@ typedef struct {
     // Particle-local parameters: h_mean from previous step
     float* d_h_mean_prev;
     
-    // Guide mean (device-side for graph compatibility)
+    // Guide mean and strength (device-side for graph compatibility)
     float* d_guide_mean;
+    float* d_guide_strength;   // Adaptive guide strength
     
     // Single-step API buffers (avoid malloc in hot loop)
     float* d_y_single;
@@ -330,11 +331,23 @@ typedef struct {
     // Guide density (EKF) config
     int use_guide;          // Enable EKF guide density
     int use_guide_preserving; // Use variance-preserving guide (vs contraction)
-    float guide_strength;   // How much to pull particles toward guide (0.1-0.3)
+    float guide_strength;   // Base guide strength (0.05 default)
     float guide_mean;       // EKF posterior mean (m_t)
     float guide_var;        // EKF posterior variance (P_t)
     float guide_K;          // Kalman gain (for debugging)
     int guide_initialized;  // Whether guide has been initialized
+    
+    // =========================================================================
+    // ADAPTIVE GUIDE STRENGTH: Innovation-gated nudging
+    // =========================================================================
+    // When innovation is high (model surprised), boost guide strength to
+    // "teleport" particles toward EKF estimate. When innovation is low,
+    // use base strength to avoid over-correction.
+    int use_adaptive_guide;         // Enable adaptive guide strength (default: 0)
+    float guide_strength_base;      // Base strength when model fits (e.g., 0.05)
+    float guide_strength_max;       // Max strength during surprises (e.g., 0.30)
+    float guide_innovation_threshold; // Z-score threshold for boost (e.g., 1.0)
+    float vol_prev;                 // Previous vol estimate (for innovation calc)
     
     // =========================================================================
     // ADAPTIVE MU: 1D Kalman Filter on mean level

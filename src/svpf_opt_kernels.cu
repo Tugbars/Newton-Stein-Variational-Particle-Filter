@@ -241,16 +241,18 @@ __global__ void svpf_apply_guide_kernel(
     h[i] = clamp_logvol(h[i] + guide_strength * delta);
 }
 
+// Graph-compatible version: reads guide_mean AND guide_strength from device
 __global__ void svpf_apply_guide_kernel_graph(
     float* __restrict__ h,
     const float* __restrict__ d_guide_mean,
-    float guide_strength,
+    const float* __restrict__ d_guide_strength,  // NEW: read from device
     int n
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     
     float guide_mean = *d_guide_mean;
+    float guide_strength = *d_guide_strength;  // Read adaptive strength
     float delta = guide_mean - h[i];
     h[i] = clamp_logvol(h[i] + guide_strength * delta);
 }
@@ -274,11 +276,12 @@ __global__ void svpf_apply_guide_preserving_kernel(
     h[i] = clamp_logvol(new_mean + deviation);
 }
 
+// Graph-compatible version: reads guide_mean AND guide_strength from device
 __global__ void svpf_apply_guide_preserving_kernel_graph(
     float* __restrict__ h,
     const float* __restrict__ d_h_mean,
     const float* __restrict__ d_guide_mean,
-    float guide_strength,
+    const float* __restrict__ d_guide_strength,  // NEW: read from device
     int n
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -286,6 +289,7 @@ __global__ void svpf_apply_guide_preserving_kernel_graph(
     
     float current_mean = *d_h_mean;
     float guide_mean = *d_guide_mean;
+    float guide_strength = *d_guide_strength;  // Read adaptive strength
     float h_val = h[i];
     
     float deviation = h_val - current_mean;
