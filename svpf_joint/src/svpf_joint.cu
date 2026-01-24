@@ -27,15 +27,15 @@ SVPFJointConfig svpf_joint_default_config(void) {
     // Learning rates: h is fast, parameters are slow
     // Note: These base rates are scaled by bw² (natural gradient) in the kernel
     // sigma is additionally boosted by surprise factor during crashes
-    cfg.step_h = 0.10f;
-    cfg.step_mu = 0.01f;
-    cfg.step_rho = 0.005f;   // Let rho be stiff (dominated by prior)
-    cfg.step_sigma = 0.05f;  // Higher base rate - will be boosted during crashes
+    cfg.step_h = 0.10f;      // Back to original - needed for tracking
+    cfg.step_mu = 0.005f;    // Keep reduced for parameter stability
+    cfg.step_rho = 0.002f;   // Keep reduced - rho is stiff
+    cfg.step_sigma = 0.03f;  // Slightly increased from 0.02
     
-    // Parameter diffusion (small random walk)
-    cfg.diffusion_mu = 0.01f;
-    cfg.diffusion_rho = 0.001f;
-    cfg.diffusion_sigma = 0.005f;
+    // Parameter diffusion (small random walk) - reduced for stability
+    cfg.diffusion_mu = 0.005f;    // Reduced from 0.01
+    cfg.diffusion_rho = 0.0005f;  // Reduced from 0.001
+    cfg.diffusion_sigma = 0.002f; // Reduced from 0.005
     
     // Diversity collapse thresholds
     cfg.collapse_thresh_mu = 0.05f;
@@ -68,7 +68,7 @@ SVPFJointConfig svpf_joint_default_config(void) {
     
     // Gradient config
     cfg.lik_offset = 0.30f;
-    cfg.prior_weight = 0.01f;
+    cfg.prior_weight = 0.05f;  // Increased from 0.01 for better regularization
     
     return cfg;
 }
@@ -229,6 +229,20 @@ void svpf_joint_step(SVPFJointState* state, float y_t, SVPFJointDiagnostics* dia
     // =========================================================================
     size_t smem_size = 8 * n * sizeof(float);
     
+    // Safety check: verify shared memory doesn't exceed device limit
+    // n=512 → 16KB (fine), n=2048 → 64KB (borderline), n=4096 → 128KB (likely fails)
+    static bool smem_checked = false;
+    if (!smem_checked) {
+        int maxSmem = 0;
+        cudaDeviceGetAttribute(&maxSmem, cudaDevAttrMaxSharedMemoryPerBlock, 0);
+        if ((int)smem_size > maxSmem) {
+            fprintf(stderr, "ERROR: SVGD shared memory %zu exceeds per-block limit %d\n", 
+                    smem_size, maxSmem);
+            fprintf(stderr, "Reduce n_particles or use tiled SVGD implementation\n");
+        }
+        smem_checked = true;
+    }
+    
     for (int s = 0; s < cfg->n_stein_steps; s++) {
         // Gradient
         svpf_joint_gradient_kernel<<<grid, block, 0, stream>>>(
@@ -254,7 +268,8 @@ void svpf_joint_step(SVPFJointState* state, float y_t, SVPFJointDiagnostics* dia
         );
         
         // Stein transport (with surprise-boosted step size)
-        svpf_joint_stein_kernel<<<1, block, smem_size, stream>>>(
+        // CRITICAL: Use grid, not 1, to update ALL particles!
+        svpf_joint_stein_kernel<<<grid, block, smem_size, stream>>>(
             state->d_h,
             state->d_mu_tilde,
             state->d_rho_tilde,

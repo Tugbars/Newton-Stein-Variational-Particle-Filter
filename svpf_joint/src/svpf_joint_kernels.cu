@@ -191,44 +191,69 @@ __global__ void svpf_joint_gradient_kernel(
     float grad_h_lik = -0.5f + 0.5f * (nu + 1.0f) * A / one_plus_A - lik_offset;
     
     // =========================================================================
-    // TRANSITION GRADIENT (backward-looking: does h_j fit h_prev?)
+    // OBSERVATION SURPRISE DETECTION
     // =========================================================================
-    float h_pred = mu + rho * (h_prev_j - mu);
-    float diff = h_j - h_pred;
-    float z_sq_trans = (diff * diff) / var;
-    
-    // ∇_h
-    float grad_h_trans = -diff / var;
-    
-    // ∇_μ = (diff / σ²) * (1 - ρ)
-    float grad_mu_trans = (diff / var) * (1.0f - rho);
-    
-    // ∇_ρ̃ = (diff / σ²) * (h_prev - μ) * sigmoid'(ρ̃)
-    float grad_rho_trans = (diff / var) * (h_prev_j - mu) * sigmoid_deriv(rho);
-    
-    // ∇_σ̃ = z² - 1  (standard transition gradient)
-    float grad_sigma_trans = z_sq_trans - 1.0f;
-    
-    // =========================================================================
-    // OBSERVATION SURPRISE FORCE (forward-looking: does y fit h_prev?)
-    // =========================================================================
-    // Key insight: During crash, h_j hasn't moved yet, so z²_trans ≈ 0.
-    // The transition gradient becomes ≈ -1, which DECREASES sigma!
-    // 
-    // We need to inject the observation surprise DIRECTLY into sigma gradient.
-    // If y is huge compared to exp(h_prev), we know a regime shift is needed.
-    // This force overrides the momentary negative transition signal.
-    
     float expected_y_sq_prev = safe_exp(h_prev_j);  // Use h_PREV to gauge surprise
     float obs_z_sq = y_sq / (expected_y_sq_prev + 1e-8f);
     
-    // Observation force: if z² > 4 (2-sigma event), push sigma UP
-    // Lowered threshold from 9 (3-sigma) for faster response
-    float obs_force = 0.0f;
-    if (obs_z_sq > 4.0f) {
-        // Scale force by magnitude of surprise
-        // Slope 1.0, cap at 20.0 for strong response
-        obs_force = fminf((obs_z_sq - 4.0f) * 1.0f, 20.0f);
+    // =========================================================================
+    // VIRTUAL VARIANCE (Decoupling Motion from Learning)
+    // =========================================================================
+    // The problem: σ is small (~0.15), so the spring 1/σ² is massive (~44).
+    // Even with aggressive gating, the restoring force overwhelms likelihood.
+    // σ inflation is reactive - there's a lag before it catches up.
+    //
+    // Solution: Use DIFFERENT variances for motion vs learning.
+    // - var_learning: Real σ² (small). Used for ∇_σ so it sees the huge error.
+    // - var_motion: Virtual inflated σ² (large). Used for ∇_h so it can jump.
+    //
+    // This lets h jump immediately (virtual physics) while σ catches up (real learning).
+    
+    bool is_panic = (obs_z_sq > 9.0f);  // 3-sigma event (lowered from 16)
+    
+    // Variance for LEARNING (true state)
+    // Must use real σ so gradient sees the huge error z² >> 1
+    float var_learning = var;
+    
+    // Variance for MOTION (virtual state)
+    // If panic, pretend σ is large (loose spring) so h can jump freely
+    // Floor at 1.0 during panic (σ_virtual = 1.0 → var = 1.0)
+    float var_motion = is_panic ? fmaxf(var, 1.0f) : var;
+    
+    // =========================================================================
+    // TRANSITION GRADIENT (with virtual variance)
+    // =========================================================================
+    float h_pred = mu + rho * (h_prev_j - mu);
+    float diff = h_j - h_pred;
+    
+    // Gradient for h: Use MOTION variance (loose spring during panic)
+    // This allows h to jump to -1.0 immediately
+    float grad_h_trans = -diff / var_motion;
+    
+    // Gradients for mu, rho: Also use motion variance for consistency
+    float grad_mu_trans = (diff / var_motion) * (1.0f - rho);
+    float grad_rho_trans = (diff / var_motion) * (h_prev_j - mu) * sigmoid_deriv(rho);
+    
+    // Gradient for sigma: Use LEARNING variance (the truth!)
+    // The error z² will be massive (e.g., 100+) because we use real small σ
+    // This drives σ up hard to catch up with the virtual variance
+    float z_sq_learning = (diff * diff) / var_learning;
+    float grad_sigma_trans = z_sq_learning - 1.0f;
+    
+    // =========================================================================
+    // OBSERVATION-DRIVEN FORCE FOR SIGMA (bidirectional)
+    // =========================================================================
+    // This supplements the natural z²-1 signal during the first timesteps
+    // before h has fully jumped
+    // 
+    // Threshold at 9 (3-sigma) for crash detection
+    // Downward pressure when over-predicting variance
+    float obs_force_sigma = 0.0f;
+    if (obs_z_sq > 9.0f) {  // 3-sigma threshold
+        obs_force_sigma = fminf((obs_z_sq - 9.0f) * 0.5f, 5.0f);
+    } else if (obs_z_sq < 1.0f) {
+        // Proportional downward force when z² is smaller than expected
+        obs_force_sigma = -2.0f * (1.0f - obs_z_sq);
     }
     
     // =========================================================================
@@ -241,20 +266,23 @@ __global__ void svpf_joint_gradient_kernel(
     // =========================================================================
     // COMBINE
     // =========================================================================
+    // H gradient: likelihood + transition (using var_motion for loose spring)
+    // The virtual variance lets h follow likelihood freely during panic
     float grad_h = grad_h_lik + grad_h_trans;
+    
+    // Mu, rho: transition (using var_motion) + prior
     float grad_mu = grad_mu_trans + prior_weight * grad_mu_prior;
     float grad_rho = grad_rho_trans + prior_weight * grad_rho_prior;
     
-    // CRITICAL: Add observation force to sigma gradient
-    // Calm: obs_force = 0, uses rigorous Bayesian update (z²_trans - 1)
-    // Crash: obs_force >> 0, overrides negative transition signal
-    float grad_sigma = grad_sigma_trans + obs_force + prior_weight * grad_sigma_prior;
+    // SIGMA gradient: transition (using var_learning!) + observation force + prior
+    // Uses real small σ so z² is massive, driving rapid inflation
+    float grad_sigma = grad_sigma_trans + obs_force_sigma + prior_weight * grad_sigma_prior;
     
-    // Clip gradients
+    // Clip gradients - reduced σ clip for stability
     grad_h = fmaxf(fminf(grad_h, 10.0f), -10.0f);
     grad_mu = fmaxf(fminf(grad_mu, 5.0f), -5.0f);
     grad_rho = fmaxf(fminf(grad_rho, 5.0f), -5.0f);
-    grad_sigma = fmaxf(fminf(grad_sigma, 20.0f), -5.0f);  // Allow larger positive for crash
+    grad_sigma = fmaxf(fminf(grad_sigma, 5.0f), -5.0f);  // Reduced from 20
     
     // Store
     d_grad_h[j] = grad_h;
@@ -327,36 +355,22 @@ __global__ void svpf_joint_stein_kernel(
     float expected_y_sq_prev = expf(h_prev_j);
     float obs_z_sq = y_sq / (expected_y_sq_prev + 1e-8f);
     
-    bool is_surprise = (obs_z_sq > 4.0f);  // 2-sigma event
+    bool is_surprise = (obs_z_sq > 9.0f);  // 3-sigma event (matches gradient kernel)
     
     // =========================================================================
-    // NATURAL GRADIENT SCALING (baseline)
+    // STEP SIZE BOOST (during panic/surprise)
     // =========================================================================
-    const float bw_floor = 0.01f;
-    float ng_scale_h = bw_h * bw_h + bw_floor;
-    float ng_scale_mu = bw_mu * bw_mu + bw_floor;
-    float ng_scale_rho = bw_rho * bw_rho + bw_floor;
-    float ng_scale_sigma = bw_sigma * bw_sigma + bw_floor;
+    // h gets large boost (5x) to track the observation quickly
+    // σ gets moderate boost (3x) - balance between tracking and stability
     
-    // =========================================================================
-    // PANIC BYPASS: During surprise, IGNORE bandwidth scaling for h and sigma
-    // We want raw, uninhibited movement to escape the current state
-    // =========================================================================
-    if (is_surprise) {
-        ng_scale_h = 1.0f;      // Full speed for state
-        ng_scale_sigma = 1.0f;  // Full speed for vol-of-vol
-    }
+    float step_boost_h = is_surprise ? 5.0f : 1.0f;
+    float step_boost_sigma = is_surprise ? 3.0f : 1.0f;
     
-    // Boost factor: 5x during surprise
-    float step_boost = is_surprise ? 5.0f : 1.0f;
-    
-    // Effective step sizes 
-    // h and sigma get boosted AND bypass NG during surprise
-    // mu and rho stay slow/natural (they're harder to learn anyway)
-    float eff_step_h = step_h * ng_scale_h * step_boost;
-    float eff_step_mu = step_mu * ng_scale_mu;
-    float eff_step_rho = step_rho * ng_scale_rho;
-    float eff_step_sigma = step_sigma * ng_scale_sigma * step_boost;
+    // Effective step sizes
+    float eff_step_h = step_h * step_boost_h;
+    float eff_step_mu = step_mu;
+    float eff_step_rho = step_rho;
+    float eff_step_sigma = step_sigma * step_boost_sigma;
     
     // Precompute inverse squared bandwidths
     float inv_bw_h_sq = 1.0f / (bw_h * bw_h + 1e-8f);
@@ -377,18 +391,18 @@ __global__ void svpf_joint_stein_kernel(
         float drho = sh_rho[i] - rho_j;
         float dsigma = sh_sigma[i] - sigma_j;
         
-        // Diagonal kernel
+        // Diagonal kernel with standard RBF form: exp(-0.5 * dist²)
         float dist_sq = dh * dh * inv_bw_h_sq
                       + dmu * dmu * inv_bw_mu_sq
                       + drho * drho * inv_bw_rho_sq
                       + dsigma * dsigma * inv_bw_sigma_sq;
-        float k_ij = expf(-dist_sq);
+        float k_ij = expf(-0.5f * dist_sq);
         
-        // Kernel gradient (repulsive term)
-        float dk_dh = k_ij * 2.0f * dh * inv_bw_h_sq;
-        float dk_dmu = k_ij * 2.0f * dmu * inv_bw_mu_sq;
-        float dk_drho = k_ij * 2.0f * drho * inv_bw_rho_sq;
-        float dk_dsigma = k_ij * 2.0f * dsigma * inv_bw_sigma_sq;
+        // Kernel gradient (repulsive term) - correct sign for SVGD
+        float dk_dh = -k_ij * dh * inv_bw_h_sq;
+        float dk_dmu = -k_ij * dmu * inv_bw_mu_sq;
+        float dk_drho = -k_ij * drho * inv_bw_rho_sq;
+        float dk_dsigma = -k_ij * dsigma * inv_bw_sigma_sq;
         
         // Stein: k * grad + grad_k
         phi_h += k_ij * sh_grad_h[i] + dk_dh;
@@ -397,7 +411,8 @@ __global__ void svpf_joint_stein_kernel(
         phi_sigma += k_ij * sh_grad_sigma[i] + dk_dsigma;
     }
     
-    // Normalize
+    // Standard SVGD normalization: 1/n
+    // With fixed bandwidth, sum_k will be much larger than 1, so this is correct
     float inv_n = 1.0f / (float)n;
     phi_h *= inv_n;
     phi_mu *= inv_n;
@@ -580,11 +595,12 @@ __global__ void svpf_joint_compute_bandwidth_kernel(
         float var = s_sq * inv_n - mean * mean;
         float std_dev = sqrtf(fmaxf(var, 1e-8f));
         
-        // Bandwidth from median heuristic (approximation)
-        // bw = median / sqrt(2 * log(n))
-        // For Gaussian, median ≈ 0.6745 * std
+        // Bandwidth from median heuristic
+        // For Gaussian, median of pairwise distances ≈ 0.6745 * std
+        // REMOVED: division by sqrt(2 * log(n)) which made bandwidth too small
+        // and caused near-diagonal kernels
         float median_approx = 0.6745f * std_dev;
-        float bw = median_approx / sqrtf(2.0f * logf((float)n + 1.0f));
+        float bw = median_approx;  // Use median directly
         
         // Clamp
         bw = fmaxf(fminf(bw, 10.0f), 0.01f);
