@@ -25,10 +25,12 @@ SVPFJointConfig svpf_joint_default_config(void) {
     cfg.n_stein_steps = SVPF_JOINT_DEFAULT_STEIN_STEPS;
     
     // Learning rates: h is fast, parameters are slow
+    // Note: These base rates are scaled by bw² (natural gradient) in the kernel
+    // sigma is additionally boosted by surprise factor during crashes
     cfg.step_h = 0.10f;
     cfg.step_mu = 0.01f;
-    cfg.step_rho = 0.005f;
-    cfg.step_sigma = 0.01f;
+    cfg.step_rho = 0.005f;   // Let rho be stiff (dominated by prior)
+    cfg.step_sigma = 0.05f;  // Higher base rate - will be boosted during crashes
     
     // Parameter diffusion (small random walk)
     cfg.diffusion_mu = 0.01f;
@@ -251,7 +253,7 @@ void svpf_joint_step(SVPFJointState* state, float y_t, SVPFJointDiagnostics* dia
             n
         );
         
-        // Stein transport
+        // Stein transport (with surprise-boosted step size)
         svpf_joint_stein_kernel<<<1, block, smem_size, stream>>>(
             state->d_h,
             state->d_mu_tilde,
@@ -261,6 +263,8 @@ void svpf_joint_step(SVPFJointState* state, float y_t, SVPFJointDiagnostics* dia
             state->d_grad_mu,
             state->d_grad_rho,
             state->d_grad_sigma,
+            state->d_h_prev,  // For surprise detection
+            y_t,              // For surprise detection
             state->bw_h, state->bw_mu, state->bw_rho, state->bw_sigma,
             cfg->step_h, cfg->step_mu, cfg->step_rho, cfg->step_sigma,
             n

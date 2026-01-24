@@ -40,7 +40,7 @@ void generate_sv_data(
     auto randn = []() {
         float u1 = (rand() + 1.0f) / (RAND_MAX + 2.0f);
         float u2 = (rand() + 1.0f) / (RAND_MAX + 2.0f);
-        return sqrtf(-2.0f * logf(u1)) * cosf(2.0f * M_PI * u2);
+        return sqrtf(-2.0f * logf(u1)) * cosf(2.0f * (float)M_PI * u2);
     };
     
     // Initialize
@@ -164,7 +164,6 @@ int test_calm_tracking() {
            diag.std_mu_tilde, diag.std_rho_tilde, diag.std_sigma_tilde);
     
     // Check parameter estimates are reasonable
-    int passed = 1;
     if (fabsf(diag.rho_mean - rho_true) > 0.15f) {
         printf("  WARNING: rho estimate off by %.3f\n", fabsf(diag.rho_mean - rho_true));
         // Don't fail - learning is hard
@@ -185,7 +184,7 @@ int test_calm_tracking() {
 int test_crash_adaptation() {
     printf("\n=== TEST: Crash Adaptation ===\n");
     
-    // Generate data with regime switch
+    // Generate data with dramatic regime switch
     const int T_calm = 200;
     const int T_crash = 100;
     const int T_total = T_calm + T_crash;
@@ -193,21 +192,39 @@ int test_crash_adaptation() {
     float* y = (float*)malloc(T_total * sizeof(float));
     float* h_true = (float*)malloc(T_total * sizeof(float));
     
-    // Calm period
+    // Calm period: low vol
     generate_sv_data(y, h_true, T_calm, -3.5f, 0.95f, 0.15f, 42);
     
-    // Crash period (higher sigma)
-    float* y_crash = (float*)malloc(T_crash * sizeof(float));
-    float* h_crash = (float*)malloc(T_crash * sizeof(float));
-    generate_sv_data(y_crash, h_crash, T_crash, -1.5f, 0.90f, 0.40f, 123);
+    // DRAMATIC CRASH: Instead of generating separate SV, we'll
+    // continue from calm period but with sudden vol spike
+    // Simulate flash crash: h jumps from ~-3.5 to ~-1.0 (vol ~17% to ~60%)
     
-    // Concatenate
+    srand(123);
+    auto randn = []() {
+        float u1 = (rand() + 1.0f) / (RAND_MAX + 2.0f);
+        float u2 = (rand() + 1.0f) / (RAND_MAX + 2.0f);
+        return sqrtf(-2.0f * logf(u1)) * cosf(2.0f * (float)M_PI * u2);
+    };
+    
+    // First few crash observations: HUGE returns (the surprise)
+    float h_prev = h_true[T_calm - 1];
+    float crash_mu = -1.0f;      // Higher mean vol
+    float crash_rho = 0.85f;     // Lower persistence
+    float crash_sigma = 0.50f;   // Much higher vol-of-vol
+    
     for (int t = 0; t < T_crash; t++) {
-        y[T_calm + t] = y_crash[t];
-        h_true[T_calm + t] = h_crash[t];
+        // First 5 observations: inject extreme jumps to trigger surprise
+        if (t < 5) {
+            h_true[T_calm + t] = crash_mu + randn() * 0.5f;  // Jump to high vol
+        } else {
+            // Then standard SV dynamics at higher vol
+            h_true[T_calm + t] = crash_mu + crash_rho * (h_prev - crash_mu) + crash_sigma * randn();
+        }
+        h_prev = h_true[T_calm + t];
+        
+        float vol = expf(h_true[T_calm + t] * 0.5f);
+        y[T_calm + t] = vol * randn();
     }
-    free(y_crash);
-    free(h_crash);
     
     // Create filter
     SVPFJointConfig cfg = svpf_joint_default_config();
@@ -220,6 +237,7 @@ int test_crash_adaptation() {
     // Run and track sigma
     SVPFJointDiagnostics diag;
     float sigma_before_crash = 0.0f;
+    float sigma_peak = 0.0f;
     float sigma_during_crash = 0.0f;
     
     for (int t = 0; t < T_total; t++) {
@@ -227,22 +245,40 @@ int test_crash_adaptation() {
         
         if (t == T_calm - 1) {
             sigma_before_crash = diag.sigma_mean;
-            printf("  t=%d (before crash): sigma=%.4f, h=%.3f\n", t, diag.sigma_mean, diag.h_mean);
+            printf("  t=%d (before crash): sigma=%.4f, h=%.3f, h_true=%.3f\n", 
+                   t, diag.sigma_mean, diag.h_mean, h_true[t]);
         }
+        
+        // Track during early crash (where surprise should trigger)
+        if (t >= T_calm && t < T_calm + 20) {
+            if (diag.sigma_mean > sigma_peak) {
+                sigma_peak = diag.sigma_mean;
+            }
+            if (t == T_calm + 5) {
+                printf("  t=%d (crash+5): sigma=%.4f, h=%.3f, h_true=%.3f\n", 
+                       t, diag.sigma_mean, diag.h_mean, h_true[t]);
+            }
+        }
+        
         if (t == T_calm + 50) {
             sigma_during_crash = diag.sigma_mean;
-            printf("  t=%d (during crash): sigma=%.4f, h=%.3f\n", t, diag.sigma_mean, diag.h_mean);
+            printf("  t=%d (crash+50): sigma=%.4f, h=%.3f, h_true=%.3f\n", 
+                   t, diag.sigma_mean, diag.h_mean, h_true[t]);
         }
     }
     
     printf("  Final: sigma=%.4f, h=%.3f\n", diag.sigma_mean, diag.h_mean);
-    printf("  Sigma inflation: %.2fx\n", sigma_during_crash / (sigma_before_crash + 1e-6f));
+    printf("  Peak sigma during crash: %.4f\n", sigma_peak);
+    printf("  Sigma inflation (peak): %.2fx\n", sigma_peak / (sigma_before_crash + 1e-6f));
+    printf("  Sigma inflation (t+50): %.2fx\n", sigma_during_crash / (sigma_before_crash + 1e-6f));
     
     // Check that sigma increased during crash
-    if (sigma_during_crash > sigma_before_crash * 1.2f) {
+    if (sigma_peak > sigma_before_crash * 1.5f) {
         printf("  SUCCESS: sigma inflated during crash\n");
+    } else if (sigma_peak > sigma_before_crash * 1.2f) {
+        printf("  PARTIAL: sigma inflated somewhat\n");
     } else {
-        printf("  NOTE: sigma didn't inflate much (expected in short crash)\n");
+        printf("  FAIL: sigma didn't inflate enough\n");
     }
     
     svpf_joint_destroy(state);

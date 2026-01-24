@@ -272,6 +272,8 @@ __global__ void svpf_joint_stein_kernel(
     const float* __restrict__ d_grad_mu,
     const float* __restrict__ d_grad_rho,
     const float* __restrict__ d_grad_sigma,
+    const float* __restrict__ d_h_prev,  // For surprise detection
+    float y_t,  // For surprise detection
     float bw_h, float bw_mu, float bw_rho, float bw_sigma,
     float step_h, float step_mu, float step_rho, float step_sigma,
     int n
