@@ -205,29 +205,39 @@ __global__ void svpf_joint_gradient_kernel(
     //
     // Solution: Use DIFFERENT variances for motion vs learning.
     // - var_learning: Real σ² (small). Used for ∇_σ so it sees the huge error.
-    // - var_motion: Virtual inflated σ² (large). Used for ∇_h so it can jump.
+    // - var_motion: Virtual inflated σ² (smoothly scaled). Used for ∇_h.
     //
-    // This lets h jump immediately (virtual physics) while σ catches up (real learning).
-    
-    bool is_panic = (obs_z_sq > 9.0f);  // 3-sigma event (lowered from 16)
+    // KEY CHANGE: Smooth inflation with higher threshold to avoid calm drift.
     
     // Variance for LEARNING (true state)
     // Must use real σ so gradient sees the huge error z² >> 1
     float var_learning = var;
     
-    // Variance for MOTION (virtual state)
-    // If panic, pretend σ is large (loose spring) so h can jump freely
-    // Floor at 1.0 during panic (σ_virtual = 1.0 → var = 1.0)
-    float var_motion = is_panic ? fmaxf(var, 1.0f) : var;
+    // Variance for MOTION (smoothly inflated based on surprise)
+    // 1. Always keep a minimum floor (prevents tiny σ => iron spring)
+    const float var_floor = 0.03f * 0.03f;  // σ_floor = 0.03
+    
+    // 2. Gradual inflation: only inflate when obs_z_sq > 4 (2-sigma)
+    //    This prevents casual excursions from loosening the spring too much
+    float surprise = fmaxf(obs_z_sq - 4.0f, 0.0f);  // Raised from 1.0
+    float inflate = 1.0f + 0.3f * fminf(surprise, 20.0f);  // Reduced gain from 0.5
+    
+    // 3. Apply inflation to real variance, then floor
+    float var_motion = fmaxf(var * inflate, var_floor);
+    
+    // 4. Strong panic floor for extreme events
+    bool is_panic = (obs_z_sq > 9.0f);
+    if (is_panic) {
+        var_motion = fmaxf(var_motion, 1.0f);
+    }
     
     // =========================================================================
-    // TRANSITION GRADIENT (with virtual variance)
+    // TRANSITION GRADIENT (with smoothly inflated variance)
     // =========================================================================
     float h_pred = mu + rho * (h_prev_j - mu);
     float diff = h_j - h_pred;
     
-    // Gradient for h: Use MOTION variance (loose spring during panic)
-    // This allows h to jump to -1.0 immediately
+    // Gradient for h: Use MOTION variance (looser spring allows tracking)
     float grad_h_trans = -diff / var_motion;
     
     // Gradients for mu, rho: Also use motion variance for consistency
@@ -243,18 +253,23 @@ __global__ void svpf_joint_gradient_kernel(
     // =========================================================================
     // OBSERVATION-DRIVEN FORCE FOR SIGMA (bidirectional)
     // =========================================================================
-    // This supplements the natural z²-1 signal during the first timesteps
-    // before h has fully jumped
+    // This supplements the natural z²-1 signal
     // 
     // Threshold at 9 (3-sigma) for crash detection
-    // Downward pressure when over-predicting variance
+    // ASYMMETRIC: Strong upward during crash, moderate downward in calm
     float obs_force_sigma = 0.0f;
-    if (obs_z_sq > 9.0f) {  // 3-sigma threshold
+    if (obs_z_sq > 9.0f) {
         obs_force_sigma = fminf((obs_z_sq - 9.0f) * 0.5f, 5.0f);
-    } else if (obs_z_sq < 1.0f) {
-        // Proportional downward force when z² is smaller than expected
-        obs_force_sigma = -2.0f * (1.0f - obs_z_sq);
+    } else if (obs_z_sq < 1.5f) {
+        // When observations are consistent with current h, push σ down
+        // Stronger than before to counteract upward drift
+        obs_force_sigma = -1.0f * (1.5f - obs_z_sq);  // Max -1.5 when z²=0
     }
+    
+    // Mean reversion: pull sigma_tilde toward prior mean
+    // This prevents runaway growth in σ - increased strength
+    const float sigma_mean_reversion = 0.2f;  // Increased from 0.1
+    float sigma_mr_force = -sigma_mean_reversion * (sigma_tilde - sigma_prior_mean);
     
     // =========================================================================
     // PRIOR GRADIENT (weak regularization)
@@ -274,15 +289,17 @@ __global__ void svpf_joint_gradient_kernel(
     float grad_mu = grad_mu_trans + prior_weight * grad_mu_prior;
     float grad_rho = grad_rho_trans + prior_weight * grad_rho_prior;
     
-    // SIGMA gradient: transition (using var_learning!) + observation force + prior
-    // Uses real small σ so z² is massive, driving rapid inflation
-    float grad_sigma = grad_sigma_trans + obs_force_sigma + prior_weight * grad_sigma_prior;
+    // SIGMA gradient: transition + observation force + mean reversion + prior
+    // Mean reversion prevents runaway σ growth
+    float grad_sigma = grad_sigma_trans + obs_force_sigma + sigma_mr_force 
+                     + prior_weight * grad_sigma_prior;
     
-    // Clip gradients - reduced σ clip for stability
+    // Clip gradients - panic-dependent σ clip for responsiveness during crash
     grad_h = fmaxf(fminf(grad_h, 10.0f), -10.0f);
     grad_mu = fmaxf(fminf(grad_mu, 5.0f), -5.0f);
     grad_rho = fmaxf(fminf(grad_rho, 5.0f), -5.0f);
-    grad_sigma = fmaxf(fminf(grad_sigma, 5.0f), -5.0f);  // Reduced from 20
+    float sigma_clip_hi = is_panic ? 10.0f : 5.0f;
+    grad_sigma = fmaxf(fminf(grad_sigma, sigma_clip_hi), -5.0f);
     
     // Store
     d_grad_h[j] = grad_h;
@@ -361,10 +378,10 @@ __global__ void svpf_joint_stein_kernel(
     // STEP SIZE BOOST (during panic/surprise)
     // =========================================================================
     // h gets large boost (5x) to track the observation quickly
-    // σ gets moderate boost (3x) - balance between tracking and stability
+    // σ gets moderate-high boost (4x) for faster inflation during crash
     
     float step_boost_h = is_surprise ? 5.0f : 1.0f;
-    float step_boost_sigma = is_surprise ? 3.0f : 1.0f;
+    float step_boost_sigma = is_surprise ? 4.0f : 1.0f;
     
     // Effective step sizes
     float eff_step_h = step_h * step_boost_h;
@@ -391,18 +408,22 @@ __global__ void svpf_joint_stein_kernel(
         float drho = sh_rho[i] - rho_j;
         float dsigma = sh_sigma[i] - sigma_j;
         
-        // Diagonal kernel with standard RBF form: exp(-0.5 * dist²)
+        // IMQ (Inverse Multi-Quadratic) kernel: K = 1/(1 + dist²)
+        // Heavier tails than RBF, better for SVGD (from svpf_opt)
         float dist_sq = dh * dh * inv_bw_h_sq
                       + dmu * dmu * inv_bw_mu_sq
                       + drho * drho * inv_bw_rho_sq
                       + dsigma * dsigma * inv_bw_sigma_sq;
-        float k_ij = expf(-0.5f * dist_sq);
+        float base = 1.0f + dist_sq;
+        float k_ij = 1.0f / base;
+        float k_sq = k_ij * k_ij;
         
-        // Kernel gradient (repulsive term) - correct sign for SVGD
-        float dk_dh = -k_ij * dh * inv_bw_h_sq;
-        float dk_dmu = -k_ij * dmu * inv_bw_mu_sq;
-        float dk_drho = -k_ij * drho * inv_bw_rho_sq;
-        float dk_dsigma = -k_ij * dsigma * inv_bw_sigma_sq;
+        // Kernel gradient (repulsive term) for IMQ
+        // dK/dx = -2 * diff / bw² * K²
+        float dk_dh = -2.0f * dh * inv_bw_h_sq * k_sq;
+        float dk_dmu = -2.0f * dmu * inv_bw_mu_sq * k_sq;
+        float dk_drho = -2.0f * drho * inv_bw_rho_sq * k_sq;
+        float dk_dsigma = -2.0f * dsigma * inv_bw_sigma_sq * k_sq;
         
         // Stein: k * grad + grad_k
         phi_h += k_ij * sh_grad_h[i] + dk_dh;
@@ -412,7 +433,6 @@ __global__ void svpf_joint_stein_kernel(
     }
     
     // Standard SVGD normalization: 1/n
-    // With fixed bandwidth, sum_k will be much larger than 1, so this is correct
     float inv_n = 1.0f / (float)n;
     phi_h *= inv_n;
     phi_mu *= inv_n;
@@ -595,15 +615,14 @@ __global__ void svpf_joint_compute_bandwidth_kernel(
         float var = s_sq * inv_n - mean * mean;
         float std_dev = sqrtf(fmaxf(var, 1e-8f));
         
-        // Bandwidth from median heuristic
-        // For Gaussian, median of pairwise distances ≈ 0.6745 * std
-        // REMOVED: division by sqrt(2 * log(n)) which made bandwidth too small
-        // and caused near-diagonal kernels
-        float median_approx = 0.6745f * std_dev;
-        float bw = median_approx;  // Use median directly
+        // Bandwidth using Silverman's rule (like svpf_opt)
+        // bw² = 2 * variance / log(n + 1)
+        float bw_sq = 2.0f * var / logf((float)n + 1.0f);
+        bw_sq = fmaxf(bw_sq, 1e-6f);
+        float bw = sqrtf(bw_sq);
         
         // Clamp
-        bw = fmaxf(fminf(bw, 10.0f), 0.01f);
+        bw = fmaxf(fminf(bw, 2.0f), 0.01f);
         
         d_output[0] = mean;
         d_output[1] = var;

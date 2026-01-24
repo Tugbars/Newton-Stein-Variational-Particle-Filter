@@ -27,10 +27,10 @@ SVPFJointConfig svpf_joint_default_config(void) {
     // Learning rates: h is fast, parameters are slow
     // Note: These base rates are scaled by bw² (natural gradient) in the kernel
     // sigma is additionally boosted by surprise factor during crashes
-    cfg.step_h = 0.10f;      // Back to original - needed for tracking
+    cfg.step_h = 0.15f;      // Increased from 0.10 for better h tracking
     cfg.step_mu = 0.005f;    // Keep reduced for parameter stability
     cfg.step_rho = 0.002f;   // Keep reduced - rho is stiff
-    cfg.step_sigma = 0.03f;  // Slightly increased from 0.02
+    cfg.step_sigma = 0.03f;  // Keep current level
     
     // Parameter diffusion (small random walk) - reduced for stability
     cfg.diffusion_mu = 0.005f;    // Reduced from 0.01
@@ -67,7 +67,7 @@ SVPFJointConfig svpf_joint_default_config(void) {
     cfg.student_t_implied_offset = -expected_log_t_sq;
     
     // Gradient config
-    cfg.lik_offset = 0.30f;
+    cfg.lik_offset = 0.10f;  // Reduced from 0.30 - allow stronger likelihood pull
     cfg.prior_weight = 0.05f;  // Increased from 0.01 for better regularization
     
     return cfg;
