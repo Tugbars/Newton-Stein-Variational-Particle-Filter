@@ -177,18 +177,28 @@ __global__ void svpf_joint_gradient_kernel(
     // =========================================================================
     // LIKELIHOOD GRADIENT (affects h only)
     // =========================================================================
+    // Two options:
+    // 1. Exact Student-t: saturates at ~±5 for large deviations ("volcano")
+    // 2. Log-squared surrogate: linear, never saturates, from 1D SVPF
+    //
+    // The log-squared surrogate provides a "parabolic bowl" that always
+    // pulls particles toward the observation, even from far away.
+    
     float y_sq = y_t * y_t;
     float vol = safe_exp(h_j);
     float scaled_y_sq = y_sq / (vol + 1e-8f);
     float A = scaled_y_sq / nu;
     float one_plus_A = 1.0f + A;
     
-    // Log-weight for ESS
+    // Log-weight for ESS (always exact Student-t for proper importance weights)
     d_log_w[j] = student_t_const - 0.5f * h_j 
                - (nu + 1.0f) * 0.5f * log1pf(fmaxf(A, -0.999f));
     
-    // Exact Student-t gradient with bias correction
-    float grad_h_lik = -0.5f + 0.5f * (nu + 1.0f) * A / one_plus_A - lik_offset;
+    // Likelihood gradient: USE LOG-SQUARED SURROGATE (from 1D SVPF)
+    // This is linear and doesn't saturate, giving better tracking
+    float log_y2 = logf(y_sq + 1e-10f);
+    const float R_noise = 1.4f;  // Observation noise variance
+    float grad_h_lik = (log_y2 - h_j + lik_offset) / R_noise;
     
     // =========================================================================
     // OBSERVATION SURPRISE DETECTION
@@ -228,25 +238,29 @@ __global__ void svpf_joint_gradient_kernel(
     // 4. Strong panic floor for extreme events
     bool is_panic = (obs_z_sq > 9.0f);
     if (is_panic) {
-        var_motion = fmaxf(var_motion, 1.0f);
+        var_motion = fmaxf(var_motion, 1.0f);  // Back to 1.0
     }
     
+    // Transition weight: reduce transition influence during panic
+    // This lets the likelihood dominate when observations are surprising
+    float trans_weight = is_panic ? 0.3f : 1.0f;
+    
     // =========================================================================
-    // TRANSITION GRADIENT (with smoothly inflated variance)
+    // TRANSITION GRADIENT (with smoothly inflated variance and gating)
     // =========================================================================
     float h_pred = mu + rho * (h_prev_j - mu);
     float diff = h_j - h_pred;
     
-    // Gradient for h: Use MOTION variance (looser spring allows tracking)
-    float grad_h_trans = -diff / var_motion;
+    // Gradient for h: Use MOTION variance, scaled by trans_weight during panic
+    // This lets likelihood dominate when model is falsified
+    float grad_h_trans = trans_weight * (-diff / var_motion);
     
-    // Gradients for mu, rho: Also use motion variance for consistency
-    float grad_mu_trans = (diff / var_motion) * (1.0f - rho);
-    float grad_rho_trans = (diff / var_motion) * (h_prev_j - mu) * sigmoid_deriv(rho);
+    // Gradients for mu, rho: Also use motion variance, gated
+    float grad_mu_trans = trans_weight * (diff / var_motion) * (1.0f - rho);
+    float grad_rho_trans = trans_weight * (diff / var_motion) * (h_prev_j - mu) * sigmoid_deriv(rho);
     
-    // Gradient for sigma: Use LEARNING variance (the truth!)
-    // The error z² will be massive (e.g., 100+) because we use real small σ
-    // This drives σ up hard to catch up with the virtual variance
+    // Gradient for sigma: Use LEARNING variance (the truth!) - NOT gated
+    // We want σ to learn from the true errors
     float z_sq_learning = (diff * diff) / var_learning;
     float grad_sigma_trans = z_sq_learning - 1.0f;
     
@@ -379,13 +393,15 @@ __global__ void svpf_joint_stein_kernel(
     // =========================================================================
     // h gets large boost (5x) to track the observation quickly
     // σ gets moderate-high boost (4x) for faster inflation during crash
+    // μ gets modest boost (2x) to allow regime adaptation
     
     float step_boost_h = is_surprise ? 5.0f : 1.0f;
     float step_boost_sigma = is_surprise ? 4.0f : 1.0f;
+    float step_boost_mu = is_surprise ? 2.0f : 1.0f;
     
     // Effective step sizes
     float eff_step_h = step_h * step_boost_h;
-    float eff_step_mu = step_mu;
+    float eff_step_mu = step_mu * step_boost_mu;
     float eff_step_rho = step_rho;
     float eff_step_sigma = step_sigma * step_boost_sigma;
     
@@ -432,12 +448,28 @@ __global__ void svpf_joint_stein_kernel(
         phi_sigma += k_ij * sh_grad_sigma[i] + dk_dsigma;
     }
     
-    // Standard SVGD normalization: 1/n
-    float inv_n = 1.0f / (float)n;
-    phi_h *= inv_n;
-    phi_mu *= inv_n;
-    phi_rho *= inv_n;
-    phi_sigma *= inv_n;
+    // Normalize by kernel mass instead of 1/n
+    // This preserves gradient magnitude when kernel is near-diagonal
+    // Cap sum_k to prevent over-amplification
+    float sum_k = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float dh = sh_h[i] - h_j;
+        float dmu = sh_mu[i] - mu_j;
+        float drho = sh_rho[i] - rho_j;
+        float dsigma = sh_sigma[i] - sigma_j;
+        float dist_sq = dh * dh * inv_bw_h_sq
+                      + dmu * dmu * inv_bw_mu_sq
+                      + drho * drho * inv_bw_rho_sq
+                      + dsigma * dsigma * inv_bw_sigma_sq;
+        sum_k += 1.0f / (1.0f + dist_sq);
+    }
+    // Floor at 32 to prevent over-amplification, cap at n for standard behavior
+    float norm = fmaxf(fminf(sum_k, (float)n), 32.0f);
+    float inv_norm = 1.0f / norm;
+    phi_h *= inv_norm;
+    phi_mu *= inv_norm;
+    phi_rho *= inv_norm;
+    phi_sigma *= inv_norm;
     
     // Apply update with effective learning rates
     d_h[j] = clamp_h(h_j + eff_step_h * phi_h);
