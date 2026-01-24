@@ -4,9 +4,9 @@
 
 A closed-loop system where:
 - **SVPF** tracks volatility h (fast, robust, handles everything)
-- **Gradient feedback** slowly adjusts θ = (μ, ρ, σ) to match what SVPF is doing
+- **Natural gradient feedback** slowly adjusts θ = (μ, ρ, σ, ν) to match what SVPF is doing
 
-No oracle. No batch inference. No memory. Just negative feedback like an AGC.
+No oracle. No batch inference. No memory. Just negative feedback like an AGC, with Fisher-preconditioned updates for automatic parameter scaling.
 
 ---
 
@@ -302,7 +302,7 @@ Otherwise, self-tuning SVPF is the sweet spot.
 │    │                                                     │     │
 │    │   SVPF (fast loop, ~100μs)                         │     │
 │    │                                                     │     │
-│    │   • Student-t likelihood (crash robust)            │     │
+│    │   • Student-t likelihood (ν controls tail weight)  │     │
 │    │   • Stein transport (diversity, fast adaptation)   │     │
 │    │   • Particles embody "where h actually is"         │     │
 │    │   • Handles 99% of the work                        │     │
@@ -315,16 +315,17 @@ Otherwise, self-tuning SVPF is the sweet spot.
 │                           ▼                                     │
 │    ┌─────────────────────────────────────────────────────┐     │
 │    │                                                     │     │
-│    │   Gradient Feedback (slow loop)                    │     │
+│    │   Natural Gradient Feedback (slow loop)            │     │
 │    │                                                     │     │
 │    │   • Measures: particles - prediction               │     │
-│    │   • Computes: ∇θ log p(h_t | h_{t-1}, θ)          │     │
-│    │   • Updates: θ += lr · gradient                    │     │
+│    │   • Computes: ∇θ log p (transition + observation)  │     │
+│    │   • Fisher matrix F = E[g gᵀ] (4×4)               │     │
+│    │   • Updates: θ += lr · F⁻¹ · gradient             │     │
 │    │   • State machine: SHOCK → RECOVERY → CALM         │     │
 │    │                                                     │     │
 │    └──────────────────────┬──────────────────────────────┘     │
 │                           │                                     │
-│                           │ θ = (μ, ρ, σ)                      │
+│                           │ θ = (μ, ρ, σ, ν)                   │
 │                           ▼                                     │
 │                      back to SVPF                               │
 │                                                                 │
@@ -335,59 +336,104 @@ Otherwise, self-tuning SVPF is the sweet spot.
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+### 4.1 The Four Parameters
+
+| Parameter | Symbol | Unconstrained | Range | What It Controls |
+|-----------|--------|---------------|-------|------------------|
+| Mean level | μ | μ directly | ℝ | Long-run volatility level |
+| Persistence | ρ | η = atanh(ρ) | (-1, 1) | Mean reversion speed |
+| Vol-of-vol | σ | κ = log(σ) | (0, ∞) | Transition noise |
+| Tail weight | ν | κ_ν = log(ν-2) | (2, ∞) | Crash robustness |
+
+**Why ν matters:**
+```
+ν = 3:   Very heavy tails → survives extreme crashes, inefficient in calm
+ν = 5:   Heavy tails → good default
+ν = 10:  Moderate tails
+ν = 30:  Almost Gaussian → efficient but fragile
+
+Market regimes want different ν. Learning it automatically adapts.
+```
+
 ---
 
 ## 5. What The Gradient Measures
 
-### 5.1 The Transition Model
+### 5.1 The Model
 
 ```
-h_t = μ + ρ·(h_{t-1} - μ) + σ·noise
-      ├────────────────────┤
-            prediction
+Transition:    h_t = μ + ρ·(h_{t-1} - μ) + σ·noise
+Observation:   y_t | h_t ~ Student-t(0, exp(h_t/2), ν)
 ```
+
+Total log-likelihood gradient:
+```
+∇θ log p(y,h|θ) = ∇θ log p(h_t|h_{t-1}, μ,ρ,σ)  +  ∇θ log p(y_t|h_t, ν)
+                  └───────── transition ─────────┘   └─── observation ───┘
+```
+
+### 5.2 Transition Gradients (μ, ρ, σ)
 
 Prediction error:
 ```
-ε = h_t - prediction = h_t - μ - ρ·(h_{t-1} - μ)
+ε = h_t - μ - ρ·(h_{t-1} - μ)
 ```
 
-### 5.2 Blame Assignment
-
-The gradient asks: "If ε is big, which parameter is wrong?"
-
+**μ (mean level):**
 ```
-μ (mean level):
-  "Are particles systematically above or below prediction?"
-  
-  Particles here:    ●●●●●
-  Prediction here:         ○
-  
-  ε > 0 consistently → raise μ
-  ε < 0 consistently → lower μ
-  
-  Gradient: ∂/∂μ = ε·(1-ρ) / σ²
+"Are particles systematically above or below prediction?"
 
+ε > 0 consistently → raise μ
+ε < 0 consistently → lower μ
 
-ρ (persistence):  
-  "Do particles mean-revert faster or slower than predicted?"
-  
-  If h_{t-1} was high and h_t didn't drop as much as predicted:
-  → ρ is too low, raise it
-  
-  Gradient: ∂/∂ρ = ε·(h_{t-1} - μ) / σ²
-
-
-σ (volatility):
-  "Is actual scatter bigger or smaller than predicted?"
-  
-  |ε|² > σ² consistently → raise σ (more noise than expected)
-  |ε|² < σ² consistently → lower σ (less noise than expected)
-  
-  Gradient: ∂/∂σ = -1/σ + ε²/σ³
+Gradient: ∂/∂μ = ε·(1-ρ) / σ²
 ```
 
-### 5.3 Direct Measurement, Not Inference
+**ρ (persistence):**
+```
+"Do particles mean-revert faster or slower than predicted?"
+
+If h_{t-1} was high and h_t didn't drop as much as predicted:
+→ ρ is too low, raise it
+
+Gradient: ∂/∂ρ = ε·(h_{t-1} - μ) / σ²
+```
+
+**σ (volatility):**
+```
+"Is actual scatter bigger or smaller than predicted?"
+
+|ε|² > σ² consistently → raise σ
+|ε|² < σ² consistently → lower σ
+
+Gradient: ∂/∂σ = -1/σ + ε²/σ³
+```
+
+### 5.3 Observation Gradient (ν)
+
+Student-t log-likelihood:
+```
+log p(y|h,ν) = log Γ((ν+1)/2) - log Γ(ν/2) - ½log(ν) - h/2 
+             - ((ν+1)/2) · log(1 + z²/ν)
+
+where z = y / exp(h/2)
+```
+
+**ν (tail weight):**
+```
+"How heavy should the tails be?"
+
+Large |z| (crash) with high ν → low likelihood → "ν too high"
+Large |z| (crash) with low ν  → okay likelihood → "ν is right"
+
+Gradient: ∂/∂ν = ½[ψ((ν+1)/2) - ψ(ν/2) - 1/ν - log(1+z²/ν) + (ν+1)z²/(ν(ν+z²))]
+
+where ψ = digamma function
+```
+
+**Key insight:** ν gradient is only informative during crashes (large |z|). In calm markets, all ν give similar likelihood. The Fisher matrix captures this: F_νν is large during crashes, small during calm.
+
+### 5.4 Direct Measurement, Not Inference
 
 ```
 BATCH LEARNER:
@@ -396,6 +442,7 @@ BATCH LEARNER:
   
 AGC GRADIENT:
   "Right now, are particles where θ predicts?"
+  "Right now, does ν explain the observation?"
   → Direct measurement, no lag
 ```
 
@@ -473,23 +520,92 @@ If SVPF resamples only when ESS low, must use weights.
 
 ### 6.4 Stable Parameterization
 
-Direct ρ, σ have boundary issues (clamp artifacts). Use unconstrained:
+Direct ρ, σ, ν have boundary issues (clamp artifacts). Use unconstrained:
 
 ```
-ρ = tanh(η)     η ∈ (-∞, +∞)  →  ρ ∈ (-1, 1)
-σ = exp(κ)      κ ∈ (-∞, +∞)  →  σ ∈ (0, +∞)
+ρ = tanh(η)         η ∈ (-∞, +∞)  →  ρ ∈ (-1, 1)
+σ = exp(κ)          κ ∈ (-∞, +∞)  →  σ ∈ (0, +∞)
+ν = 2 + exp(κ_ν)    κ_ν ∈ (-∞, +∞) →  ν ∈ (2, +∞)
 ```
 
-Update η, κ instead of ρ, σ:
+Update η, κ, κ_ν instead of ρ, σ, ν:
 ```cpp
 // Chain rule
-d_eta = d_rho * (1 - rho*rho)   // tanh derivative
-d_kappa = d_sigma * sigma        // exp derivative
+d_eta = d_rho * (1 - rho*rho)     // tanh derivative
+d_kappa = d_sigma * sigma          // exp derivative  
+d_kappa_nu = d_nu * (nu - 2)       // exp derivative (shifted)
 ```
 
 No boundaries. Smooth everywhere.
 
-### 6.5 Crash Handling: State Machine
+### 6.5 Natural Gradient (Fisher Preconditioning)
+
+**Problem with plain gradient:**
+```
+∇μ = 0.5      (μ is around -2)
+∇ρ = 0.001    (ρ is around 0.95)  
+∇σ = 2.0      (σ is around 0.15)
+∇ν = 0.01     (ν is around 5)
+
+With same learning rate: parameters fight each other.
+Need 4 separate learning rates? No - use Natural Gradient.
+```
+
+**Solution:** Fisher Information Matrix
+```
+F = E[(∇log p)(∇log p)ᵀ]    (4×4 matrix)
+
+F⁻¹∇ = gradient in "natural coordinates"
+     = automatically scaled by curvature
+```
+
+**Why it works:**
+- Steep direction (high F) → small step (already sensitive)
+- Flat direction (low F) → large step (need more movement)
+- Correlations handled (μ-ρ interaction, σ-ν interaction)
+- **Single learning rate for all parameters**
+
+**Implementation:**
+```cpp
+// Accumulate Fisher from particles (outer product of gradients)
+float F[4][4] = {0};
+for (int i = 0; i < N; i++) {
+    float g[4] = {grad_mu[i], grad_eta[i], grad_kappa[i], grad_kappa_nu[i]};
+    for (int j = 0; j < 4; j++)
+        for (int k = 0; k < 4; k++)
+            F[j][k] += W[i] * g[j] * g[k];
+}
+
+// Regularize (prevent singularity)
+for (int j = 0; j < 4; j++) F[j][j] += 1e-4f;
+
+// Invert 4×4 (~100 FLOPs, negligible)
+float F_inv[4][4];
+invert_4x4(F, F_inv);
+
+// Natural gradient
+float nat_grad[4] = {0};
+for (int j = 0; j < 4; j++)
+    for (int k = 0; k < 4; k++)
+        nat_grad[j] += F_inv[j][k] * mean_grad[k];
+
+// Single learning rate works for all!
+theta += lr * nat_grad;
+```
+
+**Cost:** ~100 FLOPs for 4×4 inverse. Negligible.
+
+**Fisher correlations that matter:**
+```
+F_σν:  σ and ν interact (both explain spread)
+       High σ + high ν ≈ Low σ + low ν
+       Natural gradient handles this automatically
+
+F_μρ:  μ and ρ interact (both affect mean behavior)
+       Natural gradient prevents them fighting
+```
+
+### 6.7 Crash Handling: State Machine
 
 During crashes, gradients are garbage (SVPF is stressed, particles scattered).
 
@@ -521,7 +637,7 @@ Action: │Freeze │Catch up  │Normal│
 - ESS (if you resample)
 - Guide strength (if actively forcing state)
 
-### 6.6 CUDA Graph Compatibility
+### 6.8 CUDA Graph Compatibility
 
 **Problem:** Your SVPF uses CUDA graph capture. You recapture when μ drifts >0.1 or σ_z >0.05. A θ-tuner updating every tick will constantly invalidate the graph.
 
@@ -529,10 +645,10 @@ Action: │Freeze │Catch up  │Normal│
 
 ```cpp
 // Instead of:
-kernel<<<...>>>(mu, rho, sigma);  // Captured at graph time = BAD
+kernel<<<...>>>(mu, rho, sigma, nu);  // Captured at graph time = BAD
 
 // Do:
-__device__ float d_mu, d_rho, d_sigma;  // Device globals
+__device__ float d_mu, d_rho, d_sigma, d_nu;  // Device globals
 
 kernel<<<...>>>();  // Reads d_mu etc. inside = GOOD
 // Update d_mu from host without recapture
@@ -540,15 +656,16 @@ kernel<<<...>>>();  // Reads d_mu etc. inside = GOOD
 
 This is the **single biggest integration issue** for online θ adaptation with CUDA graphs.
 
-### 6.7 Regularization (Soft Prior / "Soft Oracle")
+### 6.9 Regularization (Soft Prior / "Soft Oracle")
 
 To prevent θ from wandering and improve identifiability, add a prior term:
 
 ```cpp
 // Add to gradient (pulls toward baseline)
-grad_mu    += prior_weight * (mu_prior - theta.mu);
-grad_eta   += prior_weight * (eta_prior - theta.eta);  
-grad_kappa += prior_weight * (kappa_prior - theta.kappa);
+grad_mu       += prior_weight * (mu_prior - theta.mu);
+grad_eta      += prior_weight * (eta_prior - theta.eta);  
+grad_kappa    += prior_weight * (kappa_prior - theta.kappa);
+grad_kappa_nu += prior_weight * (kappa_nu_prior - theta.kappa_nu);
 ```
 
 This is equivalent to:
@@ -567,29 +684,53 @@ Especially helpful when multiple θ configurations explain similar h-behavior.
 //  DATA STRUCTURES
 // ═══════════════════════════════════════════════════════════════
 
-// Unconstrained parameterization
+// Unconstrained parameterization (4 parameters)
 struct Theta {
-    float mu;      // Mean level (unbounded)
-    float eta;     // ρ = tanh(η)
-    float kappa;   // σ = exp(κ)
+    float mu;       // μ directly (unbounded)
+    float eta;      // ρ = tanh(η)
+    float kappa;    // σ = exp(κ)
+    float kappa_nu; // ν = 2 + exp(κ_ν)
     
     float rho() const { return tanhf(eta); }
     float sigma() const { return expf(kappa); }
+    float nu() const { return 2.0f + expf(kappa_nu); }
 };
 
 enum State { SHOCK, RECOVERY, CALM };
 
-struct GradientTuner {
+struct NaturalGradientTuner {
     Theta theta;
     State state = CALM;
     int ticks_in_state = 0;
     
-    // RMSProp
-    float v_mu = 0, v_eta = 0, v_kappa = 0;
-    float decay = 0.99f;
-    float eps = 1e-6f;
-    float base_lr = 0.001f;
+    // Fisher matrix (EMA smoothed)
+    float F[4][4] = {0};
+    float F_ema_decay = 0.95f;
+    float F_reg = 1e-4f;  // Regularization for invertibility
+    
+    float base_lr = 0.01f;  // Can be larger with natural gradient!
 };
+
+// ═══════════════════════════════════════════════════════════════
+//  HELPER: 4x4 MATRIX INVERSE (Cramer's rule or LU, ~100 FLOPs)
+// ═══════════════════════════════════════════════════════════════
+
+void invert_4x4(const float A[4][4], float A_inv[4][4]);  // Implementation omitted
+
+// ═══════════════════════════════════════════════════════════════
+//  HELPER: DIGAMMA FUNCTION (for ν gradient)
+// ═══════════════════════════════════════════════════════════════
+
+__host__ __device__ float digamma(float x) {
+    // Approximation valid for x > 0
+    float result = 0.0f;
+    while (x < 6.0f) {
+        result -= 1.0f / x;
+        x += 1.0f;
+    }
+    result += logf(x) - 0.5f/x - 1.0f/(12.0f*x*x);
+    return result;
+}
 
 // ═══════════════════════════════════════════════════════════════
 //  MAIN LOOP (per tick)
@@ -597,7 +738,7 @@ struct GradientTuner {
 
 void tick(
     SVPF* svpf,
-    GradientTuner* tuner,
+    NaturalGradientTuner* tuner,
     float y_t
 ) {
     // ─────────────────────────────────────────────────────────
@@ -610,11 +751,11 @@ void tick(
     // 2. SVPF STEP (unchanged, does all the real work)
     // ─────────────────────────────────────────────────────────
     svpf_step(svpf, y_t, tuner->theta.mu, 
-              tuner->theta.rho(), tuner->theta.sigma());
+              tuner->theta.rho(), tuner->theta.sigma(), tuner->theta.nu());
     
     // svpf now contains:
     //   h[N]         - current particles
-    //   ancestor[N]  - parent indices
+    //   ancestor[N]  - parent indices (if resampling)
     //   W[N]         - normalized weights
     
     // ─────────────────────────────────────────────────────────
@@ -622,7 +763,7 @@ void tick(
     // ─────────────────────────────────────────────────────────
     float h_mean = weighted_mean(svpf->h, svpf->W, N);
     float vol = expf(h_mean * 0.5f);
-    float surprise = (y_t * y_t) / (vol * vol);
+    float z_sq = (y_t * y_t) / (vol * vol);
     
     // ─────────────────────────────────────────────────────────
     // 4. UPDATE STATE MACHINE
@@ -631,7 +772,7 @@ void tick(
     
     switch (tuner->state) {
         case CALM:
-            if (surprise > 9.0f) {
+            if (z_sq > 9.0f) {
                 tuner->state = SHOCK;
                 tuner->ticks_in_state = 0;
             }
@@ -645,7 +786,7 @@ void tick(
             break;
             
         case RECOVERY:
-            if (tuner->ticks_in_state > 50 && surprise < 4.0f) {
+            if (tuner->ticks_in_state > 50 && z_sq < 4.0f) {
                 tuner->state = CALM;
             }
             break;
@@ -657,61 +798,107 @@ void tick(
     if (tuner->state == SHOCK) return;
     
     // ─────────────────────────────────────────────────────────
-    // 6. COMPUTE GRADIENTS
+    // 6. COMPUTE GRADIENTS (4 parameters)
     // ─────────────────────────────────────────────────────────
     float mu = tuner->theta.mu;
     float rho = tuner->theta.rho();
     float sigma = tuner->theta.sigma();
+    float nu = tuner->theta.nu();
     float inv_sig2 = 1.0f / (sigma * sigma);
     
-    float g_mu = 0, g_eta = 0, g_kappa = 0;
+    // Accumulators for mean gradient and Fisher matrix
+    float mean_grad[4] = {0};
+    float F_new[4][4] = {0};
     
     for (int i = 0; i < N; i++) {
-        int a = svpf->ancestor[i];          // CRITICAL: actual parent
-        float hp = h_prev[a];               // Parent's h
-        float ht = svpf->h[i];              // Child's h
-        float wi = svpf->W[i];              // Posterior weight
+        int a = svpf->ancestor ? svpf->ancestor[i] : i;  // Parent index
+        float hp = h_prev[a];                             // Parent's h
+        float ht = svpf->h[i];                            // Child's h
+        float wi = svpf->W[i];                            // Posterior weight
         
-        // Prediction error
+        // === TRANSITION GRADIENTS (μ, ρ, σ) ===
         float eps = ht - mu - rho * (hp - mu);
         
-        // Gradients w.r.t. original params
         float d_mu = eps * (1.0f - rho) * inv_sig2;
         float d_rho = eps * (hp - mu) * inv_sig2;
         float d_sigma = -1.0f/sigma + eps*eps/(sigma*sigma*sigma);
         
-        // Chain rule for unconstrained params
-        float d_eta = d_rho * (1.0f - rho * rho);
-        float d_kappa = d_sigma * sigma;
+        // === OBSERVATION GRADIENT (ν) ===
+        float vol_i = expf(ht * 0.5f);
+        float z_i = y_t / vol_i;
+        float z_sq_i = z_i * z_i;
+        float A = 1.0f + z_sq_i / nu;
         
-        // Accumulate weighted
-        g_mu += wi * d_mu;
-        g_eta += wi * d_eta;
-        g_kappa += wi * d_kappa;
+        float d_nu = 0.5f * (digamma((nu+1.0f)*0.5f) - digamma(nu*0.5f) 
+                     - 1.0f/nu - logf(A) 
+                     + (nu + 1.0f) * z_sq_i / (nu * nu * A));
+        
+        // === CHAIN RULE FOR UNCONSTRAINED PARAMS ===
+        float g[4];
+        g[0] = d_mu;                              // μ directly
+        g[1] = d_rho * (1.0f - rho * rho);        // η via tanh
+        g[2] = d_sigma * sigma;                   // κ via exp
+        g[3] = d_nu * (nu - 2.0f);                // κ_ν via exp (shifted)
+        
+        // === ACCUMULATE MEAN GRADIENT ===
+        for (int j = 0; j < 4; j++) {
+            mean_grad[j] += wi * g[j];
+        }
+        
+        // === ACCUMULATE FISHER MATRIX (outer product) ===
+        for (int j = 0; j < 4; j++) {
+            for (int k = 0; k < 4; k++) {
+                F_new[j][k] += wi * g[j] * g[k];
+            }
+        }
     }
     
     // ─────────────────────────────────────────────────────────
-    // 7. GRADIENT CLIPPING
+    // 7. EMA SMOOTH FISHER MATRIX
+    // ─────────────────────────────────────────────────────────
+    float alpha = tuner->F_ema_decay;
+    for (int j = 0; j < 4; j++) {
+        for (int k = 0; k < 4; k++) {
+            tuner->F[j][k] = alpha * tuner->F[j][k] + (1.0f - alpha) * F_new[j][k];
+        }
+    }
+    
+    // Regularize diagonal for invertibility
+    for (int j = 0; j < 4; j++) {
+        tuner->F[j][j] += tuner->F_reg;
+    }
+    
+    // ─────────────────────────────────────────────────────────
+    // 8. INVERT FISHER → NATURAL GRADIENT
+    // ─────────────────────────────────────────────────────────
+    float F_inv[4][4];
+    invert_4x4(tuner->F, F_inv);
+    
+    float nat_grad[4] = {0};
+    for (int j = 0; j < 4; j++) {
+        for (int k = 0; k < 4; k++) {
+            nat_grad[j] += F_inv[j][k] * mean_grad[k];
+        }
+    }
+    
+    // ─────────────────────────────────────────────────────────
+    // 9. GRADIENT CLIPPING (still useful for safety)
     // ─────────────────────────────────────────────────────────
     float clip = 1.0f;
-    g_mu = fmaxf(fminf(g_mu, clip), -clip);
-    g_eta = fmaxf(fminf(g_eta, clip), -clip);
-    g_kappa = fmaxf(fminf(g_kappa, clip), -clip);
+    for (int j = 0; j < 4; j++) {
+        nat_grad[j] = fmaxf(fminf(nat_grad[j], clip), -clip);
+    }
     
     // ─────────────────────────────────────────────────────────
-    // 8. RMSPROP UPDATE
+    // 10. UPDATE PARAMETERS
     // ─────────────────────────────────────────────────────────
-    float d = tuner->decay;
-    tuner->v_mu = d * tuner->v_mu + (1-d) * g_mu * g_mu;
-    tuner->v_eta = d * tuner->v_eta + (1-d) * g_eta * g_eta;
-    tuner->v_kappa = d * tuner->v_kappa + (1-d) * g_kappa * g_kappa;
-    
     float lr = tuner->base_lr;
-    if (tuner->state == RECOVERY) lr *= 3.0f;
+    if (tuner->state == RECOVERY) lr *= 2.0f;  // Smaller boost (natural grad already adaptive)
     
-    tuner->theta.mu += lr * g_mu / (sqrtf(tuner->v_mu) + tuner->eps);
-    tuner->theta.eta += lr * g_eta / (sqrtf(tuner->v_eta) + tuner->eps);
-    tuner->theta.kappa += lr * g_kappa / (sqrtf(tuner->v_kappa) + tuner->eps);
+    tuner->theta.mu       += lr * nat_grad[0];
+    tuner->theta.eta      += lr * nat_grad[1];
+    tuner->theta.kappa    += lr * nat_grad[2];
+    tuner->theta.kappa_nu += lr * nat_grad[3];
 }
 ```
 
@@ -775,7 +962,7 @@ Consider if gradient approach is finicky.
 | Task | Description |
 |------|-------------|
 | A.1 | Keep existing adaptive μ Kalman update (it's already a good outer loop) |
-| A.2 | Do NOT learn ρ and σ_z yet |
+| A.2 | Do NOT learn ρ, σ, ν yet |
 | A.3 | Create unified shock state machine (SHOCK/RECOVERY/CALM) |
 | A.4 | Apply state machine consistently to: adaptive μ gain, σ_z boosting, guide strength |
 
@@ -783,53 +970,79 @@ Consider if gradient approach is finicky.
 
 **Deliverable:** Cleaner existing system with unified shock handling.
 
-### Phase B: Learn σ_z Baseline
+### Phase B: Add Natural Gradient Infrastructure
 
 | Task | Description |
 |------|-------------|
-| B.1 | Learn σ_z baseline only (outer loop, slow) |
-| B.2 | Keep "breathing filter" as fast multiplicative scaling around baseline |
-| B.3 | `σ_z_effective(t) = σ_z_baseline(t) · boost(t)` |
-| B.4 | Test: does σ_z baseline converge? Does breathing still work? |
+| B.1 | Implement 4×4 Fisher matrix accumulation from particles |
+| B.2 | Implement 4×4 matrix inverse (Cramer's rule or LU) |
+| B.3 | EMA smoothing of Fisher matrix |
+| B.4 | Test on synthetic data: verify gradients and Fisher are correct |
+
+**Goal:** Natural gradient infrastructure ready for use.
+
+**Deliverable:** Working Fisher-preconditioned update (can test with fixed SVPF).
+
+### Phase C: Learn ν (Tail Weight) First
+
+| Task | Description |
+|------|-------------|
+| C.1 | Add ν gradient (digamma function, observation likelihood) |
+| C.2 | Learn ν only, keep μ/ρ/σ fixed |
+| C.3 | Test on crash scenarios: does ν adapt appropriately? |
+| C.4 | Verify: ν drops during crisis, rises during calm |
+
+**Goal:** ν is the safest parameter to learn (only affects observation, not transition).
+
+**Deliverable:** Self-tuning tail weight.
+
+### Phase D: Learn σ Baseline
+
+| Task | Description |
+|------|-------------|
+| D.1 | Add σ to learning (transition gradient) |
+| D.2 | Keep "breathing filter" as fast multiplicative scaling |
+| D.3 | Watch for σ-ν interaction (Fisher handles correlation) |
+| D.4 | Test: does σ baseline converge? Does breathing still work? |
 
 **Goal:** Separate slow baseline learning from fast crisis response.
 
-**Deliverable:** σ_z that self-calibrates while preserving crisis machinery.
+**Deliverable:** σ that self-calibrates while preserving crisis machinery.
 
-### Phase C: Learn ρ (If Needed)
+### Phase E: Learn ρ (If Needed)
 
 | Task | Description |
 |------|-------------|
-| C.1 | Learn ρ baseline (only in CALM/RECOVERY, not SHOCK) |
-| C.2 | Strong regularization to keep ρ in plausible band |
-| C.3 | Keep asymmetric ρ (up/down) as fast machinery, not learned |
-| C.4 | Test: does ρ learning help or just add instability? |
+| E.1 | Add ρ to learning (only in CALM/RECOVERY, not SHOCK) |
+| E.2 | Strong regularization to keep ρ in plausible band |
+| E.3 | Keep asymmetric ρ (up/down) as fast machinery, not learned |
+| E.4 | Test: does ρ learning help or just add instability? |
 
 **Goal:** Only add if clearly beneficial. ρ is often stable enough to fix.
 
 **Deliverable:** Optionally adaptive ρ with guard rails.
 
-### Phase D: Full Score-Based Learning (Optional)
+### Phase F: Full 4-Parameter Learning
 
 | Task | Description |
 |------|-------------|
-| D.1 | Implement proper particle score kernel (Fisher identity) |
-| D.2 | Per-particle gradient contributions, reduced to update |
-| D.3 | Move all θ to device memory for CUDA graph compatibility |
-| D.4 | Benchmark latency overhead |
+| F.1 | Enable all 4 parameters: μ, ρ, σ, ν |
+| F.2 | Natural gradient handles correlations (σ-ν, μ-ρ) |
+| F.3 | Move all θ to device memory for CUDA graph compatibility |
+| F.4 | Benchmark latency overhead |
 
-**Goal:** Most "principled" route without SMC²/PMCMC.
+**Goal:** Complete self-tuning system.
 
-**Deliverable:** Full gradient-based learning if phases A-C insufficient.
+**Deliverable:** Production-ready 4-parameter natural gradient learning.
 
-### Phase E: Offline + Online Split
+### Phase G: Offline + Online Split
 
 | Task | Description |
 |------|-------------|
-| E.1 | Overnight calibration: maximize predictive log-likelihood on dataset |
-| E.2 | Output strong initialization + regularization targets |
-| E.3 | Online: small updates to compensate for drift |
-| E.4 | Use offline values as prior/regularization anchor |
+| G.1 | Overnight calibration: maximize predictive log-likelihood on dataset |
+| G.2 | Output strong initialization + regularization targets |
+| G.3 | Online: small updates to compensate for drift |
+| G.4 | Use offline values as prior/regularization anchor |
 
 **Goal:** Offline gives good operating point; online keeps it aligned.
 
@@ -839,20 +1052,38 @@ Consider if gradient approach is finicky.
 
 ## 11. Tuning Guide
 
-### 11.1 Learning Rate
+### 11.1 Learning Rate (Natural Gradient)
 
 ```
-base_lr = 0.001 (conservative start)
+base_lr = 0.01 (can be larger than plain SGD due to natural gradient!)
 
-Too high: θ oscillates, chases noise
+With natural gradient:
+  • Fisher matrix normalizes scales automatically
+  • Single LR works for all 4 parameters
+  • Can typically use 10× larger LR than plain SGD
+
+Too high: θ oscillates
 Too low:  θ adapts too slowly after regime change
 
-Symptoms of wrong LR:
-  • θ jumps around → reduce LR
-  • θ stuck after regime change → increase LR or check state machine
+Symptoms:
+  • All params jump together → reduce LR
+  • Params stuck after regime change → increase LR
 ```
 
-### 11.2 State Machine Thresholds
+### 11.2 Fisher Matrix EMA
+
+```
+F_ema_decay = 0.95 (typical)
+
+Higher decay (0.99): More stable Fisher, slower adaptation
+Lower decay (0.90):  More responsive, noisier
+
+F_reg = 1e-4 (regularization for invertibility)
+  • Too small: Singular matrix, NaN gradients
+  • Too large: Reverts toward plain gradient
+```
+
+### 11.3 State Machine Thresholds
 
 ```
 Surprise threshold (entering SHOCK): 9.0 (3σ event)
@@ -865,25 +1096,37 @@ Adjust based on your data frequency:
   • Daily data: longer durations
 ```
 
-### 11.3 RMSProp
-
-```
-decay = 0.99 (standard)
-eps = 1e-6 (numerical stability)
-
-Higher decay = more smoothing, slower adaptation
-Lower decay = more responsive, noisier
-```
-
 ### 11.4 Gradient Clipping
 
 ```
-clip = 1.0 (per-parameter)
+clip = 1.0 (per-parameter, applied to natural gradient)
 
-Prevents explosion during volatile periods.
+Still useful as safety net even with natural gradient.
+Prevents explosion if Fisher becomes ill-conditioned.
+
 If gradients regularly hit clip, consider:
+  • Increasing F_reg (more regularization)
   • Reducing base_lr
   • Lengthening SHOCK duration
+```
+
+### 11.5 Parameter-Specific Notes
+
+```
+ν (tail weight):
+  • Only learns from crashes (large |z|)
+  • In calm markets, gradient ≈ 0 (uninformative)
+  • Fisher F_νν captures this: small in calm, large in crisis
+  • Natural gradient automatically learns ν faster during crashes
+  
+σ-ν interaction:
+  • Both explain spread: high σ + high ν ≈ low σ + low ν
+  • Fisher captures this correlation (F_σν)
+  • Natural gradient prevents them fighting
+  
+μ-ρ interaction:  
+  • Both affect mean behavior
+  • Fisher F_μρ handles this
 ```
 
 ---
@@ -895,11 +1138,13 @@ If gradients regularly hit clip, consider:
 │  CAPABILITIES                                                   │
 ├─────────────────────────────────────────────────────────────────┤
 │  ✓ Robust h tracking (SVPF handles crashes)                    │
-│  ✓ Automatic θ adaptation (no manual recalibration)            │
+│  ✓ Automatic θ = (μ,ρ,σ,ν) adaptation                          │
+│  ✓ Tail weight ν adapts to market regime                       │
+│  ✓ Natural gradient: one LR for all parameters                 │
 │  ✓ No lag (θ reads from current particles, not history)        │
 │  ✓ No memory management (no circular buffers, checkpoints)     │
 │  ✓ Simple (gradient feedback, not SMC²/CPMMH)                  │
-│  ✓ Fast (O(N) gradient, not O(N²) or O(N×T))                  │
+│  ✓ Fast (O(N) gradient + O(1) 4×4 inverse)                    │
 └─────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────┐
@@ -916,16 +1161,22 @@ If gradients regularly hit clip, consider:
 
 ## 13. Comparison With Alternatives
 
-| Aspect | Fixed θ | SMC² + CPMMH | Self-Tuning SVPF |
-|--------|---------|--------------|------------------|
-| Complexity | None | Very High | Low |
-| θ adaptation | None | Full posterior | Point estimate |
-| Lag | N/A | Yes (batch) | No (feedback) |
-| Memory | O(N) | O(N × M × L) | O(N) |
-| Crash robust | Yes (SVPF) | Yes | Yes |
-| Arbitrary knobs | Just θ | Q, λ, L, liu-west | Just LR |
+| Aspect | Fixed θ | SMC² + CPMMH | RMSProp | **Natural Gradient** |
+|--------|---------|--------------|---------|---------------------|
+| Complexity | None | Very High | Low | Low |
+| θ adaptation | None | Full posterior | Point estimate | Point estimate |
+| Parameters | Manual | All | Needs per-param LR | **Single LR** |
+| Correlations | N/A | Captured | Ignored | **Captured (Fisher)** |
+| Lag | N/A | Yes (batch) | No | No |
+| Memory | O(N) | O(N × M × L) | O(N) | O(N) + O(16) |
+| Crash robust | Yes (SVPF) | Yes | Yes | Yes |
+| Arbitrary knobs | Just θ | Q, λ, L, liu-west | LR per param | **Just 1 LR** |
 
-**Self-Tuning SVPF is the sweet spot for most applications.**
+**Natural Gradient Self-Tuning SVPF is the sweet spot:**
+- Principled (Fisher-preconditioned)
+- One learning rate for 4 parameters
+- Handles correlations (σ-ν, μ-ρ)
+- Cheap (4×4 matrix inverse ≈ 100 FLOPs)
 
 ---
 
@@ -940,17 +1191,20 @@ If gradients regularly hit clip, consider:
 │    → Lag, amnesia problem, arbitrary fixes (Q, λ)              │
 │    → Complex (SMC², CPMMH, replay)                             │
 │                                                                 │
-│  THE NEW WAY (Self-Tuning):                                    │
+│  THE NEW WAY (Self-Tuning with Natural Gradient):              │
 │                                                                 │
 │    SVPF particles already know where h is                      │
-│    Gradient measures: "Is θ consistent with particles?"        │
-│    θ adjusts to match → Closed-loop negative feedback          │
-│    → No lag, no memory, simple                                 │
+│    Natural gradient: "adjust θ, properly scaled"               │
+│    Fisher matrix captures parameter correlations               │
+│    → No lag, no memory, principled                             │
 │                                                                 │
 │  ─────────────────────────────────────────────────────────     │
 │                                                                 │
+│    θ = (μ, ρ, σ, ν) — 4 parameters, 1 learning rate           │
+│                                                                 │
 │    SVPF is the sensor.                                         │
-│    Gradient is the actuator.                                   │
+│    Natural gradient is the actuator.                           │
+│    Fisher provides impedance matching.                         │
 │    The system self-aligns.                                     │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
@@ -958,6 +1212,7 @@ If gradients regularly hit clip, consider:
 
 ---
 
-*Document version: 2.0*
+*Document version: 3.0*
 *Created: January 2026*
-*Paradigm: AGC-style feedback, not batch inference*
+*Paradigm: AGC-style feedback with Natural Gradient (Fisher-preconditioned)*
+*Parameters: θ = (μ, ρ, σ, ν) — mean, persistence, vol-of-vol, tail weight*
