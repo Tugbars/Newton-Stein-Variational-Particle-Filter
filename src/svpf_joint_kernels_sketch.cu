@@ -11,6 +11,21 @@
 // Memory Layout: Structure of Arrays (SoA) for coalescing
 //   d_h[N], d_mu_tilde[N], d_rho_tilde[N], d_sigma_tilde[N]
 //
+// KEY DESIGN DECISIONS (based on supervisor feedback):
+//
+// 1. PARAMETER DIFFUSION: Small random walk on θ̃ makes filtering well-posed.
+//    Without it, we're doing "variational learning with regularization," not
+//    true Bayesian filtering. Diffusion prevents corner-locking and collapse.
+//
+// 2. DIVERSITY DIAGNOSTICS: Track std(θ̃) in unconstrained space. If collapse
+//    detected, it's a structural problem (bandwidth/diffusion), not heuristics.
+//
+// 3. DIAGONAL KERNEL: Per-dimension bandwidths are necessary but may not be
+//    sufficient. Fisher-information scaling is the principled upgrade if needed.
+//
+// 4. TIMESCALE SEPARATION: Parameters learn slower than state. Enforced via
+//    separate learning rates (step_h >> step_θ) and small diffusion rates.
+//
 // =============================================================================
 
 #include <cuda_runtime.h>
@@ -37,15 +52,19 @@ __device__ __forceinline__ float sigmoid_deriv(float rho) {
 // KERNEL 1: JOINT PREDICT
 // -----------------------------------------------------------------------------
 // Propagates h using particle-local parameters
-// Parameters stay fixed during predict (no dynamics on θ)
+// Also applies small diffusion to parameters (random walk for well-posed filtering)
 
 __global__ void svpf_joint_predict_kernel(
     float* __restrict__ d_h,
     float* __restrict__ d_h_prev,
-    const float* __restrict__ d_mu_tilde,
-    const float* __restrict__ d_rho_tilde,
-    const float* __restrict__ d_sigma_tilde,
+    float* __restrict__ d_mu_tilde,
+    float* __restrict__ d_rho_tilde,
+    float* __restrict__ d_sigma_tilde,
     curandStatePhilox4_32_10_t* __restrict__ rng,
+    // Parameter diffusion rates (small random walk)
+    float diffusion_mu,
+    float diffusion_rho,
+    float diffusion_sigma,
     int n
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -56,6 +75,26 @@ __global__ void svpf_joint_predict_kernel(
     
     // Store previous for gradient computation
     d_h_prev[i] = h_i;
+    
+    // =========================================================================
+    // PARAMETER DIFFUSION (small random walk for well-posed filtering)
+    // =========================================================================
+    // This makes p(θ_t | θ_{t-1}) explicit, preventing:
+    // - Parameters getting stuck in corners
+    // - Diversity collapse
+    // - Brittle behavior from extreme observations
+    
+    float noise_mu = curand_normal(&rng[i]);
+    float noise_rho = curand_normal(&rng[i]);
+    float noise_sigma = curand_normal(&rng[i]);
+    
+    d_mu_tilde[i] += diffusion_mu * noise_mu;
+    d_rho_tilde[i] += diffusion_rho * noise_rho;
+    d_sigma_tilde[i] += diffusion_sigma * noise_sigma;
+    
+    // =========================================================================
+    // STATE PROPAGATION with particle-local parameters
+    // =========================================================================
     
     // Transform parameters from unconstrained space
     float mu = d_mu_tilde[i];                    // μ̃ = μ (identity)
@@ -443,20 +482,142 @@ __global__ void svpf_joint_extract_params_kernel(
 }
 
 // -----------------------------------------------------------------------------
+// KERNEL 6: DIVERSITY COLLAPSE DIAGNOSTIC
+// -----------------------------------------------------------------------------
+// Computes std in UNCONSTRAINED space (more sensitive to collapse)
+// Returns flags indicating which parameters have collapsed
+
+__global__ void svpf_joint_diversity_diagnostic_kernel(
+    const float* __restrict__ d_mu_tilde,
+    const float* __restrict__ d_rho_tilde,
+    const float* __restrict__ d_sigma_tilde,
+    float* __restrict__ d_std_unconstrained,  // [std_mu_tilde, std_rho_tilde, std_sigma_tilde]
+    int* __restrict__ d_collapse_flags,       // [mu_collapsed, rho_collapsed, sigma_collapsed]
+    float collapse_thresh_mu,     // e.g., 0.05
+    float collapse_thresh_rho,    // e.g., 0.02
+    float collapse_thresh_sigma,  // e.g., 0.02
+    int n
+) {
+    __shared__ float s_mu_sum, s_rho_sum, s_sigma_sum;
+    __shared__ float s_mu_sq, s_rho_sq, s_sigma_sq;
+    
+    if (threadIdx.x == 0) {
+        s_mu_sum = s_rho_sum = s_sigma_sum = 0.0f;
+        s_mu_sq = s_rho_sq = s_sigma_sq = 0.0f;
+    }
+    __syncthreads();
+    
+    float mu_sum = 0.0f, rho_sum = 0.0f, sigma_sum = 0.0f;
+    float mu_sq = 0.0f, rho_sq = 0.0f, sigma_sq = 0.0f;
+    
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float mu = d_mu_tilde[i];
+        float rho = d_rho_tilde[i];
+        float sigma = d_sigma_tilde[i];
+        
+        mu_sum += mu;
+        rho_sum += rho;
+        sigma_sum += sigma;
+        
+        mu_sq += mu * mu;
+        rho_sq += rho * rho;
+        sigma_sq += sigma * sigma;
+    }
+    
+    atomicAdd(&s_mu_sum, mu_sum);
+    atomicAdd(&s_rho_sum, rho_sum);
+    atomicAdd(&s_sigma_sum, sigma_sum);
+    atomicAdd(&s_mu_sq, mu_sq);
+    atomicAdd(&s_rho_sq, rho_sq);
+    atomicAdd(&s_sigma_sq, sigma_sq);
+    __syncthreads();
+    
+    if (threadIdx.x == 0) {
+        float inv_n = 1.0f / (float)n;
+        
+        float mean_mu = s_mu_sum * inv_n;
+        float mean_rho = s_rho_sum * inv_n;
+        float mean_sigma = s_sigma_sum * inv_n;
+        
+        float std_mu = sqrtf(fmaxf(s_mu_sq * inv_n - mean_mu * mean_mu, 0.0f));
+        float std_rho = sqrtf(fmaxf(s_rho_sq * inv_n - mean_rho * mean_rho, 0.0f));
+        float std_sigma = sqrtf(fmaxf(s_sigma_sq * inv_n - mean_sigma * mean_sigma, 0.0f));
+        
+        d_std_unconstrained[0] = std_mu;
+        d_std_unconstrained[1] = std_rho;
+        d_std_unconstrained[2] = std_sigma;
+        
+        // Check for collapse
+        d_collapse_flags[0] = (std_mu < collapse_thresh_mu) ? 1 : 0;
+        d_collapse_flags[1] = (std_rho < collapse_thresh_rho) ? 1 : 0;
+        d_collapse_flags[2] = (std_sigma < collapse_thresh_sigma) ? 1 : 0;
+    }
+}
+
+// -----------------------------------------------------------------------------
 // HOST-SIDE: ONE TIMESTEP
 // -----------------------------------------------------------------------------
 
 /*
-void svpf_joint_step(SVPFJointState* state, float y_t) {
+struct SVPFJointConfig {
+    // Particle count
+    int n_particles;
+    int n_stein_steps;
+    
+    // Learning rates (per-parameter)
+    float step_h;       // Fast (0.10)
+    float step_mu;      // Slow (0.01)
+    float step_rho;     // Very slow (0.005)
+    float step_sigma;   // Slow (0.01)
+    
+    // Parameter diffusion rates (small random walk)
+    float diffusion_mu;     // 0.01
+    float diffusion_rho;    // 0.001
+    float diffusion_sigma;  // 0.005
+    
+    // Diversity collapse thresholds (unconstrained space)
+    float collapse_thresh_mu;     // 0.05
+    float collapse_thresh_rho;    // 0.02
+    float collapse_thresh_sigma;  // 0.02
+    
+    // Prior hyperparameters (weak regularization)
+    float mu_prior_mean, mu_prior_var;
+    float rho_prior_mean, rho_prior_var;
+    float sigma_prior_mean, sigma_prior_var;
+    
+    // Student-t
+    float nu;
+    float student_t_const;
+};
+
+struct SVPFJointDiagnostics {
+    // Parameter estimates (constrained space)
+    float mu_mean, rho_mean, sigma_mean;
+    float mu_std, rho_std, sigma_std;
+    
+    // Diversity (unconstrained space)
+    float std_mu_tilde, std_rho_tilde, std_sigma_tilde;
+    
+    // Collapse flags
+    int mu_collapsed, rho_collapsed, sigma_collapsed;
+    
+    // State estimate
+    float h_mean, vol_mean;
+};
+
+void svpf_joint_step(SVPFJointState* state, float y_t, SVPFJointDiagnostics* diag) {
     int n = state->n_particles;
     int block = 256;
     int grid = (n + block - 1) / block;
+    SVPFJointConfig* cfg = &state->config;
     
-    // 1. Predict (propagate h with particle-local params)
+    // 1. Predict (propagate h with particle-local params + parameter diffusion)
     svpf_joint_predict_kernel<<<grid, block>>>(
         state->d_h, state->d_h_prev,
         state->d_mu_tilde, state->d_rho_tilde, state->d_sigma_tilde,
-        state->rng_states, n
+        state->rng_states,
+        cfg->diffusion_mu, cfg->diffusion_rho, cfg->diffusion_sigma,
+        n
     );
     
     // 2. Compute bandwidths (one per dimension)
@@ -467,18 +628,17 @@ void svpf_joint_step(SVPFJointState* state, float y_t) {
     state->bw_sigma = compute_median_bandwidth(state->d_sigma_tilde, n);
     
     // 3. Stein iterations
-    for (int s = 0; s < state->n_stein_steps; s++) {
+    for (int s = 0; s < cfg->n_stein_steps; s++) {
         // Compute gradients
-        size_t grad_smem = 0;  // Gradients stored in global memory
         svpf_joint_gradient_kernel<<<grid, block>>>(
             state->d_h, state->d_h_prev,
             state->d_mu_tilde, state->d_rho_tilde, state->d_sigma_tilde,
             state->d_grad_h, state->d_grad_mu, state->d_grad_rho, state->d_grad_sigma,
             state->d_log_w,
-            y_t, state->nu, state->student_t_const,
-            state->mu_prior_mean, state->mu_prior_var,
-            state->rho_prior_mean, state->rho_prior_var,
-            state->sigma_prior_mean, state->sigma_prior_var,
+            y_t, cfg->nu, cfg->student_t_const,
+            cfg->mu_prior_mean, cfg->mu_prior_var,
+            cfg->rho_prior_mean, cfg->rho_prior_var,
+            cfg->sigma_prior_mean, cfg->sigma_prior_var,
             n
         );
         
@@ -489,7 +649,7 @@ void svpf_joint_step(SVPFJointState* state, float y_t) {
             state->d_mu_tilde, state->d_rho_tilde, state->d_sigma_tilde,
             state->d_grad_h, state->d_grad_mu, state->d_grad_rho, state->d_grad_sigma,
             state->bw_h, state->bw_mu, state->bw_rho, state->bw_sigma,
-            state->step_h, state->step_mu, state->step_rho, state->step_sigma,
+            cfg->step_h, cfg->step_mu, cfg->step_rho, cfg->step_sigma,
             n
         );
     }
@@ -499,5 +659,69 @@ void svpf_joint_step(SVPFJointState* state, float y_t) {
         state->d_mu_tilde, state->d_rho_tilde, state->d_sigma_tilde,
         state->d_param_mean, state->d_param_std, n
     );
+    
+    // 5. Diversity diagnostic (optional, can run every N steps)
+    svpf_joint_diversity_diagnostic_kernel<<<1, 256>>>(
+        state->d_mu_tilde, state->d_rho_tilde, state->d_sigma_tilde,
+        state->d_std_unconstrained, state->d_collapse_flags,
+        cfg->collapse_thresh_mu, cfg->collapse_thresh_rho, cfg->collapse_thresh_sigma,
+        n
+    );
+    
+    // 6. Copy diagnostics to host (if requested)
+    if (diag != nullptr) {
+        cudaMemcpy(&diag->mu_mean, state->d_param_mean, 3 * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&diag->mu_std, state->d_param_std, 3 * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&diag->std_mu_tilde, state->d_std_unconstrained, 3 * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&diag->mu_collapsed, state->d_collapse_flags, 3 * sizeof(int), cudaMemcpyDeviceToHost);
+        
+        // Compute h_mean and vol_mean
+        diag->h_mean = compute_mean(state->d_h, n);
+        diag->vol_mean = expf(diag->h_mean * 0.5f);
+        
+        // Warning if collapsed
+        if (diag->mu_collapsed || diag->rho_collapsed || diag->sigma_collapsed) {
+            printf("WARNING: Parameter diversity collapsed! mu:%d rho:%d sigma:%d\n",
+                   diag->mu_collapsed, diag->rho_collapsed, diag->sigma_collapsed);
+        }
+    }
+}
+
+// Default configuration
+SVPFJointConfig svpf_joint_default_config() {
+    SVPFJointConfig cfg;
+    
+    cfg.n_particles = 512;
+    cfg.n_stein_steps = 5;
+    
+    // Learning rates
+    cfg.step_h = 0.10f;
+    cfg.step_mu = 0.01f;
+    cfg.step_rho = 0.005f;
+    cfg.step_sigma = 0.01f;
+    
+    // Parameter diffusion
+    cfg.diffusion_mu = 0.01f;
+    cfg.diffusion_rho = 0.001f;
+    cfg.diffusion_sigma = 0.005f;
+    
+    // Collapse thresholds
+    cfg.collapse_thresh_mu = 0.05f;
+    cfg.collapse_thresh_rho = 0.02f;
+    cfg.collapse_thresh_sigma = 0.02f;
+    
+    // Weak priors (regularization)
+    cfg.mu_prior_mean = -3.5f;
+    cfg.mu_prior_var = 10.0f;
+    cfg.rho_prior_mean = 2.0f;   // sigmoid(2.0) ≈ 0.88
+    cfg.rho_prior_var = 5.0f;
+    cfg.sigma_prior_mean = -2.0f; // exp(-2.0) ≈ 0.14
+    cfg.sigma_prior_var = 5.0f;
+    
+    // Student-t
+    cfg.nu = 30.0f;
+    cfg.student_t_const = lgammaf(15.5f) - lgammaf(15.0f) - 0.5f * logf(M_PI * 30.0f);
+    
+    return cfg;
 }
 */

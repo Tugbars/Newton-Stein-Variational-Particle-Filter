@@ -293,6 +293,137 @@ With separation:
 
 ---
 
+## Parameter Diffusion
+
+### The Problem: Static Prior vs Sequential Belief
+
+The correct filtering target is:
+
+```
+p(h_t, θ | y_{1:t}) ∝ p(y_t|h_t) · p(h_t|h_{t-1}, θ) · p(θ | y_{1:t-1})
+                                                        └─────────────┘
+                                                        Previous belief
+```
+
+A static Gaussian prior p(θ) is **not** the same as p(θ|y_{1:t-1}). Using only a static prior makes this "online variational learning with regularization," not true Bayesian filtering.
+
+### The Solution: Small Random Walk on Parameters
+
+Add explicit parameter dynamics:
+
+```
+θ̃_t = θ̃_{t-1} + σ_θ · ε_t,    ε_t ~ N(0,1)
+```
+
+This small diffusion:
+1. **Makes filtering well-posed** - parameters can adapt over time
+2. **Prevents corner-locking** - extreme observations can't permanently push θ to boundaries
+3. **Maintains diversity** - particles don't collapse to identical θ values
+4. **Adds "forgetting"** - old observations gradually lose influence
+
+### Diffusion Rates
+
+| Parameter | Diffusion σ_θ | Rationale |
+|-----------|---------------|-----------|
+| μ̃ | 0.01 | Mean level can drift |
+| ρ̃ | 0.001 | Persistence very stable |
+| σ̃ | 0.005 | Vol-of-vol moderately stable |
+
+**Tuning principle:** Diffusion should be small enough that parameters don't random-walk away from truth during calm periods, but large enough to allow adaptation during regime changes.
+
+### Implementation
+
+In the predict kernel, after state propagation:
+
+```c
+// Parameter diffusion (small random walk)
+float noise_mu = curand_normal(&rng[i]);
+float noise_rho = curand_normal(&rng[i]);
+float noise_sigma = curand_normal(&rng[i]);
+
+d_mu_tilde[i] += diffusion_mu * noise_mu;
+d_rho_tilde[i] += diffusion_rho * noise_rho;
+d_sigma_tilde[i] += diffusion_sigma * noise_sigma;
+```
+
+This is the same approach as Liu & West (2001), but without the Gaussian kernel smoothing baggage.
+
+---
+
+## Diversity Collapse Detection
+
+### The Failure Mode
+
+If all particles converge to nearly identical θ values, you've effectively returned to "a single parameter" - just learned internally rather than injected externally. The benefits of joint learning vanish.
+
+### Diagnostic: Track Parameter Spread
+
+```c
+// Every N steps, compute:
+float std_mu = std(d_mu_tilde);
+float std_rho = std(d_rho_tilde);  
+float std_sigma = std(d_sigma_tilde);
+
+// Alert thresholds (in unconstrained space):
+const float COLLAPSE_THRESH_MU = 0.05f;
+const float COLLAPSE_THRESH_RHO = 0.02f;
+const float COLLAPSE_THRESH_SIGMA = 0.02f;
+```
+
+### Warning Signs
+
+| Symptom | Likely Cause | Fix |
+|---------|--------------|-----|
+| std_σ < 0.02 for many steps | Bandwidth too large | Reduce bw_sigma |
+| std_ρ collapses after crash | Repulsion too weak | Increase diffusion_rho |
+| All params collapse together | Kernel geometry wrong | Check bandwidth ratios |
+| Slow collapse over time | Diffusion too small | Increase all σ_θ |
+
+### Recovery Actions
+
+If collapse is detected:
+1. **First:** Increase parameter diffusion temporarily
+2. **If persistent:** Re-examine bandwidth computation
+3. **Last resort:** Re-initialize parameter particles from prior
+
+**Key insight:** Collapse is a structural problem (geometry/bandwidth/diffusion), not something to fix with heuristics.
+
+---
+
+## Advanced: Fisher Information Scaling (Optional)
+
+### The Limitation of Diagonal Bandwidths
+
+Even with per-dimension bandwidths, the joint space has non-trivial geometry:
+- Nonlinear transforms (exp, sigmoid)
+- Parameters influence transition nonlinearly
+- Local sensitivity varies across the space
+
+### Fisher Information Preconditioning
+
+Scale each dimension by its local sensitivity:
+
+```
+bw_θ = median_heuristic(θ̃) / √(F_θθ)
+```
+
+Where F_θθ is the diagonal of the Fisher information matrix.
+
+For the SV model:
+```
+F_μμ ≈ (1-ρ)² / σ_z²           # Sensitivity to mean
+F_ρρ ≈ Var[h_{t-1}] / σ_z²     # Sensitivity to persistence  
+F_σσ ≈ 2 / σ_z²                # Sensitivity to vol-of-vol
+```
+
+### When to Add Fisher Scaling
+
+- **Start without it** - diagonal bandwidths may be sufficient
+- **Add if:** diversity collapse despite tuned diffusion, or scenario-dependent failures
+- **Implementation:** Estimate F_θθ from particle distribution, update bandwidths adaptively
+
+---
+
 ## Implementation Architecture
 
 ### Data Structures
@@ -517,11 +648,57 @@ This combines the theoretical correctness of SMC² with the adaptivity of Joint 
 - 4D particles: `[h, μ̃, ρ̃, σ̃]`
 - Diagonal kernel with per-dimension bandwidths
 - Separate learning rates (fast h, slow θ)
+- Parameter diffusion (small random walk for well-posed filtering)
 - Transform constrained params to ℝ
 
 **Result:** A theoretically grounded, self-adapting filter that handles regime changes gracefully.
 
 ---
 
-*Document version: 1.0*  
+## Validation Protocol
+
+### Synthetic Test DGP
+
+Create a regime-switching DGP with **known** (μ, ρ, σ) and explicit crash segments:
+
+```
+t = 0..1000:     μ=-3.5, ρ=0.97, σ=0.15  (calm)
+t = 1001..1200:  μ=-1.0, ρ=0.90, σ=0.40  (crash)
+t = 1201..2000:  μ=-3.0, ρ=0.95, σ=0.20  (recovery)
+```
+
+### Metrics to Track
+
+1. **State RMSE:** h tracking accuracy
+2. **Parameter tracking error:** |θ_estimated - θ_true| over time
+3. **Recovery time:** Steps to re-converge after crash onset
+4. **Parameter diversity:** std(ρ̃), std(σ̃), std(μ̃) over time
+
+### Ablation Studies (Structural, Not Knobs)
+
+| Ablation | What It Tests |
+|----------|---------------|
+| Joint vs Injected | Core hypothesis |
+| Anisotropic vs Isotropic kernel | Bandwidth importance |
+| With vs Without parameter diffusion | Filtering stability |
+| With vs Without guide | Guide necessity in joint setup |
+
+### Stress Tests
+
+1. **Outlier returns:** Single 10σ observation
+2. **Long calm then crash:** 5000 calm ticks → sudden crash
+3. **Alternating regimes:** Rapid switching every 200 ticks
+4. **Gradual drift:** Slow parameter evolution over 10000 ticks
+
+### Success Criteria
+
+- [ ] h RMSE competitive with fixed-param SVPF in matching scenarios
+- [ ] h RMSE **better** than fixed-param SVPF during/after crashes
+- [ ] Parameter estimates converge to true values (within uncertainty)
+- [ ] No diversity collapse over long runs
+- [ ] Recovery time < 50 ticks after regime change
+
+---
+
+*Document version: 2.0*  
 *Date: January 2026*

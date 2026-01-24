@@ -590,7 +590,7 @@ static Metrics run_svpf_on_scenario(
 
 
         filter->use_exact_gradient = 1;
-filter->lik_offset = 0.34f;  // No correction - test if model is now consistent
+        filter->lik_offset = 0.34f;  // No correction - test if model is now consistent
     } else {
         filter->use_svld = 0;
         filter->use_annealing = 0;

@@ -97,6 +97,7 @@ include_directories(${CUDAToolkit_INCLUDE_DIRS})
 # =============================================================================
 add_subdirectory(src)
 add_subdirectory(test)
+add_subdirectory(svpf_joint)
 
 # =============================================================================
 # Python Bindings (requires pybind11)
