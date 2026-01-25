@@ -404,7 +404,14 @@ float svpf_get_lr_multiplier(const SVPFGradientDiagnostics* diag, float lr_shock
 // Gradient:
 //   ∂/∂σ = -1/σ + ε²/σ³ = (ε²/σ² - 1) / σ
 //
-// Expected behavior:
+// CRITICAL: Must use h_pred (before Stein transport), NOT h (after Stein).
+//
+//   h_pred = μ + ρ(h_prev - μ) + σ*ε_random   ← correct (random innovation)
+//   h      = h_pred + Stein_push              ← wrong (includes deterministic push)
+//
+//   Using post-Stein h gives ε²/σ² >> 1 because Stein_push >> σ*ε_random.
+//
+// Expected behavior (with h_pred):
 //   - σ too HIGH → ε²/σ² < 1 → gradient NEGATIVE (decrease σ)
 //   - σ too LOW  → ε²/σ² > 1 → gradient POSITIVE (increase σ)
 //   - σ correct  → ε²/σ² ≈ 1 → gradient ≈ 0
@@ -518,7 +525,11 @@ __global__ void svpf_sigma_gradient_kernel(
 /**
  * @brief Compute σ gradient for diagnostic purposes
  * 
- * @param state         SVPF state (has h, h_prev, log_weights)
+ * IMPORTANT: Uses h_pred (before Stein) not h (after Stein).
+ * Stein transport is deterministic and much larger than σ,
+ * so using post-Stein h gives meaningless ε²/σ² >> 1.
+ * 
+ * @param state         SVPF state (has h_pred, h_prev, log_weights)
  * @param params        SV parameters (μ, ρ, σ)
  * @param sigma_grad_out    Output: σ gradient (positive → increase σ)
  * @param eps_sq_norm_out   Output: mean ε²/σ² (should be ~1.0 if σ correct)
@@ -534,8 +545,10 @@ void svpf_compute_sigma_diagnostic_simple(
     cudaMalloc(&d_sigma_grad, sizeof(float));
     cudaMalloc(&d_eps_sq_norm, sizeof(float));
     
+    // Use h_pred (before Stein transport), NOT h (after Stein)
+    // Stein push is deterministic and >> σ, so using h gives ε²/σ² >> 1
     svpf_sigma_gradient_kernel<<<1, 256, 48, state->stream>>>(
-        state->h,
+        state->h_pred,    // <-- FIXED: use h_pred, not h
         state->h_prev,
         state->log_weights,
         params->mu,
