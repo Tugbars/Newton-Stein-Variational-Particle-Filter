@@ -497,6 +497,10 @@ static void svpf_graph_capture_internal(SVPFState* state, const SVPFParams* para
         );
     }
     
+    // Snapshot predicted particles BEFORE Stein transport (for σ gradient diagnostic)
+    // h_pred = h after prediction, before any transport/guide modifications
+    cudaMemcpyAsync(state->h_pred, state->h, n * sizeof(float), cudaMemcpyDeviceToDevice, cs);
+    
     // GUIDE
     if (state->use_guide) {
         if (state->use_guide_preserving) {
