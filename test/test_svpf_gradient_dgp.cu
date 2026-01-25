@@ -202,6 +202,22 @@ static void generate_with_ground_truth(
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
+ * MOMENT-MATCHING μ ESTIMATION (same as market data test)
+ *═══════════════════════════════════════════════════════════════════════════*/
+
+static float estimate_mu_from_returns(const double* returns, int n) {
+    double sum = 0, sq_sum = 0;
+    for (int i = 0; i < n; i++) {
+        sum += returns[i];
+        sq_sum += returns[i] * returns[i];
+    }
+    double mean = sum / n;
+    double var = sq_sum / n - mean * mean;
+    float realized_vol = sqrtf((float)var);
+    return 2.0f * logf(realized_vol + 1e-8f);
+}
+
+/*═══════════════════════════════════════════════════════════════════════════
  * SCENARIO GENERATORS
  *═══════════════════════════════════════════════════════════════════════════*/
 
@@ -461,15 +477,18 @@ static void test_nu_gradient_direction(void) {
         seed
     );
     
-    // Average μ, ρ, σ from DGP for SVPF (rough approximation)
-    // These will be "wrong" but that's okay - we're testing ν gradient
-    float filter_mu = -3.5f;
+    // Auto-calibrate μ from generated data (moment matching)
+    float filter_mu = estimate_mu_from_returns(data->returns, data->n_ticks);
+    float implied_vol = expf(filter_mu / 2.0f);
+    
+    // Fixed structural params
     float filter_rho = 0.97f;
     float filter_sigma = 0.15f;
     
     printf(" Data: %s, T=%d, true_ν=%.1f\n", data->scenario_name, n_ticks, true_nu);
-    printf(" Filter: N=%d, Stein=%d, μ=%.2f, ρ=%.2f, σ=%.2f\n",
-           n_particles, n_stein_steps, filter_mu, filter_rho, filter_sigma);
+    printf(" Auto-calibrated: μ=%.2f → implied vol=%.2f%%\n", filter_mu, implied_vol * 100.0f);
+    printf(" Filter: N=%d, Stein=%d, ρ=%.2f, σ=%.2f\n",
+           n_particles, n_stein_steps, filter_rho, filter_sigma);
     printf("\n");
     
     // Test 1: ν too HIGH (ν=30)
@@ -550,25 +569,25 @@ static void test_gradient_across_scenarios(void) {
     // DGP uses ν=5, filter uses ν=15 (moderately too high)
     const double dgp_nu = 5.0;
     const float filter_nu = 15.0f;
-    const float filter_mu = -3.5f;
     const float filter_rho = 0.97f;
     const float filter_sigma = 0.15f;
     
     printf(" DGP ν=%.0f, Filter ν=%.0f (expect NEGATIVE gradient)\n", dgp_nu, filter_nu);
-    printf(" Particles=%d, Stein=%d\n", n_particles, n_stein_steps);
+    printf(" Particles=%d, Stein=%d (μ auto-calibrated per scenario)\n", n_particles, n_stein_steps);
     printf("\n");
     
-    printf(" %-20s | Mean Grad | Crash Grad | Calm Grad | RMSE(h) | Crashes\n", "Scenario");
-    printf(" %-20s-+----------+------------+-----------+---------+--------\n", "--------------------");
+    printf(" %-20s | μ_est  | z²_mean | Mean Grad | Crash Grad | Crashes\n", "Scenario");
+    printf(" %-20s-+--------+---------+----------+------------+--------\n", "--------------------");
     
     // Scenario 1: Slow drift
     {
         GradientTestData* data = gen_slow_drift(n_ticks, 4.0, 1500.0, dgp_nu, 100);
+        float filter_mu = estimate_mu_from_returns(data->returns, data->n_ticks);
         GradientDiagnosticResults* r = run_gradient_diagnostic(
             data, filter_nu, filter_mu, filter_rho, filter_sigma, n_particles, n_stein_steps, 100
         );
-        printf(" %-20s | %+8.5f | %+10.5f | %+9.5f | %7.4f | %4d\n",
-               data->scenario_name, r->mean_nu_grad, r->mean_grad_crash, r->mean_grad_calm, r->rmse_h, r->n_crashes);
+        printf(" %-20s | %6.2f | %7.3f | %+8.5f | %+10.5f | %4d\n",
+               data->scenario_name, filter_mu, r->mean_z_sq, r->mean_nu_grad, r->mean_grad_crash, r->n_crashes);
         free_results(r);
         free_gradient_test_data(data);
     }
@@ -576,11 +595,12 @@ static void test_gradient_across_scenarios(void) {
     // Scenario 2: Spike + Recovery
     {
         GradientTestData* data = gen_spike_recovery(n_ticks, 1.0, 6.0, 800, 200, 0.01, dgp_nu, 200);
+        float filter_mu = estimate_mu_from_returns(data->returns, data->n_ticks);
         GradientDiagnosticResults* r = run_gradient_diagnostic(
             data, filter_nu, filter_mu, filter_rho, filter_sigma, n_particles, n_stein_steps, 200
         );
-        printf(" %-20s | %+8.5f | %+10.5f | %+9.5f | %7.4f | %4d\n",
-               data->scenario_name, r->mean_nu_grad, r->mean_grad_crash, r->mean_grad_calm, r->rmse_h, r->n_crashes);
+        printf(" %-20s | %6.2f | %7.3f | %+8.5f | %+10.5f | %4d\n",
+               data->scenario_name, filter_mu, r->mean_z_sq, r->mean_nu_grad, r->mean_grad_crash, r->n_crashes);
         free_results(r);
         free_gradient_test_data(data);
     }
@@ -588,11 +608,12 @@ static void test_gradient_across_scenarios(void) {
     // Scenario 3: OU Process (calm)
     {
         GradientTestData* data = gen_ou_process(n_ticks, 0.985, 0.03, 1.0, dgp_nu, 300);
+        float filter_mu = estimate_mu_from_returns(data->returns, data->n_ticks);
         GradientDiagnosticResults* r = run_gradient_diagnostic(
             data, filter_nu, filter_mu, filter_rho, filter_sigma, n_particles, n_stein_steps, 300
         );
-        printf(" %-20s | %+8.5f | %+10.5f | %+9.5f | %7.4f | %4d\n",
-               "OU (low stress)", r->mean_nu_grad, r->mean_grad_crash, r->mean_grad_calm, r->rmse_h, r->n_crashes);
+        printf(" %-20s | %6.2f | %7.3f | %+8.5f | %+10.5f | %4d\n",
+               "OU (low stress)", filter_mu, r->mean_z_sq, r->mean_nu_grad, r->mean_grad_crash, r->n_crashes);
         free_results(r);
         free_gradient_test_data(data);
     }
@@ -600,11 +621,12 @@ static void test_gradient_across_scenarios(void) {
     // Scenario 4: OU Process (stressed)
     {
         GradientTestData* data = gen_ou_process(n_ticks, 0.985, 0.05, 4.0, dgp_nu, 400);
+        float filter_mu = estimate_mu_from_returns(data->returns, data->n_ticks);
         GradientDiagnosticResults* r = run_gradient_diagnostic(
             data, filter_nu, filter_mu, filter_rho, filter_sigma, n_particles, n_stein_steps, 400
         );
-        printf(" %-20s | %+8.5f | %+10.5f | %+9.5f | %7.4f | %4d\n",
-               "OU (high stress)", r->mean_nu_grad, r->mean_grad_crash, r->mean_grad_calm, r->rmse_h, r->n_crashes);
+        printf(" %-20s | %6.2f | %7.3f | %+8.5f | %+10.5f | %4d\n",
+               "OU (high stress)", filter_mu, r->mean_z_sq, r->mean_nu_grad, r->mean_grad_crash, r->n_crashes);
         free_results(r);
         free_gradient_test_data(data);
     }
@@ -636,12 +658,18 @@ static void test_gradient_sweep(void) {
     // Generate spike data
     GradientTestData* data = gen_spike_recovery(n_ticks, 1.0, 5.0, 600, 150, 0.015, dgp_nu, 555);
     
+    // Auto-calibrate μ from generated data
+    float filter_mu = estimate_mu_from_returns(data->returns, data->n_ticks);
+    float filter_rho = 0.97f;
+    float filter_sigma = 0.15f;
+    
     printf(" DGP: Spike + Recovery, true_ν=%.0f\n", dgp_nu);
+    printf(" Auto-calibrated: μ=%.2f (implied vol=%.2f%%)\n", filter_mu, expf(filter_mu / 2.0f) * 100.0f);
     printf("\n");
     printf(" Sweeping filter ν to find where gradient crosses zero:\n");
     printf("\n");
-    printf("   ν_filter | Mean Gradient | Direction\n");
-    printf("   ---------+--------------+----------\n");
+    printf("   ν_filter | Mean Gradient | z²_mean | Crashes | Direction\n");
+    printf("   ---------+--------------+---------+---------+----------\n");
     
     float nu_values[] = {3.0f, 4.0f, 5.0f, 6.0f, 8.0f, 10.0f, 15.0f, 20.0f, 30.0f};
     int n_nu = sizeof(nu_values) / sizeof(nu_values[0]);
@@ -652,7 +680,7 @@ static void test_gradient_sweep(void) {
     for (int i = 0; i < n_nu; i++) {
         float filter_nu = nu_values[i];
         GradientDiagnosticResults* r = run_gradient_diagnostic(
-            data, filter_nu, -3.5f, 0.97f, 0.15f, n_particles, n_stein_steps, 555 + i
+            data, filter_nu, filter_mu, filter_rho, filter_sigma, n_particles, n_stein_steps, 555 + i
         );
         
         const char* direction;
@@ -660,7 +688,8 @@ static void test_gradient_sweep(void) {
         else if (r->mean_nu_grad < -0.001) direction = "↓ decrease ν";
         else direction = "≈ equilibrium";
         
-        printf("   %7.1f  | %+12.6f | %s\n", filter_nu, r->mean_nu_grad, direction);
+        printf("   %7.1f  | %+12.6f | %7.3f | %5d   | %s\n", 
+               filter_nu, r->mean_nu_grad, r->mean_z_sq, r->n_crashes, direction);
         
         // Detect zero crossing
         if (i > 0 && prev_grad > 0 && r->mean_nu_grad < 0) {
@@ -676,9 +705,10 @@ static void test_gradient_sweep(void) {
     if (equilibrium_nu > 0) {
         printf(" Equilibrium ν ≈ %.1f (gradient crosses zero)\n", equilibrium_nu);
         printf(" True DGP ν = %.1f\n", dgp_nu);
-        printf(" Difference: %.1f\n", fabs(equilibrium_nu - dgp_nu));
+        printf(" Difference: %.1f (due to model mismatch: DGP has time-varying params)\n", fabs(equilibrium_nu - dgp_nu));
     } else {
         printf(" No zero crossing found in range [3, 30]\n");
+        printf(" Gradient still positive at ν=30 → equilibrium ν > 30\n");
     }
     printf("\n");
     
