@@ -545,15 +545,20 @@ void svpf_compute_sigma_diagnostic_simple(
     cudaMalloc(&d_sigma_grad, sizeof(float));
     cudaMalloc(&d_eps_sq_norm, sizeof(float));
     
-    // Use h_pred (before Stein transport), NOT h (after Stein)
-    // Stein push is deterministic and >> σ, so using h gives ε²/σ² >> 1
+    // Use the EFFECTIVE sigma that the filter actually used (includes breathing)
+    float effective_sigma = state->sigma_z_effective;
+    if (effective_sigma < 1e-6f) {
+        effective_sigma = params->sigma_z;  // Fallback
+    }
+    
+    // Use h_pred (before Stein transport) and EFFECTIVE sigma
     svpf_sigma_gradient_kernel<<<1, 256, 48, state->stream>>>(
-        state->h_pred,    // <-- FIXED: use h_pred, not h
+        state->h_pred,
         state->h_prev,
         state->log_weights,
         params->mu,
         params->rho,
-        params->sigma_z,
+        effective_sigma,
         d_sigma_grad,
         d_eps_sq_norm,
         state->n_particles
