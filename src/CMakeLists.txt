@@ -7,6 +7,7 @@ set(SVPF_SOURCES
     svpf_optimized_graph.cu
     svpf_opt_kernels.cu
     svpf_gradient_diagnostic.cu
+    svpf_diagnostics.cu
 )
 
 # =============================================================================
