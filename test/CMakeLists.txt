@@ -90,6 +90,28 @@ set_target_properties(svpf_gradient_market PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
 )
 
+# -----------------------------------------------------------------------------
+# σ (vol-of-vol) gradient test - always informative (unlike ν)
+# -----------------------------------------------------------------------------
+add_executable(svpf_gradient_sigma test_svpf_gradient_sigma.cu)
+
+target_include_directories(svpf_gradient_sigma
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CUDAToolkit_INCLUDE_DIRS}
+)
+
+target_link_libraries(svpf_gradient_sigma
+    PRIVATE
+        svpf
+        CUDA::cudart
+        CUDA::curand
+)
+
+set_target_properties(svpf_gradient_sigma PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+)
+
 # =============================================================================
 # CTest Integration
 # =============================================================================
@@ -117,4 +139,10 @@ add_test(NAME GradientMarket COMMAND svpf_gradient_market)
 set_tests_properties(GradientMarket PROPERTIES
     TIMEOUT 600
     LABELS "gradient;market;self-tuning"
+)
+
+add_test(NAME GradientSigma COMMAND svpf_gradient_sigma)
+set_tests_properties(GradientSigma PROPERTIES
+    TIMEOUT 600
+    LABELS "gradient;sigma;self-tuning"
 )

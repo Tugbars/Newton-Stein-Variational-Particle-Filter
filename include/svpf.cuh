@@ -832,6 +832,41 @@ void svpf_compute_nu_diagnostic_simple(
 );
 
 /**
+ * @brief Compute σ gradient for diagnostic purposes
+ * 
+ * From transition likelihood: log p(h_t|h_{t-1}) = -½log(2πσ²) - ε²/(2σ²)
+ * Gradient: ∂/∂σ = (ε²/σ² - 1) / σ
+ * 
+ * Expected behavior:
+ *   - σ too HIGH → ε²/σ² < 1 → gradient NEGATIVE (decrease σ)
+ *   - σ too LOW  → ε²/σ² > 1 → gradient POSITIVE (increase σ)
+ *   - σ correct  → ε²/σ² ≈ 1 → gradient ≈ 0
+ * 
+ * Key advantage over ν: Signal available EVERY timestep, not just crashes.
+ * 
+ * @param state           SVPF state (has h, h_prev, log_weights)
+ * @param params          SV parameters (μ, ρ, σ)
+ * @param sigma_grad_out  Output: σ gradient (positive → increase σ)
+ * @param eps_sq_norm_out Output: mean ε²/σ² (should be ~1.0 if σ correct)
+ */
+void svpf_compute_sigma_diagnostic_simple(
+    SVPFState* state,
+    const SVPFParams* params,
+    float* sigma_grad_out,
+    float* eps_sq_norm_out
+);
+
+/**
+ * @brief Snapshot current particles to a buffer
+ * 
+ * Use when you need h_{t-1} explicitly (state->h_prev should already have it).
+ */
+void svpf_snapshot_particles(
+    SVPFState* state,
+    float* d_h_buffer
+);
+
+/**
  * @brief Compute all 4 parameter gradients (μ, ρ, σ, ν)
  * 
  * Requires h_prev snapshot from BEFORE svpf_step_graph().

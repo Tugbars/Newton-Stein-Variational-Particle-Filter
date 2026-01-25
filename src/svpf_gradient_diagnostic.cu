@@ -392,6 +392,198 @@ float svpf_get_lr_multiplier(const SVPFGradientDiagnostics* diag, float lr_shock
 // Natural Gradient Tuner (Stub - Future Implementation)
 // =============================================================================
 
+// =============================================================================
+// σ Gradient Kernel (Transition Likelihood)
+// =============================================================================
+// 
+// Computes ∂/∂σ log p(h_t | h_{t-1}, θ) for Gaussian transition:
+//
+//   log p(h_t|h_{t-1}) = -½log(2πσ²) - ε²/(2σ²)
+//   where ε = h_t - μ - ρ(h_{t-1} - μ)
+//
+// Gradient:
+//   ∂/∂σ = -1/σ + ε²/σ³ = (ε²/σ² - 1) / σ
+//
+// Expected behavior:
+//   - σ too HIGH → ε²/σ² < 1 → gradient NEGATIVE (decrease σ)
+//   - σ too LOW  → ε²/σ² > 1 → gradient POSITIVE (increase σ)
+//   - σ correct  → ε²/σ² ≈ 1 → gradient ≈ 0
+//
+// Key advantage over ν: Signal available EVERY timestep, not just crashes.
+
+__global__ void svpf_sigma_gradient_kernel(
+    const float* __restrict__ h,           // [n] Current particles h_t
+    const float* __restrict__ h_prev,      // [n] Previous particles h_{t-1}
+    const float* __restrict__ log_w,       // [n] Log weights
+    float mu,                              // Mean level
+    float rho,                             // Persistence
+    float sigma,                           // Current σ value
+    float* __restrict__ d_sigma_grad,      // Output: weighted mean σ gradient
+    float* __restrict__ d_eps_sq_mean,     // Output: mean ε²/σ² (diagnostic)
+    int n
+) {
+    extern __shared__ float smem[];
+    float* s_max = smem;
+    float* s_grad_sum = &smem[8];
+    float* s_weight_sum = &smem[9];
+    float* s_eps_sq_sum = &smem[10];
+    
+    int tid = threadIdx.x;
+    int warp_id = tid / 32;
+    int lane_id = tid % 32;
+    
+    if (tid == 0) {
+        *s_grad_sum = 0.0f;
+        *s_weight_sum = 0.0f;
+        *s_eps_sq_sum = 0.0f;
+    }
+    if (tid < 8) {
+        s_max[tid] = -1e30f;
+    }
+    __syncthreads();
+    
+    // === Pass 1: Find max log weight ===
+    float local_max = -1e30f;
+    for (int i = tid; i < n; i += blockDim.x) {
+        float lw = log_w[i];
+        if (!isnan(lw) && !isinf(lw)) {
+            local_max = fmaxf(local_max, lw);
+        }
+    }
+    
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        float other = __shfl_down_sync(0xffffffff, local_max, offset);
+        local_max = fmaxf(local_max, other);
+    }
+    
+    if (lane_id == 0 && warp_id < 8) {
+        s_max[warp_id] = local_max;
+    }
+    __syncthreads();
+    
+    float max_log_w = -1e30f;
+    if (tid == 0) {
+        for (int i = 0; i < 8; i++) {
+            max_log_w = fmaxf(max_log_w, s_max[i]);
+        }
+        s_max[0] = max_log_w;
+    }
+    __syncthreads();
+    max_log_w = s_max[0];
+    
+    // === Pass 2: Compute weighted gradient ===
+    float inv_sigma = 1.0f / sigma;
+    float inv_sigma_sq = inv_sigma * inv_sigma;
+    
+    float local_grad = 0.0f;
+    float local_weight = 0.0f;
+    float local_eps_sq_norm = 0.0f;
+    
+    for (int i = tid; i < n; i += blockDim.x) {
+        float w_i = __expf(log_w[i] - max_log_w);
+        
+        // Transition innovation: ε = h_t - μ - ρ(h_{t-1} - μ)
+        float h_i = h[i];
+        float h_prev_i = h_prev[i];
+        float eps = h_i - mu - rho * (h_prev_i - mu);
+        float eps_sq = eps * eps;
+        
+        // Normalized squared innovation: ε²/σ²
+        float eps_sq_norm = eps_sq * inv_sigma_sq;
+        
+        // σ gradient: (ε²/σ² - 1) / σ
+        float grad_sigma = (eps_sq_norm - 1.0f) * inv_sigma;
+        
+        local_grad += w_i * grad_sigma;
+        local_weight += w_i;
+        local_eps_sq_norm += w_i * eps_sq_norm;
+    }
+    
+    atomicAdd(s_grad_sum, local_grad);
+    atomicAdd(s_weight_sum, local_weight);
+    atomicAdd(s_eps_sq_sum, local_eps_sq_norm);
+    __syncthreads();
+    
+    if (tid == 0) {
+        float inv_weight = 1.0f / (*s_weight_sum + 1e-8f);
+        *d_sigma_grad = *s_grad_sum * inv_weight;
+        *d_eps_sq_mean = *s_eps_sq_sum * inv_weight;  // ε²/σ² mean
+    }
+}
+
+// =============================================================================
+// Host API: Compute σ Gradient (Simple Version)
+// =============================================================================
+
+/**
+ * @brief Compute σ gradient for diagnostic purposes
+ * 
+ * @param state         SVPF state (has h, h_prev, log_weights)
+ * @param params        SV parameters (μ, ρ, σ)
+ * @param sigma_grad_out    Output: σ gradient (positive → increase σ)
+ * @param eps_sq_norm_out   Output: mean ε²/σ² (should be ~1.0 if σ correct)
+ */
+void svpf_compute_sigma_diagnostic_simple(
+    SVPFState* state,
+    const SVPFParams* params,
+    float* sigma_grad_out,
+    float* eps_sq_norm_out
+) {
+    float* d_sigma_grad;
+    float* d_eps_sq_norm;
+    cudaMalloc(&d_sigma_grad, sizeof(float));
+    cudaMalloc(&d_eps_sq_norm, sizeof(float));
+    
+    svpf_sigma_gradient_kernel<<<1, 256, 48, state->stream>>>(
+        state->h,
+        state->h_prev,
+        state->log_weights,
+        params->mu,
+        params->rho,
+        params->sigma_z,
+        d_sigma_grad,
+        d_eps_sq_norm,
+        state->n_particles
+    );
+    
+    float sigma_grad, eps_sq_norm;
+    cudaMemcpy(&sigma_grad, d_sigma_grad, sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&eps_sq_norm, d_eps_sq_norm, sizeof(float), cudaMemcpyDeviceToHost);
+    
+    cudaFree(d_sigma_grad);
+    cudaFree(d_eps_sq_norm);
+    
+    if (sigma_grad_out) *sigma_grad_out = sigma_grad;
+    if (eps_sq_norm_out) *eps_sq_norm_out = eps_sq_norm;
+}
+
+// =============================================================================
+// Host API: Snapshot h for σ gradient computation
+// =============================================================================
+
+/**
+ * @brief Copy current particles to a buffer for later σ gradient computation
+ * 
+ * Call BEFORE svpf_step_graph() if you need h_{t-1} for gradient.
+ * (Note: state->h_prev should already have this after a step)
+ */
+void svpf_snapshot_particles(
+    SVPFState* state,
+    float* d_h_buffer
+) {
+    cudaMemcpyAsync(
+        d_h_buffer,
+        state->h,
+        state->n_particles * sizeof(float),
+        cudaMemcpyDeviceToDevice,
+        state->stream
+    );
+}
+
+// =============================================================================
+// Natural Gradient Tuner Implementation
+// =============================================================================
+
 SVPFNaturalGradientTuner* svpf_tuner_create(
     const SVPFParams* params,
     float nu,
