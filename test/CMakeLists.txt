@@ -88,6 +88,28 @@ set_target_properties(svpf_gradient_dgp PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
 )
 
+# -----------------------------------------------------------------------------
+# Market data gradient test (real crashes: 2008, 2020, etc.)
+# -----------------------------------------------------------------------------
+add_executable(svpf_gradient_market test_svpf_gradient_market.cu)
+
+target_include_directories(svpf_gradient_market
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CUDAToolkit_INCLUDE_DIRS}
+)
+
+target_link_libraries(svpf_gradient_market
+    PRIVATE
+        svpf
+        CUDA::cudart
+        CUDA::curand
+)
+
+set_target_properties(svpf_gradient_market PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+)
+
 # =============================================================================
 # CTest Integration
 # =============================================================================
@@ -115,6 +137,12 @@ add_test(NAME GradientDiagnostic COMMAND svpf_gradient_dgp)
 set_tests_properties(GradientDiagnostic PROPERTIES
     TIMEOUT 300
     LABELS "gradient;self-tuning"
+)
+
+add_test(NAME GradientMarket COMMAND svpf_gradient_market)
+set_tests_properties(GradientMarket PROPERTIES
+    TIMEOUT 600
+    LABELS "gradient;market;self-tuning"
 )
 
 # =============================================================================
@@ -191,6 +219,22 @@ add_custom_target(gradient_log
     COMMENT "Running gradient diagnostic with CSV log output..."
 )
 
+# Run gradient test on real market data
+add_custom_target(gradient_market
+    COMMAND ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/svpf_gradient_market
+    DEPENDS svpf_gradient_market
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    COMMENT "Running gradient diagnostic on real market data (2008, 2020 crashes)..."
+)
+
+# Run gradient market test with time series output
+add_custom_target(gradient_market_ts
+    COMMAND ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/svpf_gradient_market --timeseries gradient_timeseries.csv
+    DEPENDS svpf_gradient_market
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    COMMENT "Running gradient diagnostic with time series output..."
+)
+
 # Run all comparison tests
 add_custom_target(compare_all
     COMMAND ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/svpf_scenarios
@@ -205,7 +249,8 @@ add_custom_target(all_tests
     COMMAND ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/svpf_scenarios
     COMMAND ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/svpf_hcrbpf_dgp
     COMMAND ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/svpf_gradient_dgp
-    DEPENDS svpf_scenarios svpf_hcrbpf_dgp svpf_gradient_dgp
+    COMMAND ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/svpf_gradient_market
+    DEPENDS svpf_scenarios svpf_hcrbpf_dgp svpf_gradient_dgp svpf_gradient_market
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
-    COMMENT "Running all tests (scenarios + HCRBPF comparison + gradient diagnostic)..."
+    COMMENT "Running all tests (scenarios + HCRBPF + gradient DGP + gradient market)..."
 )
