@@ -219,7 +219,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     state->use_adaptive_sigma = 0;       // Disabled by default
     state->sigma_boost_threshold = 1.0f; // Start boosting when |z| > 1
     state->sigma_boost_max = 3.0f;       // Max 3x boost
-    state->sigma_z_effective = 0.15f;    // Initial effective sigma_z
+    state->sigma_z_effective = 0.10f;    // Calibrated via gradient diagnostic (was 0.15)
     
     // Device scalars
     cudaMalloc(&state->d_scalar_max, sizeof(float));
