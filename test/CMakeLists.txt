@@ -146,3 +146,25 @@ set_tests_properties(GradientSigma PROPERTIES
     TIMEOUT 600
     LABELS "gradient;sigma;self-tuning"
 )
+
+# -----------------------------------------------------------------------------
+# Performance profiler
+# -----------------------------------------------------------------------------
+add_executable(profile_svpf profile_svpf.cu)
+
+target_include_directories(profile_svpf
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CUDAToolkit_INCLUDE_DIRS}
+)
+
+target_link_libraries(profile_svpf
+    PRIVATE
+        svpf
+        CUDA::cudart
+        CUDA::curand
+)
+
+set_target_properties(profile_svpf PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+)

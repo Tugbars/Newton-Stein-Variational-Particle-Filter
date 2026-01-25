@@ -361,6 +361,7 @@ __global__ void svpf_fused_gradient_kernel(
     
     // Pass 1: numerical stability - find max log weight
     float log_r_max = -1e10f;
+    #pragma unroll 8
     for (int i = 0; i < n; i++) {
         float diff = h_j - sh_mu_i[i];
         float log_r_i = -diff * diff * inv_2sigma_sq;
@@ -370,6 +371,7 @@ __global__ void svpf_fused_gradient_kernel(
     // Pass 2: weighted gradient
     float sum_r = 0.0f;
     float weighted_grad = 0.0f;
+    #pragma unroll 8
     for (int i = 0; i < n; i++) {
         float diff = h_j - sh_mu_i[i];
         float log_r_i = -diff * diff * inv_2sigma_sq;

@@ -497,9 +497,11 @@ static void svpf_graph_capture_internal(SVPFState* state, const SVPFParams* para
         );
     }
     
+#ifdef SVPF_ENABLE_DIAGNOSTICS
     // Snapshot predicted particles BEFORE Stein transport (for σ gradient diagnostic)
     // h_pred = h after prediction, before any transport/guide modifications
     cudaMemcpyAsync(state->h_pred, state->h, n * sizeof(float), cudaMemcpyDeviceToDevice, cs);
+#endif
     
     // GUIDE
     if (state->use_guide) {
@@ -759,22 +761,34 @@ void svpf_step_graph(SVPFState* state, float y_t, float y_prev, const SVPFParams
         cudaMemcpyAsync(opt->d_guide_mean, &state->guide_mean, sizeof(float), cudaMemcpyHostToDevice, opt->graph_stream);
     }
     
-    cudaStreamSynchronize(opt->graph_stream);
+    // NOTE: No sync needed here! cudaMemcpyAsync on same stream guarantees
+    // ordering - the graph will see the uploaded params.
     cudaGraphLaunch(opt->graph_exec, opt->graph_stream);
     cudaStreamSynchronize(opt->graph_stream);
     
-    // Read back results
-    float h_mean_local = 0.0f;
-    float bandwidth_local = 0.0f;
-    float vol_local = 0.0f;
+    // Read back results - BATCHED to avoid multiple sync points
+    // Pack into contiguous struct for single memcpy
+    struct {
+        float loglik;
+        float vol;
+        float h_mean;
+        float bandwidth;
+    } results;
     
-    if (h_loglik_out) cudaMemcpy(h_loglik_out, opt->d_loglik_single, sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(&vol_local, opt->d_vol_single, sizeof(float), cudaMemcpyDeviceToHost);
-    if (h_vol_out) *h_vol_out = vol_local;
-    cudaMemcpy(&h_mean_local, opt->d_h_mean_prev, sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(&bandwidth_local, opt->d_bandwidth, sizeof(float), cudaMemcpyDeviceToHost);
+    // Use async copies then single sync
+    cudaMemcpyAsync(&results.loglik, opt->d_loglik_single, sizeof(float), cudaMemcpyDeviceToHost, opt->graph_stream);
+    cudaMemcpyAsync(&results.vol, opt->d_vol_single, sizeof(float), cudaMemcpyDeviceToHost, opt->graph_stream);
+    cudaMemcpyAsync(&results.h_mean, opt->d_h_mean_prev, sizeof(float), cudaMemcpyDeviceToHost, opt->graph_stream);
+    cudaMemcpyAsync(&results.bandwidth, opt->d_bandwidth, sizeof(float), cudaMemcpyDeviceToHost, opt->graph_stream);
+    cudaStreamSynchronize(opt->graph_stream);  // Single sync for all 4 copies
     
-    if (h_mean_out) *h_mean_out = h_mean_local;
+    if (h_loglik_out) *h_loglik_out = results.loglik;
+    if (h_vol_out) *h_vol_out = results.vol;
+    if (h_mean_out) *h_mean_out = results.h_mean;
+    
+    float h_mean_local = results.h_mean;
+    float bandwidth_local = results.bandwidth;
+    float vol_local = results.vol;
     
     // Update state for next step
     state->vol_prev = vol_local;              // For adaptive guide and adaptive sigma
