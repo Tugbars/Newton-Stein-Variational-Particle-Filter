@@ -184,6 +184,10 @@ typedef struct {
     float mu_captured;
     float sigma_z_captured;
     
+    // Pinned host memory for fast D2H transfers
+    // Layout: [loglik, vol, h_mean, bandwidth]
+    float* h_results_pinned;
+    
     // Capacity tracking
     int allocated_n;
     bool initialized;
@@ -837,6 +841,9 @@ void svpf_compute_nu_diagnostic_simple(
  * From transition likelihood: log p(h_t|h_{t-1}) = -½log(2πσ²) - ε²/(2σ²)
  * Gradient: ∂/∂σ = (ε²/σ² - 1) / σ
  * 
+ * IMPORTANT: Uses h_pred (before Stein transport), not h (after Stein).
+ * Stein transport is deterministic and >> σ, so post-Stein h gives garbage.
+ * 
  * Expected behavior:
  *   - σ too HIGH → ε²/σ² < 1 → gradient NEGATIVE (decrease σ)
  *   - σ too LOW  → ε²/σ² > 1 → gradient POSITIVE (increase σ)
@@ -844,7 +851,7 @@ void svpf_compute_nu_diagnostic_simple(
  * 
  * Key advantage over ν: Signal available EVERY timestep, not just crashes.
  * 
- * @param state           SVPF state (has h, h_prev, log_weights)
+ * @param state           SVPF state (uses h_pred, h_prev, log_weights)
  * @param params          SV parameters (μ, ρ, σ)
  * @param sigma_grad_out  Output: σ gradient (positive → increase σ)
  * @param eps_sq_norm_out Output: mean ε²/σ² (should be ~1.0 if σ correct)

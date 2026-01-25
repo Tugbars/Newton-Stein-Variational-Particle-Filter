@@ -394,6 +394,10 @@ static void svpf_optimized_init(SVPFOptimizedState* opt, int n) {
     opt->graph_n = 0;
     opt->graph_n_stein = 0;
     
+    // Pinned host memory for fast D2H transfers
+    // Layout: [loglik, vol, h_mean, bandwidth]
+    cudaMallocHost(&opt->h_results_pinned, 4 * sizeof(float));
+    
     opt->allocated_n = n;
     opt->initialized = true;
 }
@@ -418,6 +422,12 @@ static void svpf_optimized_cleanup(SVPFOptimizedState* opt) {
     cudaFree(opt->d_loglik_single);
     cudaFree(opt->d_vol_single);
     cudaFree(opt->d_params_staging);
+    
+    // Free pinned host memory
+    if (opt->h_results_pinned) {
+        cudaFreeHost(opt->h_results_pinned);
+        opt->h_results_pinned = nullptr;
+    }
     
     if (opt->graph_captured) {
         cudaGraphExecDestroy(opt->graph_exec);
@@ -764,31 +774,28 @@ void svpf_step_graph(SVPFState* state, float y_t, float y_prev, const SVPFParams
     // NOTE: No sync needed here! cudaMemcpyAsync on same stream guarantees
     // ordering - the graph will see the uploaded params.
     cudaGraphLaunch(opt->graph_exec, opt->graph_stream);
+    
+    // Read back results using PINNED MEMORY for faster D2H
+    // NO SYNC between graph and memcpy - stream ordering handles it!
+    // Layout: [0]=loglik, [1]=vol, [2]=h_mean, [3]=bandwidth
+    float* results = opt->h_results_pinned;
+    
+    // Async copies to pinned memory - queued after graph completion
+    cudaMemcpyAsync(&results[0], opt->d_loglik_single, sizeof(float), cudaMemcpyDeviceToHost, opt->graph_stream);
+    cudaMemcpyAsync(&results[1], opt->d_vol_single, sizeof(float), cudaMemcpyDeviceToHost, opt->graph_stream);
+    cudaMemcpyAsync(&results[2], opt->d_h_mean_prev, sizeof(float), cudaMemcpyDeviceToHost, opt->graph_stream);
+    cudaMemcpyAsync(&results[3], opt->d_bandwidth, sizeof(float), cudaMemcpyDeviceToHost, opt->graph_stream);
+    
+    // SINGLE sync - waits for graph AND all memcpy to complete
     cudaStreamSynchronize(opt->graph_stream);
     
-    // Read back results - BATCHED to avoid multiple sync points
-    // Pack into contiguous struct for single memcpy
-    struct {
-        float loglik;
-        float vol;
-        float h_mean;
-        float bandwidth;
-    } results;
+    if (h_loglik_out) *h_loglik_out = results[0];
+    if (h_vol_out) *h_vol_out = results[1];
+    if (h_mean_out) *h_mean_out = results[2];
     
-    // Use async copies then single sync
-    cudaMemcpyAsync(&results.loglik, opt->d_loglik_single, sizeof(float), cudaMemcpyDeviceToHost, opt->graph_stream);
-    cudaMemcpyAsync(&results.vol, opt->d_vol_single, sizeof(float), cudaMemcpyDeviceToHost, opt->graph_stream);
-    cudaMemcpyAsync(&results.h_mean, opt->d_h_mean_prev, sizeof(float), cudaMemcpyDeviceToHost, opt->graph_stream);
-    cudaMemcpyAsync(&results.bandwidth, opt->d_bandwidth, sizeof(float), cudaMemcpyDeviceToHost, opt->graph_stream);
-    cudaStreamSynchronize(opt->graph_stream);  // Single sync for all 4 copies
-    
-    if (h_loglik_out) *h_loglik_out = results.loglik;
-    if (h_vol_out) *h_vol_out = results.vol;
-    if (h_mean_out) *h_mean_out = results.h_mean;
-    
-    float h_mean_local = results.h_mean;
-    float bandwidth_local = results.bandwidth;
-    float vol_local = results.vol;
+    float h_mean_local = results[2];
+    float bandwidth_local = results[3];
+    float vol_local = results[1];
     
     // Update state for next step
     state->vol_prev = vol_local;              // For adaptive guide and adaptive sigma

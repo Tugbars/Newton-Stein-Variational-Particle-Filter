@@ -392,7 +392,7 @@ static void profile_overhead_breakdown(int n_particles, int n_steps) {
     TimingStats s_d2h = compute_stats(t_memcpy_d2h);
     printf("    cudaMemcpy D2H (16B):      mean=%5.1f μs, p99=%5.1f μs\n", s_d2h.mean_us, s_d2h.p99_us);
     
-    // 4. Measure 4x separate cudaMemcpy D2H (current code does this!)
+    // 4. Measure 4x separate cudaMemcpy D2H (old code)
     std::vector<float> t_memcpy_d2h_4x;
     for (int i = 0; i < n_steps; i++) {
         cudaEventRecord(e_start);
@@ -407,10 +407,32 @@ static void profile_overhead_breakdown(int n_particles, int n_steps) {
         t_memcpy_d2h_4x.push_back(ms * 1000.0f);
     }
     TimingStats s_d2h_4x = compute_stats(t_memcpy_d2h_4x);
-    printf("    4x cudaMemcpy D2H (4B ea): mean=%5.1f μs, p99=%5.1f μs  ← CURRENT CODE!\n", 
+    printf("    4x cudaMemcpy D2H (4B ea): mean=%5.1f μs, p99=%5.1f μs  ← OLD CODE\n", 
            s_d2h_4x.mean_us, s_d2h_4x.p99_us);
     
-    // 5. Now profile actual svpf_step_graph
+    // 5. Measure pinned memory D2H (new code)
+    float* h_pinned;
+    cudaMallocHost(&h_pinned, 4 * sizeof(float));
+    std::vector<float> t_memcpy_pinned;
+    for (int i = 0; i < n_steps; i++) {
+        cudaEventRecord(e_start);
+        cudaMemcpyAsync(&h_pinned[0], d_result + 0, sizeof(float), cudaMemcpyDeviceToHost, 0);
+        cudaMemcpyAsync(&h_pinned[1], d_result + 1, sizeof(float), cudaMemcpyDeviceToHost, 0);
+        cudaMemcpyAsync(&h_pinned[2], d_result + 2, sizeof(float), cudaMemcpyDeviceToHost, 0);
+        cudaMemcpyAsync(&h_pinned[3], d_result + 3, sizeof(float), cudaMemcpyDeviceToHost, 0);
+        cudaStreamSynchronize(0);
+        cudaEventRecord(e_end);
+        cudaEventSynchronize(e_end);
+        float ms;
+        cudaEventElapsedTime(&ms, e_start, e_end);
+        t_memcpy_pinned.push_back(ms * 1000.0f);
+    }
+    TimingStats s_pinned = compute_stats(t_memcpy_pinned);
+    printf("    4x async+pinned D2H:       mean=%5.1f μs, p99=%5.1f μs  ← NEW CODE\n", 
+           s_pinned.mean_us, s_pinned.p99_us);
+    cudaFreeHost(h_pinned);
+    
+    // 6. Now profile actual svpf_step_graph
     SVPFState* state = svpf_create(n_particles, 5, 7.0f, nullptr);
     SVPFParams params = {0.98f, 0.10f, -4.5f, 0.0f};
     svpf_initialize(state, &params, 12345);
@@ -440,23 +462,22 @@ static void profile_overhead_breakdown(int n_particles, int n_steps) {
     printf("\n    TOTAL svpf_step_graph:     mean=%5.1f μs, p99=%5.1f μs\n", 
            s_total.mean_us, s_total.p99_us);
     
-    // Estimate breakdown
-    float overhead_sync = 2 * s_sync.mean_us;  // Two syncs
-    float overhead_memcpy = s_d2h_4x.mean_us + 3 * s_h2d.mean_us;  // 4 D2H + 3 H2D
+    // Estimate breakdown (single sync architecture - D2H overlaps with graph)
+    float overhead_sync = s_sync.mean_us;  // Just one sync at end
+    float overhead_memcpy = 3 * s_h2d.mean_us;  // H2D only - D2H pipelined
     float estimated_kernels = s_total.mean_us - overhead_sync - overhead_memcpy;
     
-    printf("\n  Estimated breakdown:\n");
-    printf("    Sync overhead (2x):        ~%5.1f μs (%.0f%%)\n", 
+    printf("\n  Estimated breakdown (single sync, pipelined D2H):\n");
+    printf("    Sync overhead (1x):        ~%5.1f μs (%.0f%%)\n", 
            overhead_sync, 100.0f * overhead_sync / s_total.mean_us);
-    printf("    Memcpy overhead:           ~%5.1f μs (%.0f%%)\n", 
+    printf("    H2D memcpy overhead:       ~%5.1f μs (%.0f%%)\n", 
            overhead_memcpy, 100.0f * overhead_memcpy / s_total.mean_us);
-    printf("    Actual kernels:            ~%5.1f μs (%.0f%%)\n",
+    printf("    Kernels + D2H (pipelined): ~%5.1f μs (%.0f%%)\n",
            estimated_kernels, 100.0f * estimated_kernels / s_total.mean_us);
     
-    printf("\n  OPTIMIZATION OPPORTUNITY:\n");
-    printf("    Batch 4 D2H memcpy → 1:    save ~%.0f μs (%.0f%%)\n",
-           s_d2h_4x.mean_us - s_d2h.mean_us,
-           100.0f * (s_d2h_4x.mean_us - s_d2h.mean_us) / s_total.mean_us);
+    printf("\n  Reference timings:\n");
+    printf("    Old (4x sync memcpy):      ~%5.1f μs\n", s_d2h_4x.mean_us);
+    printf("    Pinned async D2H:          ~%5.1f μs\n", s_pinned.mean_us);
     
     // Cleanup
     cudaEventDestroy(e_start);
