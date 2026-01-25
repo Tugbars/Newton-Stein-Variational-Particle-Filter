@@ -1,2 +1,7 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Exclude data files from linguist statistics
+*.csv linguist-generated
+*.bin linguist-generated binary
+market_data/** linguist-vendored
