@@ -32,12 +32,62 @@
  * CONFIGURATION
  *═══════════════════════════════════════════════════════════════════════════*/
 
-// Default paths (relative to build directory)
-#define DATA_DIR "../market_data/"
+// Try multiple paths for market data
+static const char* DATA_PATHS[] = {
+    "../market_data/",           // From build/ directory
+    "market_data/",              // From project root
+    "../../market_data/",        // From build/Release or build/Debug
+    "../../../market_data/",     // Deeper nested build dirs
+    NULL
+};
 
-// Filter configuration
+// Default filter configuration
 #define DEFAULT_PARTICLES    4096
 #define DEFAULT_STEIN_STEPS  5
+
+// Find the correct data path
+static const char* find_data_path(void) {
+    for (int i = 0; DATA_PATHS[i] != NULL; i++) {
+        char test_path[512];
+        snprintf(test_path, sizeof(test_path), "%sspy_full.bin", DATA_PATHS[i]);
+        FILE* f = fopen(test_path, "rb");
+        if (f) {
+            fclose(f);
+            return DATA_PATHS[i];
+        }
+    }
+    return NULL;
+}
+
+/*═══════════════════════════════════════════════════════════════════════════
+ * MOMENT-MATCHING CALIBRATION
+ *═══════════════════════════════════════════════════════════════════════════*/
+
+/**
+ * @brief Estimate μ from realized volatility (moment matching)
+ * 
+ * In the SV model: vol_t = exp(h_t/2), with E[h_t] = μ
+ * So: E[vol] ≈ exp(μ/2)  →  μ ≈ 2·log(realized_vol)
+ * 
+ * This is crude but gets μ within ~10-20% of PMMH estimate,
+ * which is sufficient for the gradient diagnostic.
+ */
+static float estimate_mu_from_data(const float* returns, int n) {
+    // Compute sample variance
+    double sum = 0, sq_sum = 0;
+    for (int i = 0; i < n; i++) {
+        sum += returns[i];
+        sq_sum += returns[i] * returns[i];
+    }
+    double mean = sum / n;
+    double var = sq_sum / n - mean * mean;
+    
+    // Sample std = proxy for unconditional volatility
+    float realized_vol = sqrtf((float)var);
+    
+    // μ = 2·log(vol) since vol = exp(h/2)
+    return 2.0f * logf(realized_vol + 1e-8f);
+}
 
 /*═══════════════════════════════════════════════════════════════════════════
  * TEST UTILITIES
@@ -149,15 +199,18 @@ static void test_gradient_on_market_data(const char* data_path, const char* name
     }
     
     print_return_stats(name, returns, n);
-    printf("\n");
     
-    // Fixed filter params (reasonable defaults for equity returns)
-    const float filter_mu = -4.5f;       // log(0.01) ≈ -4.6 for 1% daily vol
-    const float filter_rho = 0.97f;      // Typical persistence
-    const float filter_sigma_z = 0.15f;  // Vol-of-vol
+    // Auto-calibrate μ from realized volatility
+    float filter_mu = estimate_mu_from_data(returns, n);
+    float implied_vol = expf(filter_mu / 2.0f);
     
-    printf(" Filter config: μ=%.2f, ρ=%.2f, σ_z=%.2f\n", 
-           filter_mu, filter_rho, filter_sigma_z);
+    // Fixed structural parameters (stable across equity data)
+    const float filter_rho = 0.98f;      // Persistence ~0.97-0.99 for daily
+    const float filter_sigma_z = 0.15f;  // Vol-of-vol ~0.10-0.20
+    
+    printf("\n Auto-calibrated: μ=%.2f → implied daily vol=%.2f%%\n", 
+           filter_mu, implied_vol * 100.0f);
+    printf(" Fixed params: ρ=%.2f, σ_z=%.2f\n", filter_rho, filter_sigma_z);
     printf(" Particles=%d, Stein=%d\n\n", DEFAULT_PARTICLES, DEFAULT_STEIN_STEPS);
     
     // Test different ν values
@@ -211,17 +264,24 @@ static void test_gradient_on_market_data(const char* data_path, const char* name
  * TEST: Compare Crash vs Calm Gradient Magnitude
  *═══════════════════════════════════════════════════════════════════════════*/
 
-static void test_crash_vs_calm_gradient(void) {
+static void test_crash_vs_calm_gradient(const char* data_dir) {
     printf("\n═══════════════════════════════════════════════════════════════════\n");
     printf(" TEST: Crash vs Calm Gradient Magnitude\n");
     printf("═══════════════════════════════════════════════════════════════════\n\n");
     
+    char path_spy_full[512], path_2008[512], path_2020[512], path_crashes[512], path_tsla[512];
+    snprintf(path_spy_full, sizeof(path_spy_full), "%sspy_full.bin", data_dir);
+    snprintf(path_2008, sizeof(path_2008), "%sspy_2008_crisis.bin", data_dir);
+    snprintf(path_2020, sizeof(path_2020), "%sspy_2020_covid.bin", data_dir);
+    snprintf(path_crashes, sizeof(path_crashes), "%scrashes_combined.bin", data_dir);
+    snprintf(path_tsla, sizeof(path_tsla), "%stsla.bin", data_dir);
+    
     const char* datasets[] = {
-        DATA_DIR "spy_full.bin",
-        DATA_DIR "spy_2008_crisis.bin",
-        DATA_DIR "spy_2020_covid.bin",
-        DATA_DIR "crashes_combined.bin",
-        DATA_DIR "tsla.bin"
+        path_spy_full,
+        path_2008,
+        path_2020,
+        path_crashes,
+        path_tsla
     };
     const char* names[] = {
         "SPY Full (2007-2024)",
@@ -233,10 +293,12 @@ static void test_crash_vs_calm_gradient(void) {
     int n_datasets = sizeof(datasets) / sizeof(datasets[0]);
     
     const float filter_nu = 10.0f;  // Moderately heavy tails
+    const float filter_rho = 0.98f;
+    const float filter_sigma = 0.15f;
     
-    printf(" Testing with ν=%0.f\n\n", filter_nu);
-    printf(" Dataset              | N      | Crashes | Crash Grad  | Calm Grad   | Ratio\n");
-    printf(" ---------------------+--------+---------+-------------+-------------+------\n");
+    printf(" Testing with ν=%.0f (μ auto-calibrated per dataset)\n\n", filter_nu);
+    printf(" Dataset              | N      | μ_est  | Crashes | Crash Grad  | Calm Grad   | Ratio\n");
+    printf(" ---------------------+--------+--------+---------+-------------+-------------+------\n");
     
     for (int d = 0; d < n_datasets; d++) {
         float* returns;
@@ -247,16 +309,19 @@ static void test_crash_vs_calm_gradient(void) {
             continue;
         }
         
+        // Auto-calibrate μ for this dataset
+        float filter_mu = estimate_mu_from_data(returns, n);
+        
         GradientStats stats = run_gradient_test(
-            returns, n, filter_nu, -4.5f, 0.97f, 0.15f,
+            returns, n, filter_nu, filter_mu, filter_rho, filter_sigma,
             DEFAULT_PARTICLES, DEFAULT_STEIN_STEPS
         );
         
         float ratio = (stats.mean_grad_calm != 0) ? 
             fabsf(stats.mean_grad_crash / stats.mean_grad_calm) : 0.0f;
         
-        printf(" %-20s | %6d | %7d | %+11.6f | %+11.6f | %5.1fx\n",
-               names[d], n, stats.n_crashes, 
+        printf(" %-20s | %6d | %6.2f | %7d | %+11.6f | %+11.6f | %5.1fx\n",
+               names[d], n, filter_mu, stats.n_crashes, 
                stats.mean_grad_crash, stats.mean_grad_calm, ratio);
         
         free(returns);
@@ -292,12 +357,16 @@ static void write_gradient_timeseries(const char* data_path, const char* output_
     
     fprintf(f, "t,return,vol_est,h_mean,z_sq,nu_grad_5,nu_grad_10,nu_grad_30\n");
     
+    // Auto-calibrate μ for this dataset
+    float filter_mu = estimate_mu_from_data(returns, n);
+    printf(" Auto-calibrated μ=%.2f\n", filter_mu);
+    
     // Create three filters with different ν
     SVPFState* state_5 = svpf_create(DEFAULT_PARTICLES, DEFAULT_STEIN_STEPS, 5.0f, nullptr);
     SVPFState* state_10 = svpf_create(DEFAULT_PARTICLES, DEFAULT_STEIN_STEPS, 10.0f, nullptr);
     SVPFState* state_30 = svpf_create(DEFAULT_PARTICLES, DEFAULT_STEIN_STEPS, 30.0f, nullptr);
     
-    SVPFParams params = {0.97f, 0.15f, -4.5f, 0.0f};
+    SVPFParams params = {0.98f, 0.15f, filter_mu, 0.0f};
     svpf_initialize(state_5, &params, 12345);
     svpf_initialize(state_10, &params, 12345);
     svpf_initialize(state_30, &params, 12345);
@@ -343,19 +412,40 @@ int main(int argc, char** argv) {
     printf("║     Testing on actual crashes (2008, 2020, etc.)                  ║\n");
     printf("╚═══════════════════════════════════════════════════════════════════╝\n");
     
+    // Find data directory
+    const char* data_dir = find_data_path();
+    if (!data_dir) {
+        printf("\n ERROR: Could not find market_data directory!\n");
+        printf(" Tried paths:\n");
+        for (int i = 0; DATA_PATHS[i] != NULL; i++) {
+            printf("   - %s\n", DATA_PATHS[i]);
+        }
+        printf("\n Make sure to run: python scripts/fetch_market_data.py\n");
+        printf(" And that market_data/ is at the project root.\n");
+        return 1;
+    }
+    printf("\n Found market data at: %s\n", data_dir);
+    
+    // Build full paths
+    char path_spy_full[512], path_2008[512], path_2020[512], path_crashes[512];
+    snprintf(path_spy_full, sizeof(path_spy_full), "%sspy_full.bin", data_dir);
+    snprintf(path_2008, sizeof(path_2008), "%sspy_2008_crisis.bin", data_dir);
+    snprintf(path_2020, sizeof(path_2020), "%sspy_2020_covid.bin", data_dir);
+    snprintf(path_crashes, sizeof(path_crashes), "%scrashes_combined.bin", data_dir);
+    
     // Test on different datasets
-    test_gradient_on_market_data(DATA_DIR "spy_full.bin", "SPY Full (2007-2024)");
-    test_gradient_on_market_data(DATA_DIR "spy_2008_crisis.bin", "SPY 2008 Crisis");
-    test_gradient_on_market_data(DATA_DIR "spy_2020_covid.bin", "SPY 2020 COVID");
-    test_gradient_on_market_data(DATA_DIR "crashes_combined.bin", "Crashes Combined");
+    test_gradient_on_market_data(path_spy_full, "SPY Full (2007-2024)");
+    test_gradient_on_market_data(path_2008, "SPY 2008 Crisis");
+    test_gradient_on_market_data(path_2020, "SPY 2020 COVID");
+    test_gradient_on_market_data(path_crashes, "Crashes Combined");
     
     // Compare crash vs calm
-    test_crash_vs_calm_gradient();
+    test_crash_vs_calm_gradient(data_dir);
     
     // Optional: Write time series for plotting
     if (argc > 1 && strcmp(argv[1], "--timeseries") == 0) {
         const char* output = (argc > 2) ? argv[2] : "gradient_timeseries.csv";
-        write_gradient_timeseries(DATA_DIR "spy_2008_crisis.bin", output);
+        write_gradient_timeseries(path_2008, output);
     }
     
     printf("\n═══════════════════════════════════════════════════════════════════\n");
