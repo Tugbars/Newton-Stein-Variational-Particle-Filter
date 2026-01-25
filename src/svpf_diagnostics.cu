@@ -11,53 +11,57 @@
 #include <math.h>
 
 // =============================================================================
-// Status Names
+// Status Names - C++ compatible (no designated initializers)
 // =============================================================================
 
-static const char* status_names[] = {
-    [SVPF_OK] = "OK",
-    
-    // CUDA errors
-    [SVPF_ERR_CUDA_INIT] = "CUDA_INIT_FAILED",
-    [SVPF_ERR_CUDA_MALLOC] = "CUDA_MALLOC_FAILED",
-    [SVPF_ERR_CUDA_MEMCPY] = "CUDA_MEMCPY_FAILED",
-    [SVPF_ERR_CUDA_KERNEL] = "CUDA_KERNEL_FAILED",
-    [SVPF_ERR_CUDA_GRAPH] = "CUDA_GRAPH_FAILED",
-    [SVPF_ERR_CUDA_SYNC] = "CUDA_SYNC_FAILED",
-    [SVPF_ERR_CUDA_DEVICE] = "CUDA_DEVICE_ERROR",
-    
-    // Numerical errors
-    [SVPF_ERR_NAN_PARTICLES] = "NAN_IN_PARTICLES",
-    [SVPF_ERR_NAN_WEIGHTS] = "NAN_IN_WEIGHTS",
-    [SVPF_ERR_NAN_OUTPUT] = "NAN_IN_OUTPUT",
-    [SVPF_ERR_INF_PARTICLES] = "INF_IN_PARTICLES",
-    [SVPF_ERR_INF_WEIGHTS] = "INF_IN_WEIGHTS",
-    [SVPF_ERR_PARTICLE_COLLAPSE] = "PARTICLE_COLLAPSE",
-    [SVPF_ERR_WEIGHT_UNDERFLOW] = "WEIGHT_UNDERFLOW",
-    [SVPF_ERR_BANDWIDTH_ZERO] = "BANDWIDTH_ZERO",
-    
-    // Input errors
-    [SVPF_ERR_INPUT_NAN] = "INPUT_IS_NAN",
-    [SVPF_ERR_INPUT_INF] = "INPUT_IS_INF",
-    [SVPF_ERR_INPUT_EXTREME] = "INPUT_EXTREME_VALUE",
-    [SVPF_ERR_PARAMS_INVALID] = "PARAMS_INVALID",
-    
-    // State errors
-    [SVPF_ERR_NOT_INITIALIZED] = "NOT_INITIALIZED",
-    [SVPF_ERR_ALREADY_DESTROYED] = "ALREADY_DESTROYED",
-    [SVPF_ERR_STATE_CORRUPTED] = "STATE_CORRUPTED",
-    
-    // Resource errors
-    [SVPF_ERR_OUT_OF_MEMORY] = "OUT_OF_MEMORY",
-    [SVPF_ERR_SHARED_MEM_EXCEEDED] = "SHARED_MEM_EXCEEDED",
-};
-
-static const char* warning_names[] = {
-    [SVPF_WARN_ESS_LOW - 1000] = "ESS_LOW",
-    [SVPF_WARN_VOL_EXTREME - 1000] = "VOL_EXTREME",
-    [SVPF_WARN_PARTICLES_CLUSTERED - 1000] = "PARTICLES_CLUSTERED",
-    [SVPF_WARN_GRAPH_RECAPTURE - 1000] = "GRAPH_RECAPTURE",
-};
+const char* svpf_status_name(SVPFStatus status) {
+    switch (status) {
+        // Success
+        case SVPF_OK: return "OK";
+        
+        // CUDA errors
+        case SVPF_ERR_CUDA_INIT: return "CUDA_INIT_FAILED";
+        case SVPF_ERR_CUDA_MALLOC: return "CUDA_MALLOC_FAILED";
+        case SVPF_ERR_CUDA_MEMCPY: return "CUDA_MEMCPY_FAILED";
+        case SVPF_ERR_CUDA_KERNEL: return "CUDA_KERNEL_FAILED";
+        case SVPF_ERR_CUDA_GRAPH: return "CUDA_GRAPH_FAILED";
+        case SVPF_ERR_CUDA_SYNC: return "CUDA_SYNC_FAILED";
+        case SVPF_ERR_CUDA_DEVICE: return "CUDA_DEVICE_ERROR";
+        
+        // Numerical errors
+        case SVPF_ERR_NAN_PARTICLES: return "NAN_IN_PARTICLES";
+        case SVPF_ERR_NAN_WEIGHTS: return "NAN_IN_WEIGHTS";
+        case SVPF_ERR_NAN_OUTPUT: return "NAN_IN_OUTPUT";
+        case SVPF_ERR_INF_PARTICLES: return "INF_IN_PARTICLES";
+        case SVPF_ERR_INF_WEIGHTS: return "INF_IN_WEIGHTS";
+        case SVPF_ERR_PARTICLE_COLLAPSE: return "PARTICLE_COLLAPSE";
+        case SVPF_ERR_WEIGHT_UNDERFLOW: return "WEIGHT_UNDERFLOW";
+        case SVPF_ERR_BANDWIDTH_ZERO: return "BANDWIDTH_ZERO";
+        
+        // Input errors
+        case SVPF_ERR_INPUT_NAN: return "INPUT_IS_NAN";
+        case SVPF_ERR_INPUT_INF: return "INPUT_IS_INF";
+        case SVPF_ERR_INPUT_EXTREME: return "INPUT_EXTREME_VALUE";
+        case SVPF_ERR_PARAMS_INVALID: return "PARAMS_INVALID";
+        
+        // State errors
+        case SVPF_ERR_NOT_INITIALIZED: return "NOT_INITIALIZED";
+        case SVPF_ERR_ALREADY_DESTROYED: return "ALREADY_DESTROYED";
+        case SVPF_ERR_STATE_CORRUPTED: return "STATE_CORRUPTED";
+        
+        // Resource errors
+        case SVPF_ERR_OUT_OF_MEMORY: return "OUT_OF_MEMORY";
+        case SVPF_ERR_SHARED_MEM_EXCEEDED: return "SHARED_MEM_EXCEEDED";
+        
+        // Warnings
+        case SVPF_WARN_ESS_LOW: return "ESS_LOW";
+        case SVPF_WARN_VOL_EXTREME: return "VOL_EXTREME";
+        case SVPF_WARN_PARTICLES_CLUSTERED: return "PARTICLES_CLUSTERED";
+        case SVPF_WARN_GRAPH_RECAPTURE: return "GRAPH_RECAPTURE";
+        
+        default: return "UNKNOWN_STATUS";
+    }
+}
 
 // =============================================================================
 // Initialization
@@ -336,17 +340,6 @@ SVPFStatus svpf_diag_check(void* state_ptr, SVPFDiagnostics* diag) {
 
 const char* svpf_diag_message(const SVPFDiagnostics* diag) {
     return diag->last_error_message;
-}
-
-const char* svpf_status_name(SVPFStatus status) {
-    if (status == SVPF_OK) return "OK";
-    if (status >= 1000) {
-        int idx = status - 1000;
-        if (idx < 4) return warning_names[idx];
-        return "UNKNOWN_WARNING";
-    }
-    if (status < 600) return status_names[status];
-    return "UNKNOWN_ERROR";
 }
 
 bool svpf_status_is_error(SVPFStatus status) {
