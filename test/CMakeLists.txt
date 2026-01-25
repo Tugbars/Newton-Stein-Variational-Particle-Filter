@@ -66,6 +66,28 @@ set_target_properties(svpf_hcrbpf_dgp PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
 )
 
+# -----------------------------------------------------------------------------
+# Gradient diagnostic test (self-tuning SVPF - Step 0 verification)
+# -----------------------------------------------------------------------------
+add_executable(svpf_gradient_dgp test_svpf_gradient_dgp.cu)
+
+target_include_directories(svpf_gradient_dgp
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CUDAToolkit_INCLUDE_DIRS}
+)
+
+target_link_libraries(svpf_gradient_dgp
+    PRIVATE
+        svpf
+        CUDA::cudart
+        CUDA::curand
+)
+
+set_target_properties(svpf_gradient_dgp PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+)
+
 # =============================================================================
 # CTest Integration
 # =============================================================================
@@ -87,6 +109,12 @@ add_test(NAME HCRBPFComparison COMMAND svpf_hcrbpf_dgp)
 set_tests_properties(HCRBPFComparison PROPERTIES
     TIMEOUT 300
     LABELS "comparison"
+)
+
+add_test(NAME GradientDiagnostic COMMAND svpf_gradient_dgp)
+set_tests_properties(GradientDiagnostic PROPERTIES
+    TIMEOUT 300
+    LABELS "gradient;self-tuning"
 )
 
 # =============================================================================
@@ -143,6 +171,26 @@ add_custom_target(hcrbpf_compare_custom
     COMMENT "Running SVPF on HCRBPF DGP with custom params..."
 )
 
+# -----------------------------------------------------------------------------
+# Gradient Diagnostic Targets (Self-Tuning SVPF Development)
+# -----------------------------------------------------------------------------
+
+# Run gradient diagnostic test (Step 0: verify gradients point correct direction)
+add_custom_target(gradient_test
+    COMMAND ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/svpf_gradient_dgp
+    DEPENDS svpf_gradient_dgp
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    COMMENT "Running gradient diagnostic test (Step 0: verify before learning)..."
+)
+
+# Run gradient test with CSV log output (for plotting)
+add_custom_target(gradient_log
+    COMMAND ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/svpf_gradient_dgp --log svpf_gradient_diagnostic.csv
+    DEPENDS svpf_gradient_dgp
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    COMMENT "Running gradient diagnostic with CSV log output..."
+)
+
 # Run all comparison tests
 add_custom_target(compare_all
     COMMAND ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/svpf_scenarios
@@ -150,4 +198,14 @@ add_custom_target(compare_all
     DEPENDS svpf_scenarios svpf_hcrbpf_dgp
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     COMMENT "Running all comparison tests (SVPF-favorable + HCRBPF-favorable DGPs)..."
+)
+
+# Run all tests including gradient diagnostic
+add_custom_target(all_tests
+    COMMAND ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/svpf_scenarios
+    COMMAND ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/svpf_hcrbpf_dgp
+    COMMAND ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/svpf_gradient_dgp
+    DEPENDS svpf_scenarios svpf_hcrbpf_dgp svpf_gradient_dgp
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    COMMENT "Running all tests (scenarios + HCRBPF comparison + gradient diagnostic)..."
 )

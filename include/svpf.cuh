@@ -34,6 +34,7 @@
 
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
+#include <stdio.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -659,6 +660,355 @@ bool svpf_graph_is_captured(SVPFState* state);
  * The next svpf_step_graph() call will recapture with new parameters.
  */
 void svpf_graph_invalidate(SVPFState* state);
+
+// =============================================================================
+// GRADIENT DIAGNOSTICS & SELF-TUNING (svpf_gradient_diagnostic.cu)
+// =============================================================================
+// 
+// AGC-style parameter adaptation: SVPF particles find h, then θ follows.
+// No oracle, no batch inference, no memory. Just negative feedback.
+//
+// Development phases:
+//   Step 0: Observe gradients (no learning) - verify correctness
+//   Step 1: Learn ν only (safest - observation likelihood only)
+//   Step 2: Add σ learning (transition, with breathing overlay)
+//   Step 3: Add ρ learning (if needed, often stable enough to fix)
+//   Step 4: Full 4-param natural gradient (μ, ρ, σ, ν)
+//
+// Current implementation: Step 0 (diagnostic only)
+// =============================================================================
+
+/**
+ * @brief Gradient diagnostic state for parameter learning
+ * 
+ * Tracks gradients and statistics for self-tuning development.
+ * Start with diagnostic-only mode to verify gradient correctness
+ * before enabling any parameter updates.
+ */
+typedef struct {
+    // Device buffers for gradient computation
+    float* d_nu_grad;           // Weighted mean ν gradient
+    float* d_z_sq_mean;         // Mean standardized residual² (diagnostic)
+    
+    // Future: transition gradients (μ, ρ, σ)
+    float* d_mu_grad;           // μ gradient (transition)
+    float* d_rho_grad;          // ρ gradient (transition, unconstrained η)
+    float* d_sigma_grad;        // σ gradient (transition, unconstrained κ)
+    
+    // Future: Fisher matrix for natural gradient (4x4, row-major)
+    float* d_fisher;            // [16] Fisher matrix elements
+    float* d_fisher_inv;        // [16] Inverse Fisher (for natural gradient)
+    
+    // Host-side EMA smoothing
+    float nu_gradient_ema;      // Smoothed ν gradient
+    float z_sq_ema;             // Smoothed z² (should be ~1 at equilibrium)
+    float mu_gradient_ema;      // Smoothed μ gradient
+    float rho_gradient_ema;     // Smoothed ρ gradient (unconstrained)
+    float sigma_gradient_ema;   // Smoothed σ gradient (unconstrained)
+    
+    // Shock state machine (SHOCK → RECOVERY → CALM)
+    int shock_state;            // 0=CALM, 1=SHOCK, 2=RECOVERY
+    int ticks_in_state;         // Ticks since last state transition
+    float shock_threshold;      // z² threshold to enter SHOCK (e.g., 9.0 = 3σ)
+    int shock_duration;         // Ticks to stay in SHOCK (e.g., 20)
+    int recovery_duration;      // Ticks in RECOVERY before CALM (e.g., 50)
+    float recovery_exit_threshold; // z² threshold to exit RECOVERY (e.g., 4.0)
+    
+    // Logging
+    bool enable_logging;
+    FILE* log_file;
+    
+    bool initialized;
+} SVPFGradientDiagnostics;
+
+/**
+ * @brief Unconstrained parameter representation for gradient descent
+ * 
+ * Maps constrained parameters to unconstrained space:
+ *   μ = μ directly (unbounded)
+ *   ρ = tanh(η)        → η ∈ (-∞, +∞), ρ ∈ (-1, 1)
+ *   σ = exp(κ)         → κ ∈ (-∞, +∞), σ ∈ (0, +∞)
+ *   ν = 2 + exp(κ_ν)   → κ_ν ∈ (-∞, +∞), ν ∈ (2, +∞)
+ * 
+ * Gradients are computed in unconstrained space for smooth optimization.
+ */
+typedef struct {
+    float mu;       // Mean level (unbounded)
+    float eta;      // Unconstrained persistence: ρ = tanh(η)
+    float kappa;    // Unconstrained vol-of-vol: σ = exp(κ)
+    float kappa_nu; // Unconstrained tail weight: ν = 2 + exp(κ_ν)
+} SVPFThetaUnconstrained;
+
+/**
+ * @brief Natural gradient tuner state
+ * 
+ * Implements Fisher-preconditioned parameter updates:
+ *   θ += lr · F⁻¹ · ∇θ
+ * 
+ * Fisher matrix captures parameter correlations (σ-ν, μ-ρ)
+ * allowing a single learning rate for all parameters.
+ */
+typedef struct {
+    SVPFThetaUnconstrained theta;
+    
+    // Fisher matrix (4x4, EMA smoothed)
+    float F[4][4];              // Fisher information matrix
+    float F_ema_decay;          // EMA decay for Fisher (e.g., 0.95)
+    float F_reg;                // Regularization for invertibility (e.g., 1e-4)
+    
+    // Learning rate
+    float base_lr;              // Base learning rate (e.g., 0.01)
+    float lr_shock_mult;        // LR multiplier in RECOVERY (e.g., 2.0)
+    
+    // Gradient clipping
+    float grad_clip;            // Max |gradient| per parameter (e.g., 1.0)
+    
+    // Regularization toward prior (soft oracle)
+    float prior_weight;         // Pull toward offline-calibrated baseline
+    SVPFThetaUnconstrained theta_prior;  // Offline baseline
+    
+    // State
+    int warmup_ticks;           // Ticks before learning starts
+    bool learning_enabled;      // Master switch
+    
+} SVPFNaturalGradientTuner;
+
+// -----------------------------------------------------------------------------
+// Gradient Diagnostic API
+// -----------------------------------------------------------------------------
+
+/**
+ * @brief Create gradient diagnostic state
+ * 
+ * @param enable_logging  Write CSV log file
+ * @param log_path        Path to log file (NULL for no logging)
+ * @return Diagnostic state, or NULL on error
+ */
+SVPFGradientDiagnostics* svpf_gradient_diagnostic_create(bool enable_logging, const char* log_path);
+
+/**
+ * @brief Destroy gradient diagnostic state
+ */
+void svpf_gradient_diagnostic_destroy(SVPFGradientDiagnostics* diag);
+
+/**
+ * @brief Compute ν gradient (observation likelihood only)
+ * 
+ * Call AFTER svpf_step_graph() to compute the gradient of log p(y|h,ν)
+ * with respect to ν, averaged over particles weighted by posterior.
+ * 
+ * Expected behavior:
+ *   - ν too high → gradient NEGATIVE (wants heavier tails)
+ *   - ν too low → gradient POSITIVE (wants lighter tails)
+ *   - ν correct → gradient ≈ 0
+ * 
+ * @param state         SVPF state (after step)
+ * @param diag          Diagnostic state
+ * @param y_t           Current observation
+ * @param timestep      Current timestep (for logging)
+ * @param nu_grad_out   Optional: raw ν gradient
+ * @param z_sq_mean_out Optional: mean standardized residual²
+ */
+void svpf_compute_nu_diagnostic(
+    SVPFState* state,
+    SVPFGradientDiagnostics* diag,
+    float y_t,
+    int timestep,
+    float* nu_grad_out,
+    float* z_sq_mean_out
+);
+
+/**
+ * @brief Simplified ν gradient (no diagnostic state needed)
+ * 
+ * Allocates temporary buffers, computes gradient, frees buffers.
+ * Less efficient but convenient for quick tests.
+ */
+void svpf_compute_nu_diagnostic_simple(
+    SVPFState* state,
+    float y_t,
+    float* nu_grad_out,
+    float* z_sq_mean_out
+);
+
+/**
+ * @brief Compute all 4 parameter gradients (μ, ρ, σ, ν)
+ * 
+ * Requires h_prev snapshot from BEFORE svpf_step_graph().
+ * 
+ * For transition gradients (μ, ρ, σ):
+ *   ε = h_t - μ - ρ·(h_{t-1} - μ)
+ *   ∂/∂μ = ε·(1-ρ) / σ²
+ *   ∂/∂ρ = ε·(h_{t-1} - μ) / σ²
+ *   ∂/∂σ = -1/σ + ε²/σ³
+ * 
+ * For observation gradient (ν):
+ *   ∂/∂ν = ½[ψ((ν+1)/2) - ψ(ν/2) - 1/ν - log(1+z²/ν) + (ν+1)z²/(ν²(1+z²/ν))]
+ * 
+ * Gradients are in UNCONSTRAINED space (η, κ, κ_ν).
+ * 
+ * @param state         SVPF state (after step)
+ * @param diag          Diagnostic state
+ * @param h_prev_snap   Snapshot of h_prev from before step [n_particles]
+ * @param y_t           Current observation
+ * @param params        Model parameters (for ρ, σ, μ values)
+ * @param timestep      Current timestep (for logging)
+ */
+void svpf_compute_all_gradients(
+    SVPFState* state,
+    SVPFGradientDiagnostics* diag,
+    const float* h_prev_snap,
+    float y_t,
+    const SVPFParams* params,
+    int timestep
+);
+
+// -----------------------------------------------------------------------------
+// Shock State Machine API
+// -----------------------------------------------------------------------------
+
+/**
+ * @brief Update shock state machine
+ * 
+ * Transitions: CALM → SHOCK (on surprise) → RECOVERY → CALM
+ * During SHOCK: freeze all learning (gradients are garbage)
+ * During RECOVERY: boost learning rate to catch up
+ * 
+ * @param diag      Diagnostic state
+ * @param z_sq      Current standardized residual² (from diagnostic)
+ */
+void svpf_update_shock_state(SVPFGradientDiagnostics* diag, float z_sq);
+
+/**
+ * @brief Get current shock state
+ * @return 0=CALM, 1=SHOCK, 2=RECOVERY
+ */
+int svpf_get_shock_state(const SVPFGradientDiagnostics* diag);
+
+/**
+ * @brief Check if learning should be active
+ * @return true if CALM or RECOVERY, false if SHOCK
+ */
+bool svpf_should_learn(const SVPFGradientDiagnostics* diag);
+
+/**
+ * @brief Get learning rate multiplier based on shock state
+ * @return 0.0 (SHOCK), lr_shock_mult (RECOVERY), 1.0 (CALM)
+ */
+float svpf_get_lr_multiplier(const SVPFGradientDiagnostics* diag, float lr_shock_mult);
+
+// -----------------------------------------------------------------------------
+// Natural Gradient Tuner API (Future - Step 4)
+// -----------------------------------------------------------------------------
+
+/**
+ * @brief Create natural gradient tuner
+ * 
+ * @param params        Initial parameters (from offline calibration)
+ * @param base_lr       Base learning rate (e.g., 0.01)
+ * @param prior_weight  Regularization toward initial params (e.g., 0.001)
+ * @return Tuner state, or NULL on error
+ */
+SVPFNaturalGradientTuner* svpf_tuner_create(
+    const SVPFParams* params,
+    float nu,
+    float base_lr,
+    float prior_weight
+);
+
+/**
+ * @brief Destroy natural gradient tuner
+ */
+void svpf_tuner_destroy(SVPFNaturalGradientTuner* tuner);
+
+/**
+ * @brief Update parameters with natural gradient
+ * 
+ * Computes: θ += lr · F⁻¹ · ∇θ
+ * 
+ * Call after svpf_compute_all_gradients() to update parameters.
+ * Respects shock state (no update during SHOCK).
+ * 
+ * @param tuner         Tuner state
+ * @param diag          Diagnostic state (for gradients and shock state)
+ * @param params_out    Updated SVPFParams (constrained space)
+ * @param nu_out        Updated ν value
+ */
+void svpf_tuner_update(
+    SVPFNaturalGradientTuner* tuner,
+    const SVPFGradientDiagnostics* diag,
+    SVPFParams* params_out,
+    float* nu_out
+);
+
+/**
+ * @brief Get current parameters in constrained space
+ */
+void svpf_tuner_get_params(
+    const SVPFNaturalGradientTuner* tuner,
+    SVPFParams* params_out,
+    float* nu_out
+);
+
+// -----------------------------------------------------------------------------
+// Synthetic Verification
+// -----------------------------------------------------------------------------
+
+/**
+ * @brief Run synthetic gradient verification test
+ * 
+ * Generates data from known model, then verifies:
+ *   - ν too high → gradient negative
+ *   - ν too low → gradient positive
+ *   - ν correct → gradient ≈ 0
+ * 
+ * @param n_particles   Particles to use
+ * @param n_stein_steps Stein steps per observation
+ */
+void svpf_test_nu_gradient_synthetic(int n_particles, int n_stein_steps);
+
+// -----------------------------------------------------------------------------
+// Utility: Convert Between Constrained/Unconstrained
+// -----------------------------------------------------------------------------
+
+static inline float svpf_constrain_rho(float eta) {
+    return tanhf(eta);
+}
+
+static inline float svpf_unconstrain_rho(float rho) {
+    // atanh(rho) = 0.5 * log((1+rho)/(1-rho))
+    rho = fminf(fmaxf(rho, -0.999f), 0.999f);  // Clamp to avoid inf
+    return 0.5f * logf((1.0f + rho) / (1.0f - rho));
+}
+
+static inline float svpf_constrain_sigma(float kappa) {
+    return expf(kappa);
+}
+
+static inline float svpf_unconstrain_sigma(float sigma) {
+    return logf(fmaxf(sigma, 1e-8f));
+}
+
+static inline float svpf_constrain_nu(float kappa_nu) {
+    return 2.0f + expf(kappa_nu);
+}
+
+static inline float svpf_unconstrain_nu(float nu) {
+    return logf(fmaxf(nu - 2.0f, 1e-8f));
+}
+
+// Chain rule factors for unconstrained gradients
+static inline float svpf_drho_deta(float rho) {
+    return 1.0f - rho * rho;  // sech²(η) = 1 - tanh²(η)
+}
+
+static inline float svpf_dsigma_dkappa(float sigma) {
+    return sigma;  // d/dκ exp(κ) = exp(κ) = σ
+}
+
+static inline float svpf_dnu_dkappa_nu(float nu) {
+    return nu - 2.0f;  // d/dκ_ν (2 + exp(κ_ν)) = exp(κ_ν) = ν - 2
+}
 
 #ifdef __cplusplus
 }
