@@ -353,6 +353,51 @@ SVPFTestComparison svpf_test_compare(
     SVPFTestAggregateResult* result_b_out
 );
 
+/**
+ * @brief Callback type for configuring filter state
+ * 
+ * Called after svpf_create() and svpf_initialize() to set flags like
+ * use_mim, use_asymmetric_rho, use_adaptive_mu, etc.
+ */
+typedef void (*SVPFConfigCallback)(void* state);
+
+/**
+ * @brief A/B comparison with full filter configuration
+ * 
+ * This version allows configuring all SVPFState flags, not just params.
+ * 
+ * @param scenario          DGP parameters
+ * @param config            Test configuration
+ * @param filter_params_a   Params for baseline
+ * @param configure_a       Callback to configure baseline filter state
+ * @param filter_params_b   Params for modified
+ * @param configure_b       Callback to configure modified filter state
+ * @param result_a_out      Aggregate results for A (optional, can be NULL)
+ * @param result_b_out      Aggregate results for B (optional, can be NULL)
+ * @return                  Statistical comparison
+ */
+SVPFTestComparison svpf_test_compare_with_config(
+    const SVPFTestScenario* scenario,
+    const SVPFTestConfig* config,
+    const void* filter_params_a,
+    SVPFConfigCallback configure_a,
+    const void* filter_params_b,
+    SVPFConfigCallback configure_b,
+    SVPFTestAggregateResult* result_a_out,
+    SVPFTestAggregateResult* result_b_out
+);
+
+/**
+ * @brief Run single test with configuration callback
+ */
+SVPFTestMetrics svpf_test_run_single_with_config(
+    const SVPFTestScenario* scenario,
+    const SVPFTestConfig* config,
+    const void* filter_params,
+    SVPFConfigCallback configure,
+    uint64_t seed
+);
+
 // =============================================================================
 // Output and Reporting
 // =============================================================================

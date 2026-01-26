@@ -30,13 +30,13 @@
 #define N_STEIN_STEPS   5
 
 // =============================================================================
-// DEFINE YOUR MODIFICATIONS HERE
+// FILTER CONFIGURATION FUNCTIONS
 // =============================================================================
 
 /**
- * Baseline filter parameters (control group)
+ * Get baseline SVPFParams for a scenario
  */
-static SVPFParams get_baseline_params(const SVPFTestScenario* scenario) {
+static SVPFParams get_params_for_scenario(const SVPFTestScenario* scenario) {
     SVPFParams p;
     p.rho = scenario->true_rho;
     p.sigma_z = scenario->true_sigma_z;
@@ -46,27 +46,99 @@ static SVPFParams get_baseline_params(const SVPFTestScenario* scenario) {
 }
 
 /**
- * Modified filter parameters (treatment group)
+ * Configure BASELINE filter (control group)
  * 
- * THIS IS WHERE YOU IMPLEMENT YOUR CHANGES.
- * For state-dependent sigma_z, we'll need to modify the filter itself,
- * not just parameters. For now this is a placeholder.
+ * Full production configuration. All features enabled and tuned.
+ * Only the feature under test differs between baseline and modified.
  */
-static SVPFParams get_modified_params(const SVPFTestScenario* scenario) {
-    SVPFParams p = get_baseline_params(scenario);
+static void configure_baseline(void* state_ptr) {
+    SVPFState* f = (SVPFState*)state_ptr;
     
-    // Example modification: slightly different sigma_z
-    // In practice, state-dependent sigma would be a filter flag, not a param
-    // p.sigma_z *= 1.1f;  // Uncomment to test
+    // Core
+    f->use_svld = 1;
+    f->use_annealing = 1;
+    f->n_anneal_steps = 3;
+    f->temperature = 0.45f;
+    f->rmsprop_rho = 0.9f;
+    f->rmsprop_eps = 1e-6f;
     
-    return p;
+    // MIM
+    f->use_mim = 1;
+    f->mim_jump_prob = 0.15f;
+    f->mim_jump_scale = 7.0f;
+    
+    // Asymmetric rho
+    f->use_asymmetric_rho = 1;
+    f->rho_up = 0.99f;
+    f->rho_down = 0.92f;
+    
+    // Newton-Stein (simplified - more robust under misspecification)
+    f->use_newton = 1;
+    f->use_full_newton = 0;
+    
+    // Guided prediction
+    f->use_guided = 1;
+    f->guided_alpha_base = 0.0f;
+    f->guided_alpha_shock = 0.50f;
+    f->guided_innovation_threshold = 1.5f;
+    
+    // EKF guide
+    f->use_guide = 1;
+    f->use_guide_preserving = 1;
+    f->guide_strength = 0.05f;
+    
+    // Adaptive mu
+    f->use_adaptive_mu = 1;
+    f->mu_process_var = 0.001f;
+    f->mu_obs_var_scale = 11.0f;
+    f->mu_min = -4.0f;
+    f->mu_max = -1.0f;
+    
+    // Adaptive guide
+    f->use_adaptive_guide = 1;
+    f->guide_strength_base = 0.05f;
+    f->guide_strength_max = 0.30f;
+    f->guide_innovation_threshold = 1.0f;
+    
+    // Adaptive sigma (breathing)
+    f->use_adaptive_sigma = 1;
+    f->sigma_boost_threshold = 1.0f;
+    f->sigma_boost_max = 3.0f;
+    
+    // Likelihood / gradient
+    f->use_exact_gradient = 1;
+    f->lik_offset = 0.34f;
+    
+    // =========================================================================
+    // FEATURE UNDER TEST - OFF in baseline
+    // =========================================================================
+    f->use_local_params = 0;
+    f->delta_rho = 0.0f;
+    f->delta_sigma = 0.0f;
+}
+
+/**
+ * Configure MODIFIED filter (treatment group)
+ * 
+ * Same as baseline, but with the feature under test enabled.
+ */
+static void configure_modified(void* state_ptr) {
+    configure_baseline(state_ptr);
+    SVPFState* f = (SVPFState*)state_ptr;
+    
+    // =========================================================================
+    // FEATURE UNDER TEST - ON in modified
+    // =========================================================================
+    f->use_local_params = 1;
+    f->delta_sigma = 0.15f;  // State-dependent sigma: wider when far from mu
+    // f->delta_rho = 0.04f; // Could also test state-dependent rho
 }
 
 /**
  * Description of what's being compared
  */
-static const char* BASELINE_NAME = "Standard SVPF";
-static const char* MODIFIED_NAME = "State-Dependent σ_z";  // Change this when testing
+static const char* BASELINE_NAME = "Standard (local_params=OFF)";
+static const char* MODIFIED_NAME = "State-Dependent σ_z (local_params=ON)";
 
 // =============================================================================
 // MAIN - Just run it
@@ -80,7 +152,9 @@ int main(int argc, char** argv) {
     printf("║                    SVPF A/B Test Suite                            ║\n");
     printf("╚═══════════════════════════════════════════════════════════════════╝\n");
     printf("\n");
-    printf("  Comparing: %s  vs  %s\n", BASELINE_NAME, MODIFIED_NAME);
+    printf("  Comparing:\n");
+    printf("    A: %s\n", BASELINE_NAME);
+    printf("    B: %s\n", MODIFIED_NAME);
     printf("\n");
     printf("  Configuration:\n");
     printf("    Seeds:     %d (for statistical significance)\n", N_SEEDS);
@@ -108,8 +182,8 @@ int main(int argc, char** argv) {
     int ties = 0;
     
     printf("═══════════════════════════════════════════════════════════════════\n");
-    printf("  Running %d scenarios × %d seeds = %d total filter runs...\n",
-           n_scenarios, N_SEEDS * 2, n_scenarios * N_SEEDS * 2);
+    printf("  Running %d scenarios × %d seeds × 2 configs = %d filter runs...\n",
+           n_scenarios, N_SEEDS, n_scenarios * N_SEEDS * 2);
     printf("═══════════════════════════════════════════════════════════════════\n\n");
     
     // Results table header
@@ -118,14 +192,14 @@ int main(int argc, char** argv) {
     printf("├─────────────────┼──────────┼──────────┼──────────┼─────────────────┤\n");
     
     for (int s = 0; s < n_scenarios; s++) {
-        SVPFParams params_a = get_baseline_params(&scenarios[s]);
-        SVPFParams params_b = get_modified_params(&scenarios[s]);
+        SVPFParams params = get_params_for_scenario(&scenarios[s]);
         
-        // Run comparison
+        // Run comparison with proper configuration
         SVPFTestAggregateResult result_a, result_b;
-        SVPFTestComparison comp = svpf_test_compare(
+        SVPFTestComparison comp = svpf_test_compare_with_config(
             &scenarios[s], &config,
-            &params_a, &params_b,
+            &params, configure_baseline,
+            &params, configure_modified,
             &result_a, &result_b
         );
         
@@ -188,41 +262,6 @@ int main(int argc, char** argv) {
     }
     
     printf("\n");
-    
-    // ==========================================================================
-    // Detailed results (for debugging)
-    // ==========================================================================
-    
-    printf("═══════════════════════════════════════════════════════════════════\n");
-    printf("  DETAILED METRICS (all scenarios, baseline)\n");
-    printf("═══════════════════════════════════════════════════════════════════\n\n");
-    
-    printf("┌─────────────────┬──────────┬──────────┬──────────┬──────────┬──────────┐\n");
-    printf("│ Scenario        │ RMSE(h)  │ Bias     │ Cov(95%%) │ Corr     │ NLL      │\n");
-    printf("├─────────────────┼──────────┼──────────┼──────────┼──────────┼──────────┤\n");
-    
-    for (int s = 0; s < n_scenarios; s++) {
-        SVPFParams params_a = get_baseline_params(&scenarios[s]);
-        SVPFTestAggregateResult result = svpf_test_run_scenario(&scenarios[s], &config, &params_a);
-        
-        // Coverage check
-        char cov_indicator = ' ';
-        if (result.coverage_95.mean < 0.90f) cov_indicator = '!';  // Overconfident
-        if (result.coverage_95.mean > 0.98f) cov_indicator = '?';  // Underconfident
-        
-        printf("│ %-15s │ %8.4f │ %+7.4f │ %6.1f%%%c │ %8.4f │ %8.4f │\n",
-               scenarios[s].name,
-               result.rmse_h.mean,
-               result.bias_h.mean,
-               result.coverage_95.mean * 100.0f,
-               cov_indicator,
-               result.lag_correlation.mean,
-               result.nll.mean);
-    }
-    
-    printf("└─────────────────┴──────────┴──────────┴──────────┴──────────┴──────────┘\n");
-    printf("  Coverage: ! = overconfident (<90%%), ? = underconfident (>98%%)\n\n");
-    
     printf("═══════════════════════════════════════════════════════════════════\n");
     printf("  Done.\n");
     printf("═══════════════════════════════════════════════════════════════════\n\n");

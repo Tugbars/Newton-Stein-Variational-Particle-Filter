@@ -767,6 +767,246 @@ SVPFTestComparison svpf_test_compare(
 }
 
 // =============================================================================
+// Single Run with Config Callback
+// =============================================================================
+
+SVPFTestMetrics svpf_test_run_single_with_config(
+    const SVPFTestScenario* scenario,
+    const SVPFTestConfig* config,
+    const void* filter_params_ptr,
+    SVPFConfigCallback configure,
+    uint64_t seed
+) {
+    const SVPFParams* filter_params = (const SVPFParams*)filter_params_ptr;
+    SVPFTestMetrics m = {};
+    m.seed = seed;
+    
+    int n_steps = config->n_steps;
+    int n_particles = config->n_particles;
+    int warmup = config->warmup_steps;
+    int eval_steps = n_steps - warmup;
+    
+    // Allocate data
+    float* h_true = (float*)malloc(n_steps * sizeof(float));
+    float* y = (float*)malloc(n_steps * sizeof(float));
+    float* h_est = (float*)malloc(n_steps * sizeof(float));
+    float* vol_est = (float*)malloc(n_steps * sizeof(float));
+    float* vol_true = (float*)malloc(n_steps * sizeof(float));
+    float* ess_trace = (float*)malloc(n_steps * sizeof(float));
+    float* h_particles = (float*)malloc(n_steps * n_particles * sizeof(float));
+    
+    // Generate data
+    svpf_test_generate_data(scenario, n_steps, seed, h_true, y);
+    
+    // Compute true vol
+    for (int t = 0; t < n_steps; t++) {
+        vol_true[t] = expf(h_true[t] * 0.5f);
+    }
+    
+    // Create and configure filter
+    SVPFState* state = svpf_create(n_particles, config->n_stein_steps, 7.0f, NULL);
+    svpf_initialize(state, filter_params, (unsigned int)seed);
+    
+    // Apply configuration callback (sets all the flags)
+    if (configure) {
+        configure(state);
+    }
+    
+    // Timer
+    auto start = std::chrono::high_resolution_clock::now();
+    
+    // Run filter
+    float y_prev = 0.0f;
+    float total_nll = 0.0f;
+    float total_ess = 0.0f;
+    float min_ess = 1.0f;
+    int ess_below_30 = 0;
+    
+    for (int t = 0; t < n_steps; t++) {
+        float loglik, vol, h_mean;
+        svpf_step_graph(state, y[t], y_prev, filter_params, &loglik, &vol, &h_mean);
+        
+        h_est[t] = h_mean;
+        vol_est[t] = vol;
+        
+        // Copy particles for coverage computation
+        cudaMemcpy(&h_particles[t * n_particles], state->h, 
+                   n_particles * sizeof(float), cudaMemcpyDeviceToHost);
+        
+        // Track NLL (skip warmup)
+        if (t >= warmup) {
+            total_nll -= loglik;
+        }
+        
+        // Track ESS
+        float ess_ratio = 0.7f;  // Placeholder
+        ess_trace[t] = ess_ratio;
+        if (t >= warmup) {
+            total_ess += ess_ratio;
+            if (ess_ratio < min_ess) min_ess = ess_ratio;
+            if (ess_ratio < 0.3f) ess_below_30++;
+        }
+        
+        y_prev = y[t];
+    }
+    
+    auto end = std::chrono::high_resolution_clock::now();
+    m.runtime_ms = std::chrono::duration<float, std::milli>(end - start).count();
+    
+    // Compute metrics (on post-warmup data)
+    float* h_true_eval = h_true + warmup;
+    float* h_est_eval = h_est + warmup;
+    float* vol_true_eval = vol_true + warmup;
+    float* vol_est_eval = vol_est + warmup;
+    float* h_particles_eval = h_particles + warmup * n_particles;
+    
+    m.rmse_h = compute_rmse(h_est_eval, h_true_eval, eval_steps);
+    m.rmse_vol = compute_rmse(vol_est_eval, vol_true_eval, eval_steps);
+    m.mae_h = compute_mae(h_est_eval, h_true_eval, eval_steps);
+    m.bias_h = compute_bias(h_est_eval, h_true_eval, eval_steps);
+    
+    m.nll = total_nll / eval_steps;
+    
+    m.coverage_50 = svpf_test_compute_coverage(h_true_eval, h_particles_eval, 
+                                                eval_steps, n_particles, 0.50f);
+    m.coverage_90 = svpf_test_compute_coverage(h_true_eval, h_particles_eval,
+                                                eval_steps, n_particles, 0.90f);
+    m.coverage_95 = svpf_test_compute_coverage(h_true_eval, h_particles_eval,
+                                                eval_steps, n_particles, 0.95f);
+    
+    m.ess_mean = total_ess / eval_steps;
+    m.ess_min = min_ess;
+    m.ess_below_30_pct = (float)ess_below_30 / eval_steps;
+    
+    m.lag_correlation = compute_correlation(h_est_eval, h_true_eval, eval_steps);
+    
+    if (eval_steps > 1) {
+        m.lag_1_correlation = compute_correlation(h_est_eval + 1, h_true_eval, eval_steps - 1);
+    }
+    
+    // Cleanup
+    svpf_destroy(state);
+    free(h_true);
+    free(y);
+    free(h_est);
+    free(vol_est);
+    free(vol_true);
+    free(ess_trace);
+    free(h_particles);
+    
+    return m;
+}
+
+// =============================================================================
+// A/B Comparison with Config Callbacks
+// =============================================================================
+
+SVPFTestComparison svpf_test_compare_with_config(
+    const SVPFTestScenario* scenario,
+    const SVPFTestConfig* config,
+    const void* filter_params_a,
+    SVPFConfigCallback configure_a,
+    const void* filter_params_b,
+    SVPFConfigCallback configure_b,
+    SVPFTestAggregateResult* result_a_out,
+    SVPFTestAggregateResult* result_b_out
+) {
+    SVPFTestComparison comp = {};
+    
+    std::vector<float> rmse_a, rmse_b, nll_a, nll_b, cov95_a, cov95_b, ess_a, ess_b;
+    
+    for (int s = 0; s < config->n_seeds; s++) {
+        uint64_t seed = 12345 + s * 1000;
+        
+        SVPFTestMetrics m_a = svpf_test_run_single_with_config(
+            scenario, config, filter_params_a, configure_a, seed);
+        SVPFTestMetrics m_b = svpf_test_run_single_with_config(
+            scenario, config, filter_params_b, configure_b, seed);
+        
+        // Skip if either failed
+        if (!isfinite(m_a.rmse_h) || !isfinite(m_b.rmse_h)) continue;
+        
+        rmse_a.push_back(m_a.rmse_h);
+        rmse_b.push_back(m_b.rmse_h);
+        nll_a.push_back(m_a.nll);
+        nll_b.push_back(m_b.nll);
+        cov95_a.push_back(m_a.coverage_95);
+        cov95_b.push_back(m_b.coverage_95);
+        ess_a.push_back(m_a.ess_mean);
+        ess_b.push_back(m_b.ess_mean);
+    }
+    
+    int n = (int)rmse_a.size();
+    if (n < 2) return comp;
+    
+    // Compute paired differences
+    std::vector<float> rmse_diff(n), nll_diff(n), cov95_diff(n), ess_diff(n);
+    for (int i = 0; i < n; i++) {
+        rmse_diff[i] = rmse_b[i] - rmse_a[i];
+        nll_diff[i] = nll_b[i] - nll_a[i];
+        cov95_diff[i] = cov95_b[i] - cov95_a[i];
+        ess_diff[i] = ess_b[i] - ess_a[i];
+    }
+    
+    // Mean differences
+    comp.rmse_h_diff = 0; for (float d : rmse_diff) comp.rmse_h_diff += d; comp.rmse_h_diff /= n;
+    comp.nll_diff = 0; for (float d : nll_diff) comp.nll_diff += d; comp.nll_diff /= n;
+    comp.coverage_95_diff = 0; for (float d : cov95_diff) comp.coverage_95_diff += d; comp.coverage_95_diff /= n;
+    comp.ess_mean_diff = 0; for (float d : ess_diff) comp.ess_mean_diff += d; comp.ess_mean_diff /= n;
+    
+    // T-tests
+    svpf_test_paired_ttest(rmse_diff.data(), n, &comp.rmse_h_tstat, &comp.rmse_h_pvalue);
+    svpf_test_paired_ttest(nll_diff.data(), n, &comp.nll_tstat, &comp.nll_pvalue);
+    svpf_test_paired_ttest(cov95_diff.data(), n, &comp.coverage_95_tstat, &comp.coverage_95_pvalue);
+    svpf_test_paired_ttest(ess_diff.data(), n, &comp.ess_mean_tstat, &comp.ess_mean_pvalue);
+    
+    // Standard errors
+    float var_rmse = 0, var_nll = 0;
+    for (int i = 0; i < n; i++) {
+        var_rmse += (rmse_diff[i] - comp.rmse_h_diff) * (rmse_diff[i] - comp.rmse_h_diff);
+        var_nll += (nll_diff[i] - comp.nll_diff) * (nll_diff[i] - comp.nll_diff);
+    }
+    comp.rmse_h_se = sqrtf(var_rmse / (n * (n - 1)));
+    comp.nll_se = sqrtf(var_nll / (n * (n - 1)));
+    
+    // Cohen's d
+    float sd_rmse = sqrtf(var_rmse / (n - 1));
+    float sd_nll = sqrtf(var_nll / (n - 1));
+    comp.rmse_h_cohens_d = (sd_rmse > 1e-10f) ? (comp.rmse_h_diff / sd_rmse) : 0.0f;
+    comp.nll_cohens_d = (sd_nll > 1e-10f) ? (comp.nll_diff / sd_nll) : 0.0f;
+    
+    // Verdicts
+    comp.rmse_significant = comp.rmse_h_pvalue < 0.05f;
+    comp.nll_significant = comp.nll_pvalue < 0.05f;
+    comp.rmse_b_better = comp.rmse_h_diff < 0;
+    comp.nll_b_better = comp.nll_diff < 0;
+    
+    // Compute aggregate results if requested
+    // Note: For proper aggregates, we'd need to re-run, but for efficiency
+    // we construct from the collected data
+    if (result_a_out) {
+        result_a_out->scenario_name = scenario->name;
+        result_a_out->n_seeds = n;
+        result_a_out->n_steps = config->n_steps;
+        result_a_out->rmse_h = compute_stats(rmse_a);
+        result_a_out->nll = compute_stats(nll_a);
+        result_a_out->coverage_95 = compute_stats(cov95_a);
+        result_a_out->ess_mean = compute_stats(ess_a);
+    }
+    if (result_b_out) {
+        result_b_out->scenario_name = scenario->name;
+        result_b_out->n_seeds = n;
+        result_b_out->n_steps = config->n_steps;
+        result_b_out->rmse_h = compute_stats(rmse_b);
+        result_b_out->nll = compute_stats(nll_b);
+        result_b_out->coverage_95 = compute_stats(cov95_b);
+        result_b_out->ess_mean = compute_stats(ess_b);
+    }
+    
+    return comp;
+}
+
+// =============================================================================
 // Output Functions
 // =============================================================================
 
