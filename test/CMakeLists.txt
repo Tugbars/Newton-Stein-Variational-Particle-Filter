@@ -168,3 +168,31 @@ target_link_libraries(profile_svpf
 set_target_properties(profile_svpf PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
 )
+
+# -----------------------------------------------------------------------------
+# Test framework runner
+# -----------------------------------------------------------------------------
+add_executable(run_svpf_tests run_svpf_tests.cu)
+
+target_include_directories(run_svpf_tests
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CUDAToolkit_INCLUDE_DIRS}
+)
+
+target_link_libraries(run_svpf_tests
+    PRIVATE
+        svpf
+        CUDA::cudart
+        CUDA::curand
+)
+
+set_target_properties(run_svpf_tests PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+)
+
+add_test(NAME TestFramework COMMAND run_svpf_tests --quick)
+set_tests_properties(TestFramework PROPERTIES
+    TIMEOUT 600
+    LABELS "framework;validation"
+)

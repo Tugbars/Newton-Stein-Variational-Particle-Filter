@@ -8,6 +8,7 @@ set(SVPF_SOURCES
     svpf_opt_kernels.cu
     svpf_gradient_diagnostic.cu
     svpf_diagnostics.cu
+    svpf_test_framework.cu
 )
 
 # =============================================================================
