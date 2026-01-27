@@ -125,7 +125,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     cudaMemcpy(state->d_return_var, &init_ema, sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(state->d_bw_alpha, &init_alpha, sizeof(float), cudaMemcpyHostToDevice);
     
-    state->lik_offset = 0.70f;
+    state->lik_offset = 0.45f;
     state->use_exact_gradient = 0;
     
     state->use_svld = 1;

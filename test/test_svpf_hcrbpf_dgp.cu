@@ -540,20 +540,9 @@ static Metrics run_svpf_on_scenario(
         filter->rmsprop_eps = 1e-6f;
         
         filter->use_mim = 1;
-        filter->mim_jump_prob = 0.15f;
-        filter->mim_jump_scale = 7.0f;
-        
-        filter->use_asymmetric_rho = 1;
-        filter->rho_up = 0.99f;
-        filter->rho_down = 0.92f;
-        
-        // Particle-local parameters
-        // Key insight: DGP has θ(z), σ(z) — params depend on latent z
-        // We use h deviation as proxy: high h → likely high z → different dynamics
-        filter->use_local_params = 0;
-        filter->delta_rho = 0.04f;    // ±2% rho variation based on h deviation
-        filter->delta_sigma = 0.3f;   // ±10% sigma variation
-        
+        filter->mim_jump_prob = 0.25f;
+        filter->mim_jump_scale = 9.0f;
+    
         // Newton-Stein (Hessian preconditioning)
         // Adaptive step size based on local curvature: H^{-1} * grad
         filter->use_newton = 1;
@@ -583,13 +572,12 @@ static Metrics run_svpf_on_scenario(
         filter->guide_strength_max = 0.30f;        // Max during surprises
         filter->guide_innovation_threshold = 1.0f; // Z-score to start boosting
 
-        filter->use_adaptive_sigma = 1;
+        filter->use_adaptive_sigma = 0;
         filter->sigma_boost_threshold = 1.0f; // Start boosting when |z| > 1
         filter->sigma_boost_max = 3.0f;       // Max 3x boost
 
-
         filter->use_exact_gradient = 1;
-        filter->lik_offset = 0.335f;  // No correction - test if model is now consistent
+        filter->lik_offset = 0.35f;  // No correction - test if model is now consistent
 
          // === KSD-based Adaptive Stein Steps ===
         // Replaces fixed n_stein_steps with convergence-based early stopping
