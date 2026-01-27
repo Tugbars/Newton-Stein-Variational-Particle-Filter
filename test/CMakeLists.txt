@@ -196,3 +196,31 @@ set_tests_properties(TestFramework PROPERTIES
     TIMEOUT 600
     LABELS "framework;validation"
 )
+
+# -----------------------------------------------------------------------------
+# Multi-Scale SVPF A/B Test (REACTIVE + INERTIAL vs Mono)
+# -----------------------------------------------------------------------------
+add_executable(svpf_multiscale_test svpf_multiscale_test.cu)
+
+target_include_directories(svpf_multiscale_test
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CUDAToolkit_INCLUDE_DIRS}
+)
+
+target_link_libraries(svpf_multiscale_test
+    PRIVATE
+        svpf
+        CUDA::cudart
+        CUDA::curand
+)
+
+set_target_properties(svpf_multiscale_test PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+)
+
+add_test(NAME MultiscaleABTest COMMAND svpf_multiscale_test)
+set_tests_properties(MultiscaleABTest PROPERTIES
+    TIMEOUT 1200
+    LABELS "multiscale;comparison;ab-test"
+)

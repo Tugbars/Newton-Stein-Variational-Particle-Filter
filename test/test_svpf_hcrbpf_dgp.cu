@@ -527,7 +527,7 @@ static Metrics run_svpf_on_scenario(
     SVPFParams params;
     params.rho = 0.97f;     /* Fixed, but DGP has θ(z) ∈ [0.007, 0.127] */
     params.sigma_z = 0.15f; /* Fixed, but DGP has σ(z) ∈ [0.08, 0.50] */
-    params.mu = -3.5f;      /* Fixed, but DGP has μ(z) ∈ [-4.5, -1.0] */
+    params.mu = -4.5f;      /* Fixed, but DGP has μ(z) ∈ [-4.5, -1.0] */
     params.gamma = 0.0f;    /* No leverage in this DGP */
 
     // IMPORTANT: Re-initialize to set up lambda particles
@@ -537,7 +537,7 @@ static Metrics run_svpf_on_scenario(
     if (use_adaptive) {
         filter->use_svld = 1;
         filter->use_annealing = 1;
-        filter->n_anneal_steps = 3;
+        filter->n_anneal_steps = 5;
         filter->temperature = 0.45f;
         filter->rmsprop_rho = 0.9f;
         filter->rmsprop_eps = 1e-6f;
@@ -580,10 +580,7 @@ static Metrics run_svpf_on_scenario(
         filter->sigma_boost_max = 3.2f;       // Max 3x boost
 
         filter->use_exact_gradient = 1;
-        filter->lik_offset = 0.35f;  // No correction - test if model is now consistent
-
-        // Test B: Fan mode (weightless SVGD)
-        svpf_set_fan_mode(filter, 1);
+        filter->lik_offset = 0.345f;  // No correction - test if model is now consistent
 
          // === KSD-based Adaptive Stein Steps ===
         // Replaces fixed n_stein_steps with convergence-based early stopping

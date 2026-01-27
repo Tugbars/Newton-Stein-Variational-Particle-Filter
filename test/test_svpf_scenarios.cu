@@ -429,9 +429,9 @@ int main(int argc, char** argv) {
     printf("╚══════════════════════════════════════════════════════════════════════════════╝\n\n");
     
     int seed = 42;
-    int n_particles = 1024;
+    int n_particles = 512;
     int n_stein = 10;
-    float nu = 5.0f;
+    float nu = 50.0f;
     int use_adaptive = 1;  /* Default: use adaptive improvements */
     
     /* Parse args */
@@ -508,26 +508,59 @@ int main(int argc, char** argv) {
     svpf_initialize(filter, &params, seed);
     
     /* Configure adaptive SVPF settings */
-    filter->use_svld = use_adaptive ? 1 : 0;       // 1 = SVLD with Langevin noise
-    filter->use_annealing = use_adaptive ? 1 : 0;
-    filter->n_anneal_steps = 3;
-    filter->temperature = 0.3f;    // 0=SVGD, 1=SVLD, >1=extra exploration
-    filter->rmsprop_rho = 0.9f;
-    filter->rmsprop_eps = 1e-6f;
+     filter->use_svld = 1;
+        filter->use_annealing = 1;
+        filter->n_anneal_steps = 3;
+        filter->temperature = 0.45f;
+        filter->rmsprop_rho = 0.9f;
+        filter->rmsprop_eps = 1e-6f;
+        
+        filter->use_mim = 1;
+        filter->mim_jump_prob = 0.25f;
+        filter->mim_jump_scale = 9.0f;
     
-    /* Mixture Innovation Model (MIM) */
-    filter->use_mim = use_adaptive ? 1 : 0;
-    filter->mim_jump_prob = 0.25f;   // 5% of particles get large innovation
-    filter->mim_jump_scale = 5.0f;   // 5x std dev for jump component
-    
-    /* Asymmetric persistence (vol spikes fast, decays slow) */
-    filter->use_asymmetric_rho = use_adaptive ? 1 : 0;
-    filter->rho_up = 0.99f;    // Higher persistence when vol increasing
-    filter->rho_down = 0.91f;  // Lower persistence when vol decreasing
-    
-    /* EKF Guide Density (coarse positioning before Stein) */
-    filter->use_guide = use_adaptive ? 1 : 0;
-    filter->guide_strength = 0.05f;  // How much to pull toward guide (0.1-0.3)
+        // Newton-Stein (Hessian preconditioning)
+        // Adaptive step size based on local curvature: H^{-1} * grad
+        filter->use_newton = 1;
+        filter->use_full_newton = 1;  // Enable Detommaso 2018 full Newton
+
+        // Guided Prediction with INNOVATION GATING (FIXED)
+        // - Bottom clamp prevents zero-return trap (log(0) → -inf)
+        // - Asymmetric gating only activates on UPWARD shocks (spikes)
+        filter->use_guided = 1;
+        filter->guided_alpha_base = 0.0f;             // 0% when model fits
+        filter->guided_alpha_shock = 0.40f;           // 40% when model fails
+        filter->guided_innovation_threshold = 1.5f;   // 1.5σ = "surprised"
+        
+        // EKF Guide density
+        filter->use_guide = 1;
+        filter->use_guide_preserving = 1;  // Variance-preserving shift (not contraction)
+        filter->guide_strength = 0.05f;
+      
+        filter->use_adaptive_mu = 1;
+        filter->mu_process_var = 0.001f;  // Q: how fast can mu drift
+        filter->mu_obs_var_scale = 11.0f; // R = scale * bw²
+        filter->mu_min = -4.0f;
+        filter->mu_max = -1.0f;
+
+        filter->use_adaptive_guide = 1;
+        filter->guide_strength_base = 0.05f;       // Base when model fits
+        filter->guide_strength_max = 0.30f;        // Max during surprises
+        filter->guide_innovation_threshold = 1.0f; // Z-score to start boosting
+
+        filter->use_adaptive_sigma = 1;
+        filter->sigma_boost_threshold = 0.95f; // Start boosting when |z| > 1
+        filter->sigma_boost_max = 3.2f;       // Max 3x boost
+
+        filter->use_exact_gradient = 1;
+        filter->lik_offset = 0.35f;  // No correction - test if model is now consistent
+
+         // === KSD-based Adaptive Stein Steps ===
+        // Replaces fixed n_stein_steps with convergence-based early stopping
+        // KSD (Kernel Stein Discrepancy) computed in same O(N²) pass - zero extra cost
+        filter->stein_min_steps = 12;              // Always run at least 4 (RMSProp warmup)
+        filter->stein_max_steps = 20;             // Cap at 12 (crisis budget)
+        filter->ksd_improvement_threshold = 0.03; // Stop if <5% relative improvement
     
     printf("  Filter initialized.\n");
     printf("  Mode: %s\n", use_adaptive ? "SVLD + MIM + Asym-ρ + Guide" : "VANILLA SVGD");
