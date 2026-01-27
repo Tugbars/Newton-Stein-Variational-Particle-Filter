@@ -12,7 +12,7 @@ A high-performance CUDA implementation of the Stein Variational Particle Filter 
 | Metric | Value |
 |--------|-------|
 | **Latency** | ~10 μs/step |
-| **Particles** | 1024 |
+| **Particles** | 512 |
 
 ```
 Scenario            RMSE (log-vol)
