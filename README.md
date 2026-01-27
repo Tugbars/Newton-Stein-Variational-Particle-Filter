@@ -6,6 +6,7 @@ A high-performance CUDA implementation of the Stein Variational Particle Filter 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 ---
+<img width="4170" height="2370" alt="529603395-23dc2d9c-f92a-4b3c-8fe0-73b165dde93d" src="https://github.com/user-attachments/assets/3490999d-1356-4cea-badb-bf3bb4c7a67c" />
 
 ## Performance
 
