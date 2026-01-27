@@ -426,6 +426,7 @@ __global__ void svpf_fused_stein_transport_kernel(
     float temperature,
     float rho_rmsprop,
     float epsilon,
+    int stein_sign_mode,  // 0=legacy(subtract), 1=paper(add)
     int n
 ) {
     extern __shared__ float smem[];
@@ -447,6 +448,9 @@ __global__ void svpf_fused_stein_transport_kernel(
     float inv_bw_sq = 1.0f / bw_sq;
     float inv_n = 1.0f / (float)n;
     
+    // Sign multiplier: -1 for legacy (attraction), +1 for paper (repulsion)
+    float sign_mult = (stein_sign_mode == 1) ? 1.0f : -1.0f;
+    
     // ===== STEIN OPERATOR with IMQ Kernel =====
     float k_sum = 0.0f;
     float gk_sum = 0.0f;
@@ -461,7 +465,9 @@ __global__ void svpf_fused_stein_transport_kernel(
         float K_sq = K * K;
         
         k_sum += K * sh_grad[j];
-        gk_sum -= 2.0f * diff * inv_bw_sq * K_sq;
+        // Kernel gradient: sign_mult * 2 * diff / h² * k²
+        // Legacy: -2*diff (attraction), Paper: +2*diff (repulsion)
+        gk_sum += sign_mult * 2.0f * diff * inv_bw_sq * K_sq;
     }
     
     float phi_i = (k_sum + gk_sum) * inv_n;
@@ -514,6 +520,7 @@ __global__ void svpf_fused_stein_transport_ksd_kernel(
     float temperature,
     float rho_rmsprop,
     float epsilon,
+    int stein_sign_mode,  // 0=legacy(subtract), 1=paper(add)
     int n
 ) {
     extern __shared__ float smem[];
@@ -536,6 +543,9 @@ __global__ void svpf_fused_stein_transport_ksd_kernel(
     float inv_bw_sq = 1.0f / bw_sq;
     float inv_n = 1.0f / (float)n;
     
+    // Sign multiplier: -1 for legacy (attraction), +1 for paper (repulsion)
+    float sign_mult = (stein_sign_mode == 1) ? 1.0f : -1.0f;
+    
     // ===== FUSED: Stein operator + KSD =====
     float k_sum = 0.0f;
     float gk_sum = 0.0f;
@@ -556,7 +566,8 @@ __global__ void svpf_fused_stein_transport_ksd_kernel(
         
         // ----- Stein operator -----
         k_sum += K * s_j;
-        gk_sum -= 2.0f * diff * inv_bw_sq * K_sq;
+        // Kernel gradient with configurable sign
+        gk_sum += sign_mult * 2.0f * diff * inv_bw_sq * K_sq;
         
         // ----- KSD Stein kernel -----
         // u(x,y) = k·sₓ·sᵧ + sₓ·∇ᵧk + sᵧ·∇ₓk + ∇ₓ∇ᵧk
@@ -639,6 +650,7 @@ __global__ void svpf_fused_stein_transport_newton_kernel(
     float temperature,
     float rho_rmsprop,
     float epsilon,
+    int stein_sign_mode,  // 0=legacy(subtract), 1=paper(add)
     int n
 ) {
     extern __shared__ float smem[];
@@ -662,6 +674,9 @@ __global__ void svpf_fused_stein_transport_newton_kernel(
     float inv_bw_sq = 1.0f / bw_sq;
     float inv_n = 1.0f / (float)n;
     
+    // Sign multiplier: -1 for legacy (attraction), +1 for paper (repulsion)
+    float sign_mult = (stein_sign_mode == 1) ? 1.0f : -1.0f;
+    
     float k_sum = 0.0f;
     float gk_sum = 0.0f;
     
@@ -675,7 +690,8 @@ __global__ void svpf_fused_stein_transport_newton_kernel(
         float K_sq = K * K;
         
         k_sum += K * sh_precond_grad[j];
-        gk_sum -= 2.0f * diff * inv_bw_sq * K_sq * sh_inv_hess[j];
+        // Kernel gradient with configurable sign, scaled by inv_hessian
+        gk_sum += sign_mult * 2.0f * diff * inv_bw_sq * K_sq * sh_inv_hess[j];
     }
     
     float phi_i = (k_sum + gk_sum) * inv_n;
@@ -714,6 +730,7 @@ __global__ void svpf_fused_stein_transport_newton_ksd_kernel(
     float temperature,
     float rho_rmsprop,
     float epsilon,
+    int stein_sign_mode,  // 0=legacy(subtract), 1=paper(add)
     int n
 ) {
     extern __shared__ float smem[];
@@ -738,6 +755,9 @@ __global__ void svpf_fused_stein_transport_newton_ksd_kernel(
     float inv_bw_sq = 1.0f / bw_sq;
     float inv_n = 1.0f / (float)n;
     
+    // Sign multiplier: -1 for legacy (attraction), +1 for paper (repulsion)
+    float sign_mult = (stein_sign_mode == 1) ? 1.0f : -1.0f;
+    
     float k_sum = 0.0f;
     float gk_sum = 0.0f;
     float ksd_sum = 0.0f;
@@ -755,9 +775,10 @@ __global__ void svpf_fused_stein_transport_newton_ksd_kernel(
         float K_sq = K * K;
         
         k_sum += K * s_j;
-        gk_sum -= 2.0f * diff * inv_bw_sq * K_sq * sh_inv_hess[j];
+        // Kernel gradient with configurable sign, scaled by inv_hessian
+        gk_sum += sign_mult * 2.0f * diff * inv_bw_sq * K_sq * sh_inv_hess[j];
         
-        // KSD
+        // KSD (always uses mathematically correct derivatives for discrepancy measure)
         float grad_x_k = -2.0f * diff * inv_bw_sq * K_sq;
         float grad_y_k = -grad_x_k;
         float hess_xy_k = 2.0f * inv_bw_sq * K_sq * (4.0f * dist_sq * K - 1.0f);
@@ -801,6 +822,7 @@ __global__ void svpf_fused_stein_transport_full_newton_kernel(
     float temperature,
     float rho_rmsprop,
     float epsilon,
+    int stein_sign_mode,  // 0=legacy(subtract), 1=paper(add)
     int n
 ) {
     extern __shared__ float smem[];
@@ -824,6 +846,9 @@ __global__ void svpf_fused_stein_transport_full_newton_kernel(
     float inv_bw_sq = 1.0f / bw_sq;
     float inv_n = 1.0f / (float)n;
     
+    // Sign multiplier: -1 for legacy (attraction), +1 for paper (repulsion)
+    float sign_mult = (stein_sign_mode == 1) ? 1.0f : -1.0f;
+    
     float H_weighted = 0.0f;
     float K_sum_norm = 0.0f;
     float k_grad_sum = 0.0f;
@@ -844,8 +869,9 @@ __global__ void svpf_fused_stein_transport_full_newton_kernel(
         K_sum_norm += K;
         
         k_grad_sum += K * sh_grad[j];
-        float dK = -2.0f * diff * inv_bw_sq * K_sq;
-        gk_sum += dK;
+        // Kernel gradient with configurable sign
+        // Legacy: -2*diff (attraction), Paper: +2*diff (repulsion)
+        gk_sum += sign_mult * 2.0f * diff * inv_bw_sq * K_sq;
     }
     
     H_weighted = H_weighted / fmaxf(K_sum_norm, 1e-6f);

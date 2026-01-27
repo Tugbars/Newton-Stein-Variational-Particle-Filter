@@ -299,7 +299,9 @@ __global__ void svpf_fused_stein_transport_kernel(
     curandStatePhilox4_32_10_t* __restrict__ rng,
     const float* __restrict__ d_bandwidth,
     float step_size, float beta_factor, float temperature,
-    float rho_rmsprop, float epsilon, int n
+    float rho_rmsprop, float epsilon,
+    int stein_sign_mode,  // 0=legacy(subtract), 1=paper(add)
+    int n
 );
 
 // Stein + Transport + KSD (computes KSD in same O(N²) pass, zero extra cost)
@@ -311,7 +313,9 @@ __global__ void svpf_fused_stein_transport_ksd_kernel(
     const float* __restrict__ d_bandwidth,
     float* __restrict__ d_ksd_partial,  // Output: partial KSD sums [n floats]
     float step_size, float beta_factor, float temperature,
-    float rho_rmsprop, float epsilon, int n
+    float rho_rmsprop, float epsilon,
+    int stein_sign_mode,  // 0=legacy(subtract), 1=paper(add)
+    int n
 );
 
 __global__ void svpf_fused_stein_transport_newton_kernel(
@@ -322,7 +326,9 @@ __global__ void svpf_fused_stein_transport_newton_kernel(
     curandStatePhilox4_32_10_t* __restrict__ rng,
     const float* __restrict__ d_bandwidth,
     float step_size, float beta_factor, float temperature,
-    float rho_rmsprop, float epsilon, int n
+    float rho_rmsprop, float epsilon,
+    int stein_sign_mode,  // 0=legacy(subtract), 1=paper(add)
+    int n
 );
 
 // Newton + KSD variant
@@ -335,7 +341,9 @@ __global__ void svpf_fused_stein_transport_newton_ksd_kernel(
     const float* __restrict__ d_bandwidth,
     float* __restrict__ d_ksd_partial,  // Output: partial KSD sums [n floats]
     float step_size, float beta_factor, float temperature,
-    float rho_rmsprop, float epsilon, int n
+    float rho_rmsprop, float epsilon,
+    int stein_sign_mode,  // 0=legacy(subtract), 1=paper(add)
+    int n
 );
 
 // Full Newton with kernel-weighted Hessian (Detommaso et al. 2018)
@@ -347,7 +355,9 @@ __global__ void svpf_fused_stein_transport_full_newton_kernel(
     curandStatePhilox4_32_10_t* __restrict__ rng,
     const float* __restrict__ d_bandwidth,
     float step_size, float beta_factor, float temperature,
-    float rho_rmsprop, float epsilon, int n
+    float rho_rmsprop, float epsilon,
+    int stein_sign_mode,  // 0=legacy(subtract), 1=paper(add)
+    int n
 );
 
 __global__ void svpf_fused_outputs_kernel(

@@ -61,6 +61,32 @@ extern "C" {
 #define SVPF_GRAPH_PARAMS_SIZE     32
 
 // =============================================================================
+// STEIN SIGN MODE CONFIGURATION
+// =============================================================================
+//
+// The Stein operator has two terms:
+//   φ(x_i) = 1/n Σⱼ [k(xⱼ, xᵢ)·∇log q(xⱼ) + ∇_{xⱼ} k(xⱼ, xᵢ)]
+//                    └─── attraction ────┘   └─── repulsion ───┘
+//
+// For IMQ kernel with diff = x_i - x_j:
+//   ∇_{xⱼ} k(xⱼ, xᵢ) = +2·diff/h²·k²
+//
+// STEIN_SIGN_LEGACY (0): Subtracts kernel gradient (particles attract)
+//   - Empirically tuned with MIM/SVLD/guide compensating for lack of repulsion
+//   - Production-tested configuration
+//
+// STEIN_SIGN_PAPER (1): Adds kernel gradient (particles repel)
+//   - Mathematically correct per Fan et al. 2021
+//   - May require retuning other parameters
+//
+#define SVPF_STEIN_SIGN_LEGACY  0
+#define SVPF_STEIN_SIGN_PAPER   1
+
+#ifndef SVPF_STEIN_SIGN_DEFAULT
+#define SVPF_STEIN_SIGN_DEFAULT SVPF_STEIN_SIGN_LEGACY
+#endif
+
+// =============================================================================
 // DATA STRUCTURES
 // =============================================================================
 
@@ -412,6 +438,19 @@ typedef struct {
     float sigma_boost_max;          // Maximum boost multiplier (e.g., 3.0 = 3x base)
     float sigma_z_effective;        // Current effective sigma_z (for graph capture)
     
+    // =========================================================================
+    // STEIN OPERATOR SIGN MODE
+    // =========================================================================
+    // Controls whether the kernel gradient term adds (repulsion, per paper)
+    // or subtracts (attraction, legacy empirical tuning).
+    //
+    // 0 = SVPF_STEIN_SIGN_LEGACY: gk_sum -= 2*diff*inv_bw_sq*K_sq (attraction)
+    // 1 = SVPF_STEIN_SIGN_PAPER:  gk_sum += 2*diff*inv_bw_sq*K_sq (repulsion)
+    //
+    // Legacy mode works with current MIM/SVLD/guide tuning.
+    // Paper mode is mathematically correct but may need parameter retuning.
+    int stein_repulsive_sign;
+    
     // Optimized backend (embedded for thread safety)
     SVPFOptimizedState opt_backend;
 
@@ -480,6 +519,39 @@ void svpf_step(SVPFState* state, float y_t, const SVPFParams* params, SVPFResult
  */
 void svpf_step_seeded(SVPFState* state, float y_t, const SVPFParams* params,
                       unsigned long long rng_seed, SVPFResult* result);
+
+// =============================================================================
+// API: Stein Sign Mode Configuration
+// =============================================================================
+
+/**
+ * @brief Set Stein operator repulsive sign mode
+ * 
+ * @param state   Filter state
+ * @param mode    SVPF_STEIN_SIGN_LEGACY (0) or SVPF_STEIN_SIGN_PAPER (1)
+ * 
+ * LEGACY (0): Kernel gradient subtracts (particles attract)
+ *   - Empirically tuned with MIM/SVLD/guide providing diversity
+ *   - Production-tested, stable configuration
+ * 
+ * PAPER (1): Kernel gradient adds (particles repel)
+ *   - Mathematically correct per Fan et al. 2021
+ *   - May allow reducing MIM/SVLD/guide strength
+ *   - Requires validation and possible retuning
+ * 
+ * Call svpf_graph_invalidate() after changing if using CUDA graphs.
+ */
+static inline void svpf_set_stein_sign_mode(SVPFState* state, int mode) {
+    state->stein_repulsive_sign = (mode == SVPF_STEIN_SIGN_PAPER) ? 1 : 0;
+}
+
+/**
+ * @brief Get current Stein operator sign mode
+ * @return SVPF_STEIN_SIGN_LEGACY (0) or SVPF_STEIN_SIGN_PAPER (1)
+ */
+static inline int svpf_get_stein_sign_mode(const SVPFState* state) {
+    return state->stein_repulsive_sign;
+}
 
 // =============================================================================
 // API: Batch Processing (svpf_kernels.cu)
@@ -670,6 +742,7 @@ bool svpf_graph_is_captured(SVPFState* state);
  * Call after changing:
  *   - SVPFParams (rho, sigma_z, mu, gamma)
  *   - Filter configuration (use_guided, use_newton, use_mim, etc.)
+ *   - Stein sign mode (stein_repulsive_sign)
  *   - Any other filter settings
  * 
  * The next svpf_step_graph() call will recapture with new parameters.

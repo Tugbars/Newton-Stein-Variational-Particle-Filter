@@ -182,6 +182,11 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     state->sigma_boost_max = 3.0f;
     state->sigma_z_effective = 0.10f;
     
+    // === Stein operator sign mode ===
+    // 0 = legacy (subtract, attraction) - production-tested with MIM/SVLD/guide
+    // 1 = paper (add, repulsion) - mathematically correct per Fan et al. 2021
+    state->stein_repulsive_sign = SVPF_STEIN_SIGN_DEFAULT;
+    
     // === KSD-based Adaptive Stein Steps ===
     state->stein_min_steps = 4;              // Always run at least this many
     state->stein_max_steps = 12;             // Never exceed this
@@ -654,14 +659,16 @@ void svpf_step_graph(SVPFState* state, float y_t, float y_prev, const SVPFParams
                         state->h, opt->d_precond_grad, opt->d_inv_hessian,
                         state->d_grad_v, state->rng_states, opt->d_bandwidth,
                         opt->d_ksd_partial,
-                        base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps, n
+                        base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps,
+                        state->stein_repulsive_sign, n
                     );
                 } else {
                     svpf_fused_stein_transport_ksd_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
                         state->h, state->grad_log_p, state->d_grad_v,
                         state->rng_states, opt->d_bandwidth,
                         opt->d_ksd_partial,
-                        base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps, n
+                        base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps,
+                        state->stein_repulsive_sign, n
                     );
                 }
                 
@@ -676,20 +683,23 @@ void svpf_step_graph(SVPFState* state, float y_t, float y_prev, const SVPFParams
                         svpf_fused_stein_transport_full_newton_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
                             state->h, state->grad_log_p, opt->d_inv_hessian,
                             state->d_grad_v, state->rng_states, opt->d_bandwidth,
-                            base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps, n
+                            base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps,
+                            state->stein_repulsive_sign, n
                         );
                     } else {
                         svpf_fused_stein_transport_newton_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
                             state->h, opt->d_precond_grad, opt->d_inv_hessian,
                             state->d_grad_v, state->rng_states, opt->d_bandwidth,
-                            base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps, n
+                            base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps,
+                            state->stein_repulsive_sign, n
                         );
                     }
                 } else {
                     svpf_fused_stein_transport_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
                         state->h, state->grad_log_p, state->d_grad_v,
                         state->rng_states, opt->d_bandwidth,
-                        base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps, n
+                        base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps,
+                        state->stein_repulsive_sign, n
                     );
                 }
             }
