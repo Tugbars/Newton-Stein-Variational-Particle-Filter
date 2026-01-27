@@ -1,8 +1,8 @@
 # SVPF: Stein Variational Particle Filter for Stochastic Volatility
 
-A high-performance CUDA implementation of the Stein Variational Particle Filter for real-time volatility tracking in financial applications.
+A high-performance CUDA implementation of the Stein Variational Particle Filter for real-time volatility tracking.
 
-[![CUDA](https://img.shields.io/badge/CUDA-13.1-green.svg)](https://developer.nvidia.com/cuda-toolkit)
+[![CUDA](https://img.shields.io/badge/CUDA-12+-green.svg)](https://developer.nvidia.com/cuda-toolkit)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 ---
@@ -11,148 +11,73 @@ A high-performance CUDA implementation of the Stein Variational Particle Filter 
 
 | Metric | Value |
 |--------|-------|
-| **RMSE** | 0.5507 (log-vol) |
 | **Latency** | ~10 μs/step |
-| **Particles** | 400 |
-| **Bias** | ~0.00 |
+| **Particles** | 1024 |
 
 ```
-Scenario                   RMSE        Bias
-────────────────────────────────────────────
-Slow Drift               0.5942     -0.02
-Stress Ramp              0.6233     -0.01
-OU-Matched               0.4105     +0.07
-Intermediate Band        0.6390     -0.02
-Spike+Recovery           0.4762     +0.02
-Wrong-Model              0.5611     -0.07
-────────────────────────────────────────────
-AVERAGE                  0.5507     ~0.00
+Scenario            RMSE (log-vol)
+────────────────────────────────────
+calm                0.3468
+crisis              0.6639
+spike               0.5677
+regime_shift        0.3468
+asymmetric          0.4067
+jumps               0.4108
+fat_tails           0.3899
+────────────────────────────────────
 ```
 
 ---
 
-## The Problem: Tracking Hidden Volatility
+## The Problem
 
-Financial volatility is **latent** — we never observe it directly. We only see noisy price returns:
+Volatility is **latent**—we never observe it directly:
 
 ```
 Hidden:     h_t = μ + ρ(h_{t-1} - μ) + σ_z·ε     (log-volatility)
 Observed:   y_t = exp(h_t/2)·η                   (returns)
 ```
 
-The challenge: infer the hidden state `h_t` from observations `y_t` in real-time.
+The challenge: infer `h_t` from `y_t` in real-time, handling regime changes and fat tails.
 
 ---
 
 ## Why Stein Variational?
 
-### The Bootstrap Particle Filter Problem
+**Bootstrap particle filters** rely on resampling—particles die and clone. When the target moves to a new region, you need particles already waiting there.
 
-Traditional particle filters represent the posterior as weighted samples. When the target moves, particles must **die and resample**:
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                    BOOTSTRAP PARTICLE FILTER                        │
-│                                                                     │
-│     Particles are POINTS with WEIGHTS                               │
-│                  ↓                                                   │
-│     Low-weight particles DIE (resampling)                           │
-│                  ↓                                                   │
-│     Particles can only be where they were BORN                      │
-│                  ↓                                                   │
-│     If target moves to new region → DEGENERACY                      │
-│     (no particles there to catch it)                                │
-│                                                                     │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-This is why regime-switching filters need **pre-positioned filter banks** — particles waiting at each possible regime.
-
-### The Stein Solution: Particles That Move
-
-SVPF replaces resampling with **gradient transport**. Particles flow toward high-probability regions:
+**SVPF** replaces resampling with **gradient transport**. Particles flow toward high-probability regions:
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                    STEIN VARIATIONAL FILTER                         │
-│                                                                     │
-│     Particles MOVE along gradients                                  │
-│                  ↓                                                   │
-│     φ(x) = E[K·∇log p] + E[∇K]                                      │
-│             ─────────    ─────                                       │
-│             ATTRACTION   REPULSION                                   │
-│             (to mode)    (diversity)                                 │
-│                  ↓                                                   │
-│     If target moves → gradient points there → particles FLOW        │
-│     (single adaptive filter can "teleport" to any regime)           │
-│                                                                     │
-└─────────────────────────────────────────────────────────────────────┘
+φ(x) = E[K·∇log p] + E[∇K]
+       ───────────   ─────
+       ATTRACTION    REPULSION
+       (to mode)     (diversity)
 ```
 
-**Key insight**: When you change a model parameter, you're not hoping particles randomly land correctly — you're **telling them where to go** via the gradient.
+When a regime shifts, the gradient points there—particles **flow** instead of hoping to randomly land correctly.
 
 ---
 
-## The Stein Operator
-
-At the heart of SVPF is the **Stein Variational Gradient Descent** update:
-
-```
-φ*(x) = E_{x'~q} [ k(x', x) ∇log p(x') + ∇_{x'} k(x', x) ]
-        ───────────────────────────────   ─────────────────
-                   DRIFT                      REPULSION
-           (toward high density)        (maintain diversity)
-```
-
-Where:
-- `p(x)` is the target posterior
-- `q(x)` is the current particle distribution  
-- `k(x, x')` is a kernel measuring particle similarity
-
-The drift term pulls particles toward the posterior mode. The repulsion term prevents collapse — particles push each other apart, maintaining coverage of the distribution.
-
-### Why This Works for Filtering
-
-In sequential filtering, the posterior changes every timestep. Bootstrap PF handles this by **killing and birthing** particles. SVPF handles it by **moving** particles.
-
-```
-Time t:    Posterior at region A    →  Particles cluster at A
-Time t+1:  Posterior shifts to B    →  Gradient points to B
-                                    →  Particles FLOW from A to B
-```
-
-No particles need to die. No lucky particles need to exist at B beforehand. The gradient is the **communication channel** between the model and the particles.
-
----
-
-## Algorithm Pipeline
+## Algorithm
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
 │                     SVPF STEP (per tick)                         │
 ├──────────────────────────────────────────────────────────────────┤
 │                                                                  │
-│  1. PREDICT        h_i ~ p(h_t | h_{t-1})                       │
-│     ├── Asymmetric ρ (vol spikes fast, decays slow)             │
-│     ├── Mixture Innovation (5% scouts for jumps)                │
-│     └── Guided proposal (peek at y_t when surprised)            │
+│  1. PREDICT        h ~ p(h_t | h_{t-1})                         │
+│     ├── MIM: Mixture transition for jump handling               │
+│     └── Asymmetric ρ: fast spike, slow decay                    │
 │                          ↓                                       │
-│  2. GUIDE          h_i += λ(m_EKF - h_i)                        │
-│     └── EKF posterior as "compass" to right neighborhood        │
+│  2. GUIDE          Nudge toward EKF estimate                    │
 │                          ↓                                       │
-│  3. STEIN          For β in [0.3, 0.65, 1.0]:  (annealing)     │
-│     │                                                            │
-│     │   ┌─────────────────────────────────────┐                 │
-│     │   │  GRADIENT    ∇log p(y|h) + ∇log p(h)│                 │
-│     │   │      ↓                              │                 │
-│     │   │  IMQ KERNEL  K = 1/(1 + r²)        │ ← Heavy tails    │
-│     │   │      ↓                              │                 │
-│     │   │  NEWTON      H⁻¹ preconditioning   │ ← Fast converge  │
-│     │   │      ↓                              │                 │
-│     │   │  LANGEVIN    √(2εT)·noise          │ ← Exploration    │
-│     │   └─────────────────────────────────────┘                 │
-│     │                    ↓                                       │
-│     └── Transport: h_i += ε·φ(h_i)                              │
+│  3. STEIN LOOP     For β in [0.3 → 1.0]:                        │
+│     │   • Compute gradient ∇log p(h|y)                          │
+│     │   • Newton precondition: H⁻¹·∇                            │
+│     │   • Kernel transport with IMQ                             │
+│     │   • Add Langevin noise (SVLD)                             │
+│     └── KSD early stopping                                       │
 │                          ↓                                       │
 │  4. OUTPUT         vol = mean(exp(h/2))                         │
 │                                                                  │
@@ -161,196 +86,88 @@ No particles need to die. No lucky particles need to exist at B beforehand. The 
 
 ---
 
-## Core Components
+## Key Features
 
-### 1. EKF Guide Density
-
-**Problem**: Stein gradients are local. If particles start far from the posterior mode, gradients are flat — particles don't know where to go.
-
-**Solution**: Run a cheap Extended Kalman Filter to find the approximate mode, then "teleport" particles to that neighborhood before running Stein updates.
-
+### Newton-Stein Preconditioning
+Standard SVGD uses raw gradients. We precondition with the Hessian:
 ```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│   PARTICLES │     │    EKF      │     │   STEIN     │
-│  (scattered)│ ──→ │  (compass)  │ ──→ │  (refine)   │
-│             │     │  finds mode │     │  exact shape│
-└─────────────┘     └─────────────┘     └─────────────┘
-     Lost            Points to A         Sculpts detail
+Standard:  h += ε · ∇log p           (same step everywhere)
+Newton:    h += ε · H⁻¹ · ∇log p     (adapts to curvature)
 ```
+Converges in 4-8 steps vs 15-20 for standard SVGD.
 
-The EKF is wrong (it assumes Gaussian), but it gets particles to the **right neighborhood**. Stein then corrects the shape.
+### Annealed Stein Updates
+Sharp likelihoods create local traps. We start with tempered likelihood (β=0.3), let particles explore, then gradually commit (β→1.0). Particles get a "global map" before finding specific modes.
 
-### 2. Annealed Updates
+### EKF Guide Density
+Stein gradients are local—if particles start far from the mode, gradients are flat. A parallel EKF finds the approximate mode and nudges particles to the right neighborhood. EKF is wrong (assumes Gaussian), but gets particles close; Stein then refines the shape.
 
-**Problem**: Sharp likelihoods create local traps. Particles converge to the nearest mode, not the global mode.
+### SVLD (Langevin Noise)
+Deterministic SVGD suffers variance collapse in the finite-particle regime. Adding `√(2εT)·noise` maintains particle spread and proper uncertainty quantification.
 
-**Solution**: Start with a "melted" (flat) likelihood, let particles spread globally, then gradually "freeze" to the true shape.
+### KSD-Adaptive Tempering
+When particles disagree (high KSD), the likelihood is uninformative at boundaries. We reduce β to trust the prior more—prevents overfitting to noise.
 
-```
-Temperature:   HIGH ──────────────────────→ LOW
-Landscape:     Flat (explore everywhere)    Sharp (commit to modes)
-Particles:     Spread out globally          Concentrate on peaks
-```
-
-This gives particles a "global map" before asking them to find a specific address.
-
-### 3. SVLD (Langevin Noise)
-
-**Problem**: In high dimensions, kernel repulsion weakens. Particles collapse to a point (variance collapse).
-
-**Solution**: Add controlled noise to maintain exploration:
-
-```
-Standard SVGD:  h += ε·φ(h)                    ← Deterministic, can collapse
-SVLD:           h += ε·φ(h) + √(2εT)·noise    ← Stochastic, maintains spread
-```
-
-The noise acts as "insurance" against variance collapse.
-
-### 4. Newton-Stein (Hessian Preconditioning)
-
-**Problem**: Standard gradient descent is slow in "stiff" posteriors (long narrow valleys). Particles zig-zag instead of going straight.
-
-**Solution**: Use curvature information to take smarter steps:
-
-```
-Standard:  h += ε · ∇log p           ← Same step size everywhere
-Newton:    h += ε · H⁻¹ · ∇log p     ← Adapts to local geometry
-```
-
-Newton converges in 2-3 steps where standard SVGD needs 10-20.
-
-### 5. IMQ Kernel
-
-**Problem**: Gaussian kernel `K = exp(-r²)` decays exponentially. Distant particles stop "talking" to each other.
-
-**Solution**: Use Inverse Multiquadric kernel with polynomial decay:
-
-```
-Gaussian:  K = exp(-r²)      →  At 3σ: K = 0.01  (particle stranded)
-IMQ:       K = 1/(1 + r²)    →  At 3σ: K = 0.10  (still connected)
-```
-
-During volatility spikes, outlier particles exploring the high-vol region stay connected to the group.
-
-### 6. Mixture Innovation Model
-
-**Problem**: Standard Gaussian proposals are "tunnel-visioned". If volatility jumps 10x, no particles land there.
-
-**Solution**: 5% of particles are "scouts" with 5x wider proposals:
-
-```
-┌────────────────────────────────────────────────────────────────┐
-│                                                                │
-│   95% SHEEP: σ = 0.15    ████████████                         │
-│                          (accurate if nothing crazy)           │
-│                                                                │
-│   5% SCOUTS: σ = 0.75         ▪   ▪       ▪    ▪              │
-│                          (insurance against jumps)             │
-│                                                                │
-└────────────────────────────────────────────────────────────────┘
-```
-
-During calm markets, scouts get killed by reweighting. During crashes, scouts survive and take over — the particle cloud "teleports" to the new regime.
+### IMQ Kernel
+Inverse Multiquadric `K = 1/(1+r²)` has polynomial decay vs Gaussian's exponential. Outlier particles stay connected during volatility spikes—critical for regime tracking.
 
 ---
 
-## Adaptive Mechanisms
+## Literature & Extensions
 
-The gradient is a **communication channel**. Adaptive parameters modulate what the gradient says:
+Our implementation extends Fan et al. (2021) with techniques from the particle filtering and SVGD literature:
 
-| Parameter | Adaptation | Gradient Effect |
-|-----------|------------|-----------------|
-| **μ** | Kalman filter on particle mean | Shifts prior center → particles drift |
-| **σ_z** | Innovation-gated boost | Weakens prior → particles spread |
-| **guide_strength** | Boost on upward vol surprises | Stronger likelihood pull → particles snap |
-| **ρ** | Direction-dependent (up/down) | Changes mean-reversion speed |
+| Feature | Source | Description |
+|---------|--------|-------------|
+| Stein transport | Fan 2021 | Core SVGD-based particle filter |
+| Newton preconditioning | Detommaso 2018 | Hessian-scaled Stein steps |
+| SVLD noise | Ba 2021 | Langevin diffusion prevents variance collapse |
+| Annealing | D'Angelo 2021 | Tempered likelihood for exploration |
+| KSD-adaptive β | Maken 2022 | Trust prior when particles disagree |
+| EKF guide | Van Der Merwe 2000 | Gaussian proposal for fast response |
+| MIM predict | Gordon 1993 | Mixture transition for jumps |
+| Asymmetric ρ | Nelson 1991 | Leverage effect (fast spike, slow decay) |
+| Adaptive μ | Chopin 2013 | Online mean-level learning (SMC²) |
+| Exact Student-t | Geweke 1993 | Consistent heavy-tailed likelihood |
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│              ADAPTIVE PARAMETER EFFECTS                     │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│   ↑ σ_z    →  Prior gradient WEAKENS  →  Particles SPREAD  │
-│   ↓ σ_z    →  Prior gradient STRENGTHENS → Particles FOCUS │
-│   Shift μ  →  Prior mean MOVES        →  Particles DRIFT   │
-│   ↑ guide  →  Likelihood pull UP      →  Particles SNAP    │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
+### Key References
 
-This is why SVPF doesn't need filter banks for regime switching — parameter changes **instantly** redirect all particles via the gradient.
+- Fan et al. (2021) "Stein Particle Filter" — Core algorithm
+- Detommaso et al. (2018) "Stein Variational Newton" — Newton preconditioning
+- Maken et al. (2022) "Stein Particle Filter for Nonlinear Systems" — KSD-adaptive tempering
+- Liu & Wang (2016) "Stein Variational Gradient Descent" — Foundational SVGD
 
 ---
 
-## Why Not Just Use Bootstrap PF?
+## Why Not Bootstrap PF?
 
 | Aspect | Bootstrap PF | SVPF |
 |--------|--------------|------|
-| **Particle update** | Kill/clone (resampling) | Flow (gradient transport) |
-| **Regime tracking** | Need pre-positioned filters | Single adaptive filter |
-| **Parameter changes** | Affect future births only | Instant effect on all particles |
-| **Mode collapse** | Risk with few particles | Kernel repulsion prevents it |
-| **Computational** | O(N) but degeneracy risk | O(N²) kernel but stable |
+| Particle update | Kill/clone (resampling) | Flow (gradient transport) |
+| Regime tracking | Needs pre-positioned particles | Single adaptive filter |
+| Parameter changes | Affect future births only | Instant redirect via gradient |
+| Mode collapse | Risk with few particles | Kernel repulsion prevents |
 
-**The fundamental difference**: Bootstrap PF particles are **passive** (they wait to be selected). SVPF particles are **active** (they move toward the target).
-
----
-
-## Theoretical Foundation
-
-SVPF minimizes the KL divergence between the particle distribution q and the target posterior p:
-
-```
-min KL(q || p) = min E_q[log q - log p]
-```
-
-The Stein operator provides the direction of steepest descent in the space of distributions:
-
-```
-φ* = argmax_{φ ∈ H} { -d/dε KL(T_ε q || p) |_{ε=0} }
-```
-
-Where `T_ε` is the transport map `x → x + ε·φ(x)`. The solution is:
-
-```
-φ*(x) = E_{x'~q}[ k(x',x) ∇log p(x') + ∇_{x'} k(x',x) ]
-```
-
-This is computable from samples — no need to know the normalizing constant of p.
+The fundamental difference: Bootstrap particles are **passive** (wait to be selected). SVPF particles are **active** (move toward the target).
 
 ---
 
-## Limitations
+## Usage
 
-- **Cramér-Rao Bound**: RMSE ~0.55 is approaching theoretical minimum for this observation model
-- **O(N²) Kernel**: Each particle interacts with all others (mitigated by GPU parallelism)
-- **Graph Recapture**: Adaptive parameters can trigger CUDA graph recapture (~5μs overhead)
+```c
+SVPFState* filter = svpf_create(400, 8, 30.0f, stream);
+svpf_initialize(filter, &params, seed);
 
----
+for (int t = 0; t < n_ticks; t++) {
+    svpf_step_graph(filter, returns[t], returns[t-1], &params,
+                    &loglik, &vol, &h_mean);
+}
 
-## Future Work
-
-- **PMMH Oracle**: Parallel parameter learning for ν, ρ, σ_z, μ (~100μs per iteration)
-- **Zero-Copy Updates**: Eliminate graph recapture for adaptive parameters
-- **Multi-Asset**: Correlated volatility tracking across instruments
-
----
-
-## References
-
-- Liu & Wang (2016): "Stein Variational Gradient Descent" — *The foundational SVGD paper*
-- Detommaso et al. (2018): "Stein Variational Newton" — *Hessian preconditioning*
-- D'Angelo & Fortuin (2021): "Annealed SVGD" — *Temperature scheduling for multimodal targets*
-- Ba et al. (2021): "Understanding Variance Collapse of SVGD" — *Why SVLD is needed*
-- Fan et al. (2021): "Stein Particle Filter" — *SVPF for sequential inference*
+svpf_destroy(filter);
+```
 
 ---
 
 ## License
 
 MIT
-
----
-
-*Built for HFT volatility tracking. Optimized for NVIDIA GPUs.*

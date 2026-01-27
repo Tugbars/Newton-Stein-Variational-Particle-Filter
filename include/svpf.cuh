@@ -394,6 +394,16 @@ typedef struct {
     float guided_alpha_shock;    // Alpha when model fails (e.g., 0.5 - trust observation)
     float guided_innovation_threshold; // z-score threshold for "surprise" (e.g., 1.5)
     
+    // =========================================================================
+    // PARTIAL REJUVENATION (Maken et al. 2022)
+    // =========================================================================
+    // When KSD stays high after Stein (particles stuck), nudge a fraction
+    // toward the EKF guide prediction to help escape local modes.
+    int use_rejuvenation;           // Enable partial rejuvenation (default: 1)
+    float rejuv_ksd_threshold;      // KSD threshold to trigger (e.g., 0.3)
+    float rejuv_prob;               // Fraction of particles to nudge (e.g., 0.3)
+    float rejuv_blend;              // How much to blend toward guide (e.g., 0.3)
+    
     // Guide density (EKF) config
     int use_guide;          // Enable EKF guide density
     int use_guide_preserving; // Use variance-preserving guide (vs contraction)

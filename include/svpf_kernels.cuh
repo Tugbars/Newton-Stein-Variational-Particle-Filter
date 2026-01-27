@@ -394,6 +394,22 @@ __global__ void svpf_ksd_reduce_kernel(
 );
 
 // =============================================================================
+// PARTIAL REJUVENATION KERNEL (Maken et al. 2022)
+// =============================================================================
+// When KSD stays high (particles stuck at boundary), nudge a fraction toward
+// the EKF guide prediction. This helps particles escape local modes.
+
+__global__ void svpf_partial_rejuvenation_kernel(
+    float* __restrict__ h,
+    float guide_mean,
+    float guide_std,
+    float rejuv_prob,       // Probability of rejuvenating each particle (e.g., 0.3)
+    float blend_factor,     // How much to blend toward guide (e.g., 0.3)
+    curandStatePhilox4_32_10_t* __restrict__ rng,
+    int n
+);
+
+// =============================================================================
 // Host-side Helper (inline - safe in header)
 // =============================================================================
 

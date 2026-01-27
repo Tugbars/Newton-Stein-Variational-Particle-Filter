@@ -546,7 +546,12 @@ static Metrics run_svpf_on_scenario(
         filter->mim_jump_prob = 0.25f;
         filter->mim_jump_scale = 9.0f;
         filter->use_adaptive_beta = 1;  // ON by default, set 0 for A/B test
-    
+
+        filter->use_rejuvenation = 1;        // ON
+        filter->rejuv_ksd_threshold = 0.05f; // Trigger threshold
+        filter->rejuv_prob = 0.30f;          // 30% of particles
+        filter->rejuv_blend = 0.30f;         // 30% blend factor
+
         // Newton-Stein (Hessian preconditioning)
         // Adaptive step size based on local curvature: H^{-1} * grad
         filter->use_newton = 1;

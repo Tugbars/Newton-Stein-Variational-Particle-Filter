@@ -158,6 +158,12 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     state->guide_innovation_threshold = 1.0f;
     state->vol_prev = 0.05f;
     
+    // Partial rejuvenation (Maken 2022)
+    state->use_rejuvenation = 1;        // ON by default
+    state->rejuv_ksd_threshold = 0.30f; // Trigger when KSD > 0.3
+    state->rejuv_prob = 0.30f;          // Nudge 30% of particles
+    state->rejuv_blend = 0.30f;         // 30% toward guide, 70% stay
+    
     state->use_newton = 0;
     state->use_full_newton = 0;
     
@@ -760,6 +766,27 @@ void svpf_step_graph(SVPFState* state, float y_t, float y_prev, const SVPFParams
     
     // Store diagnostic
     state->stein_steps_used = total_steps;
+    
+    // =========================================================================
+    // PARTIAL REJUVENATION (Maken et al. 2022)
+    // =========================================================================
+    // If KSD is still high after Stein (particles stuck), nudge some toward guide.
+    // Uses ksd_prev since we haven't computed this timestep's KSD yet.
+    // This helps particles escape reflecting boundaries.
+    if (state->use_rejuvenation && state->use_guide && state->timestep > 10) {
+        if (state->ksd_prev > state->rejuv_ksd_threshold) {
+            float guide_std = sqrtf(fmaxf(state->guide_var, 1e-6f));
+            svpf_partial_rejuvenation_kernel<<<nb, BLOCK_SIZE, 0, cs>>>(
+                state->h,
+                state->guide_mean,
+                guide_std,
+                state->rejuv_prob,
+                state->rejuv_blend,
+                state->rng_states,
+                n
+            );
+        }
+    }
     
     // =========================================================================
     // OUTPUTS

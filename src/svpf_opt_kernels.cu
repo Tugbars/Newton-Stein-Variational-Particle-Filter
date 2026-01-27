@@ -1025,3 +1025,43 @@ __global__ void svpf_fused_bandwidth_kernel(
         *d_bandwidth = bw;
     }
 }
+
+// =============================================================================
+// PARTIAL REJUVENATION KERNEL (Maken et al. 2022)
+// =============================================================================
+// When particles are stuck (high KSD after Stein), randomly select some
+// and nudge them toward the EKF guide prediction.
+//
+// For each particle with probability rejuv_prob:
+//   h_new = (1 - blend) * h_old + blend * (guide_mean + guide_std * noise)
+//
+// This helps escape local modes at reflecting boundaries.
+
+__global__ void svpf_partial_rejuvenation_kernel(
+    float* __restrict__ h,
+    float guide_mean,
+    float guide_std,
+    float rejuv_prob,
+    float blend_factor,
+    curandStatePhilox4_32_10_t* __restrict__ rng,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    
+    // Draw uniform random to decide if this particle gets rejuvenated
+    float u = curand_uniform(&rng[i]);
+    
+    if (u < rejuv_prob) {
+        // This particle will be nudged toward guide
+        float z = curand_normal(&rng[i]);
+        float guide_sample = guide_mean + guide_std * z;
+        
+        // Blend current position with guide sample
+        float h_old = h[i];
+        float h_new = (1.0f - blend_factor) * h_old + blend_factor * guide_sample;
+        
+        // Clamp to valid range
+        h[i] = clamp_logvol(h_new);
+    }
+}
