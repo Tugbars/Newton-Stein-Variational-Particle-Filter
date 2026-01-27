@@ -130,6 +130,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     
     state->use_svld = 1;
     state->use_annealing = 1;
+    state->use_adaptive_beta = 1;  // KSD-adaptive beta (Maken 2022)
     state->n_anneal_steps = 3;
     state->temperature = 1.0f;
     state->rmsprop_rho = 0.9f;
@@ -609,7 +610,42 @@ void svpf_step_graph(SVPFState* state, float y_t, float y_prev, const SVPFParams
     // - High KSD → more steps next timestep
     
     int n_anneal = state->use_annealing ? state->n_anneal_steps : 1;
-    float beta_schedule[3] = {0.3f, 0.65f, 1.0f};
+    
+    // KSD-ADAPTIVE BETA TEMPERING (Maken et al. 2022)
+    // When particles disagree (high KSD), likelihood is flat at boundaries.
+    // Trust the prior more by reducing beta.
+    // Thresholds:
+    //   KSD > 0.50: beta = 0.30 (trust prior)
+    //   KSD < 0.05: beta = 0.80 (trust likelihood)
+    //   Final step: beta = 1.00 (always commit)
+    auto compute_adaptive_beta = [](float ksd_prev, int anneal_idx, int n_anneal_steps) -> float {
+        // Final annealing step: always full likelihood
+        if (anneal_idx == n_anneal_steps - 1) {
+            return 1.0f;
+        }
+        
+        const float ksd_high = 0.50f;
+        const float ksd_low = 0.05f;
+        const float beta_min = 0.30f;
+        const float beta_mid = 0.80f;
+        
+        float beta;
+        if (ksd_prev > ksd_high) {
+            beta = beta_min;
+        } else if (ksd_prev < ksd_low) {
+            beta = beta_mid;
+        } else {
+            float t = (ksd_high - ksd_prev) / (ksd_high - ksd_low);
+            beta = beta_min + t * (beta_mid - beta_min);
+        }
+        
+        // Scale by annealing progress
+        float progress = (float)(anneal_idx + 1) / (float)n_anneal_steps;
+        beta *= (0.5f + 0.5f * progress);
+        
+        return fminf(fmaxf(beta, 0.1f), 1.0f);
+    };
+    
     float base_step = SVPF_STEIN_STEP_SIZE * (state->use_guide ? 0.5f : 1.0f);
     
     // Determine step budget from PREVIOUS timestep's KSD
@@ -633,7 +669,18 @@ void svpf_step_graph(SVPFState* state, float y_t, float y_prev, const SVPFParams
     int total_steps = 0;
     
     for (int ai = 0; ai < n_anneal; ai++) {
-        float beta = state->use_annealing ? beta_schedule[ai % 3] : 1.0f;
+        // Beta computation: adaptive (KSD-based) or fixed schedule
+        float beta;
+        if (!state->use_annealing) {
+            beta = 1.0f;
+        } else if (state->use_adaptive_beta) {
+            // KSD-adaptive beta (replaces fixed schedule)
+            beta = compute_adaptive_beta(state->ksd_prev, ai, n_anneal);
+        } else {
+            // Fallback to fixed schedule
+            static const float beta_schedule[3] = {0.3f, 0.65f, 1.0f};
+            beta = beta_schedule[ai % 3];
+        }
         float beta_factor = sqrtf(beta);
         float temp = state->use_svld ? state->temperature : 0.0f;
         

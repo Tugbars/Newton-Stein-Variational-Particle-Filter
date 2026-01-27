@@ -344,6 +344,7 @@ typedef struct {
     // Adaptive SVPF config
     int use_svld;           // Enable SVLD (Langevin noise) - 0=SVGD, 1=SVLD
     int use_annealing;      // Enable annealed Stein
+    int use_adaptive_beta;  // KSD-adaptive beta (Maken 2022): trust prior when particles disagree
     int n_anneal_steps;     // Number of annealing steps (2-3)
     float temperature;      // Langevin temperature: 0=SVGD, 1=SVLD, >1=exploration
     float rmsprop_rho;      // RMSProp decay (0.9-0.99)

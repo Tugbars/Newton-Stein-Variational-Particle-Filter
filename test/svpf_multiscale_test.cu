@@ -162,6 +162,7 @@ static void configure_mono_adaptive(void* state_ptr) {
     f->temperature = 0.45f;
     f->rmsprop_rho = 0.9f;
     f->rmsprop_eps = 1e-6f;
+    f->use_adaptive_beta = 1;  // ON by default, set 0 for A/B test
     
     f->use_mim = 1;
     f->mim_jump_prob = 0.25f;

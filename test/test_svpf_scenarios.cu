@@ -511,8 +511,8 @@ int main(int argc, char** argv) {
      filter->use_svld = 1;
         filter->use_annealing = 1;
         filter->n_anneal_steps = 3;
-        filter->temperature = 0.45f;
-        filter->rmsprop_rho = 0.9f;
+        filter->temperature = 0.55f;
+        filter->rmsprop_rho = 0.94f;
         filter->rmsprop_eps = 1e-6f;
         
         filter->use_mim = 1;

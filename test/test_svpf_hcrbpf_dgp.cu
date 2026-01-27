@@ -545,6 +545,7 @@ static Metrics run_svpf_on_scenario(
         filter->use_mim = 1;
         filter->mim_jump_prob = 0.25f;
         filter->mim_jump_scale = 9.0f;
+        filter->use_adaptive_beta = 1;  // ON by default, set 0 for A/B test
     
         // Newton-Stein (Hessian preconditioning)
         // Adaptive step size based on local curvature: H^{-1} * grad
