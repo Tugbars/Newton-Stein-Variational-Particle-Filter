@@ -191,6 +191,9 @@ typedef struct {
     // Capacity tracking
     int allocated_n;
     bool initialized;
+
+    float *d_ksd_partial; // Partial sums for KSD reduction [n floats]
+    float *d_ksd;         // Final KSD value [1 float]
 } SVPFOptimizedState;
 
 /**
@@ -411,7 +414,15 @@ typedef struct {
     
     // Optimized backend (embedded for thread safety)
     SVPFOptimizedState opt_backend;
-    
+
+    // === KSD-based Adaptive Stein Steps ===
+    int stein_min_steps;             // Minimum Stein iterations (default: 4)
+    int stein_max_steps;             // Maximum Stein iterations (default: 12)
+    float ksd_improvement_threshold; // Stop if relative improvement < this
+                                     // (default: 0.05)
+    float ksd_prev;                  // KSD from previous iteration (internal)
+    int stein_steps_used; // Diagnostic: how many steps were actually used
+
 } SVPFState;
 
 /**

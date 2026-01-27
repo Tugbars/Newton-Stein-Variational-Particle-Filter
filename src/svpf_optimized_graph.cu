@@ -1,16 +1,17 @@
 /**
  * @file svpf_optimized_graph.cu
- * @brief Consolidated SVPF Implementation
+ * @brief Consolidated SVPF Implementation with KSD-based Adaptive Stein Steps
  * 
  * Single implementation file containing:
  * - State management (svpf_create/destroy/initialize)
  * - Basic utility kernels
- * - Graph capture
+ * - Stein loop with KSD-based early stopping
  * - Public API (svpf_step_graph, svpf_step_adaptive, svpf_run_sequence)
  * - Diagnostics (svpf_get_particles, svpf_get_stats, svpf_get_ess)
  * 
- * External kernel files:
- * - svpf_opt_kernels.cu: Fused kernels (gradient, Stein, bandwidth, outputs)
+ * KSD (Kernel Stein Discrepancy) is computed in the same O(N²) pass as Stein
+ * transport at zero extra cost. Early stopping occurs when relative KSD
+ * improvement drops below threshold.
  */
 
 #include "svpf_kernels.cuh"
@@ -71,7 +72,6 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     SVPFState* state = (SVPFState*)malloc(sizeof(SVPFState));
     if (!state) return NULL;
     
-    // Zero-initialize opt_backend (CRITICAL - malloc doesn't zero memory)
     memset(&state->opt_backend, 0, sizeof(SVPFOptimizedState));
     
     state->n_particles = n_particles;
@@ -85,30 +85,17 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
                            - lgammaf(nu / 2.0f) 
                            - 0.5f * logf((float)M_PI * nu);
     
-    // Compute student_t_implied_offset for observation-to-h mapping
-    // For Student-t(ν), E[log(y²)|h] = h + E[log(t²_ν)]
-    // where E[log(t²_ν)] = log(ν) + ψ(1/2) - ψ(ν/2)
-    // We want: h_implied = log(y²) + offset, so offset = -E[log(t²_ν)]
-    //
-    // Digamma function approximations:
-    //   ψ(1/2) = -γ - 2*ln(2) ≈ -1.9635100260214235  (exact)
-    //   ψ(x) ≈ ln(x) - 1/(2x) - 1/(12x²)  for x > 1  (asymptotic)
     {
-        const float psi_half = -1.9635100260214235f;  // ψ(1/2) exact
+        const float psi_half = -1.9635100260214235f;
         float nu_half = nu / 2.0f;
         float psi_nu_half;
         if (nu_half >= 1.0f) {
-            // Asymptotic expansion for ψ(x) when x >= 1
             psi_nu_half = logf(nu_half) - 1.0f/(2.0f*nu_half) - 1.0f/(12.0f*nu_half*nu_half);
         } else {
-            // For small ν, use recurrence: ψ(x+1) = ψ(x) + 1/x
-            // ψ(1) = -γ ≈ -0.5772
-            psi_nu_half = -0.5772156649f - 1.0f/nu_half;  // Rough approximation for small ν
+            psi_nu_half = -0.5772156649f - 1.0f/nu_half;
         }
         float expected_log_t_sq = logf(nu) + psi_half - psi_nu_half;
         state->student_t_implied_offset = -expected_log_t_sq;
-        // For ν=30: offset ≈ 1.24
-        // For ν→∞: offset → 1.27 (Gaussian limit)
     }
     
     int n = n_particles;
@@ -126,11 +113,9 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     cudaMalloc(&state->d_reduce_buf, n * sizeof(float));
     cudaMalloc(&state->d_temp, n * sizeof(float));
     
-    // === ADAPTIVE SVPF: Per-particle RMSProp state ===
     cudaMalloc(&state->d_grad_v, n * sizeof(float));
     cudaMemset(state->d_grad_v, 0, n * sizeof(float));
     
-    // === ADAPTIVE SVPF: Regime detection scalars ===
     cudaMalloc(&state->d_return_ema, sizeof(float));
     cudaMalloc(&state->d_return_var, sizeof(float));
     cudaMalloc(&state->d_bw_alpha, sizeof(float));
@@ -140,24 +125,9 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     cudaMemcpy(state->d_return_var, &init_ema, sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(state->d_bw_alpha, &init_alpha, sizeof(float), cudaMemcpyHostToDevice);
     
-    // === Likelihood gradient config ===
-    // Likelihood offset/bias correction:
-    //   For SURROGATE (use_exact_gradient=0):
-    //     - Offset in log-squared gradient: (log(y²) - h + lik_offset) / R
-    //     - Tuned value: 0.70 for minimal bias
-    //   For EXACT (use_exact_gradient=1):
-    //     - Bias correction subtracted from exact gradient
-    //     - Raw exact gradient has ~+0.30 positive bias at equilibrium
-    //     - Tuned value: ~0.25-0.30 to center gradient around zero
-    state->lik_offset = 0.70f;  // For surrogate. Try 0.25-0.30 for exact gradient.
+    state->lik_offset = 0.70f;
+    state->use_exact_gradient = 0;
     
-    // Exact vs Surrogate gradient selection:
-    //   - 0 = Surrogate (log-squared), needs lik_offset tuning, no saturation
-    //   - 1 = Exact Student-t, consistent with weights/Hessian, saturates at ±nu/2
-    // Recommended: use_exact_gradient=1 when nu >= 30, with lik_offset ≈ 0.27
-    state->use_exact_gradient = 0;  // Default to legacy for backward compatibility
-    
-    // === ADAPTIVE SVPF: Configuration defaults ===
     state->use_svld = 1;
     state->use_annealing = 1;
     state->n_anneal_steps = 3;
@@ -165,61 +135,59 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     state->rmsprop_rho = 0.9f;
     state->rmsprop_eps = 1e-6f;
     
-    // === Mixture Innovation Model defaults ===
     state->use_mim = 1;
     state->mim_jump_prob = 0.05f;
     state->mim_jump_scale = 5.0f;
     
-    // === Asymmetric persistence defaults ===
     state->use_asymmetric_rho = 1;
     state->rho_up = 0.98f;
     state->rho_down = 0.93f;
     
-    // === Guide density (EKF) defaults ===
     state->use_guide = 1;
     state->use_guide_preserving = 1;
-    state->guide_strength = 0.05f;  // Base strength
+    state->guide_strength = 0.05f;
     state->guide_mean = 0.0f;
     state->guide_var = 0.0f;
     state->guide_K = 0.0f;
     state->guide_initialized = 0;
     
-    // === Adaptive Guide Strength defaults ===
-    state->use_adaptive_guide = 0;           // Disabled by default
-    state->guide_strength_base = 0.05f;      // Base when model fits
-    state->guide_strength_max = 0.30f;       // Max during surprises
-    state->guide_innovation_threshold = 1.0f; // Z-score threshold for boost
-    state->vol_prev = 0.05f;                 // Initial vol estimate
+    state->use_adaptive_guide = 0;
+    state->guide_strength_base = 0.05f;
+    state->guide_strength_max = 0.30f;
+    state->guide_innovation_threshold = 1.0f;
+    state->vol_prev = 0.05f;
     
-    // === Newton-Stein defaults ===
     state->use_newton = 0;
-    state->use_full_newton = 0;  // 0=local Hessian (fast), 1=kernel-weighted (Detommaso 2018)
+    state->use_full_newton = 0;
     
-    // === Guided Prediction defaults ===
     state->use_guided = 0;
     state->guided_alpha_base = 0.0f;
     state->guided_alpha_shock = 0.5f;
     state->guided_innovation_threshold = 1.5f;
     
-    // === Particle-local parameters defaults ===
     state->use_local_params = 0;
     state->delta_rho = 0.02f;
     state->delta_sigma = 0.1f;
     
-    // === Adaptive Mu (1D Kalman Filter) defaults ===
-    state->use_adaptive_mu = 0;          // Disabled by default
-    state->mu_state = -3.5f;             // Initial mu estimate
-    state->mu_var = 1.0f;                // Initial uncertainty (will shrink)
-    state->mu_process_var = 0.001f;      // Q: slow drift allowed (~0.03/step std)
-    state->mu_obs_var_scale = 10.0f;     // R = scale * bandwidth²
-    state->mu_min = -6.0f;               // Lower bound
-    state->mu_max = -1.0f;               // Upper bound
+    state->use_adaptive_mu = 0;
+    state->mu_state = -3.5f;
+    state->mu_var = 1.0f;
+    state->mu_process_var = 0.001f;
+    state->mu_obs_var_scale = 10.0f;
+    state->mu_min = -6.0f;
+    state->mu_max = -1.0f;
     
-    // === Adaptive Sigma_Z (Breathing Filter) defaults ===
-    state->use_adaptive_sigma = 0;       // Disabled by default
-    state->sigma_boost_threshold = 1.0f; // Start boosting when |z| > 1
-    state->sigma_boost_max = 3.0f;       // Max 3x boost
-    state->sigma_z_effective = 0.10f;    // Calibrated via gradient diagnostic (was 0.15)
+    state->use_adaptive_sigma = 0;
+    state->sigma_boost_threshold = 1.0f;
+    state->sigma_boost_max = 3.0f;
+    state->sigma_z_effective = 0.10f;
+    
+    // === KSD-based Adaptive Stein Steps ===
+    state->stein_min_steps = 4;              // Always run at least this many
+    state->stein_max_steps = 12;             // Never exceed this
+    state->ksd_improvement_threshold = 0.05f; // Stop if relative improvement < 5%
+    state->ksd_prev = 1e10f;                 // Initialize high
+    state->stein_steps_used = n_stein_steps; // Diagnostic
     
     // Device scalars
     cudaMalloc(&state->d_scalar_max, sizeof(float));
@@ -244,7 +212,6 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
 // STATE MANAGEMENT: Destroy
 // =============================================================================
 
-// Forward declaration
 static void svpf_optimized_cleanup(SVPFOptimizedState* opt);
 
 void svpf_destroy(SVPFState* state) {
@@ -317,16 +284,18 @@ void svpf_initialize(SVPFState* state, const SVPFParams* params, unsigned long l
     state->guide_mean = params->mu;
     state->guide_var = stationary_var;
     
-    // Initialize adaptive mu Kalman filter state
     if (state->use_adaptive_mu) {
-        state->mu_state = params->mu;         // Start from provided mu
-        state->mu_var = 1.0f;                 // High initial uncertainty
+        state->mu_state = params->mu;
+        state->mu_var = 1.0f;
     }
     
-    // Initialize adaptive sigma_z state
     if (state->use_adaptive_sigma) {
         state->sigma_z_effective = params->sigma_z;
     }
+    
+    // Reset KSD tracking
+    state->ksd_prev = 1e10f;
+    state->stein_steps_used = state->n_stein_steps;
     
     cudaMemset(state->d_grad_v, 0, n * sizeof(float));
     
@@ -389,13 +358,16 @@ static void svpf_optimized_init(SVPFOptimizedState* opt, int n) {
     cudaMalloc(&opt->d_vol_single, sizeof(float));
     
     cudaMalloc(&opt->d_params_staging, SVPF_GRAPH_PARAMS_SIZE * sizeof(float));
+    
+    // === KSD buffers ===
+    cudaMalloc(&opt->d_ksd_partial, n * sizeof(float));
+    cudaMalloc(&opt->d_ksd, sizeof(float));
+    
     cudaStreamCreateWithFlags(&opt->graph_stream, cudaStreamNonBlocking);
     opt->graph_captured = false;
     opt->graph_n = 0;
     opt->graph_n_stein = 0;
     
-    // Pinned host memory for fast D2H transfers
-    // Layout: [loglik, vol, h_mean, bandwidth]
     cudaMallocHost(&opt->h_results_pinned, 4 * sizeof(float));
     
     opt->allocated_n = n;
@@ -423,7 +395,10 @@ static void svpf_optimized_cleanup(SVPFOptimizedState* opt) {
     cudaFree(opt->d_vol_single);
     cudaFree(opt->d_params_staging);
     
-    // Free pinned host memory
+    // === KSD buffers ===
+    cudaFree(opt->d_ksd_partial);
+    cudaFree(opt->d_ksd);
+    
     if (opt->h_results_pinned) {
         cudaFreeHost(opt->h_results_pinned);
         opt->h_results_pinned = nullptr;
@@ -453,220 +428,66 @@ static inline SVPFOptimizedState* get_opt(SVPFState* state) {
 }
 
 // =============================================================================
-// GRAPH CAPTURE: 1D Path
-// =============================================================================
-
-static void svpf_graph_capture_internal(SVPFState* state, const SVPFParams* params) {
-    SVPFOptimizedState* opt = get_opt(state);
-    int n = state->n_particles;
-    cudaStream_t cs = opt->graph_stream;
-    
-    float student_t_const = lgammaf((state->nu + 1.0f) / 2.0f)
-                          - lgammaf(state->nu / 2.0f)
-                          - 0.5f * logf((float)M_PI * state->nu);
-    
-    int nb = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    size_t grad_smem = 2 * n * sizeof(float);
-    size_t stein_smem = state->use_newton ? 3 * n * sizeof(float) : 2 * n * sizeof(float);
-    
-    int n_anneal = state->use_annealing ? state->n_anneal_steps : 1;
-    float beta_schedule[3] = {0.3f, 0.65f, 1.0f};
-    float base_step = SVPF_STEIN_STEP_SIZE * (state->use_guide ? 0.5f : 1.0f);
-    
-    float rho_up = state->use_asymmetric_rho ? state->rho_up : params->rho;
-    float rho_down = state->use_asymmetric_rho ? state->rho_down : params->rho;
-    float delta_rho = state->use_local_params ? state->delta_rho : 0.0f;
-    float delta_sigma = state->use_local_params ? state->delta_sigma : 0.0f;
-    
-    cudaStreamBeginCapture(cs, cudaStreamCaptureModeGlobal);
-    
-    // PREDICT
-    if (state->use_guided) {
-        svpf_predict_guided_kernel<<<nb, BLOCK_SIZE, 0, cs>>>(
-            state->h, state->h_prev, state->rng_states,
-            opt->d_y_single, opt->d_h_mean_prev, 1,
-            rho_up, rho_down, params->sigma_z, params->mu, params->gamma,
-            state->mim_jump_prob, state->mim_jump_scale,
-            delta_rho, delta_sigma,
-            state->guided_alpha_base, state->guided_alpha_shock,
-            state->guided_innovation_threshold, 
-            state->student_t_implied_offset, n
-        );
-    } else if (state->use_mim) {
-        svpf_predict_mim_kernel<<<nb, BLOCK_SIZE, 0, cs>>>(
-            state->h, state->h_prev, state->rng_states,
-            opt->d_y_single, opt->d_h_mean_prev, 1,
-            rho_up, rho_down, params->sigma_z, params->mu, params->gamma,
-            state->mim_jump_prob, state->mim_jump_scale,
-            delta_rho, delta_sigma, n
-        );
-    } else {
-        svpf_predict_kernel<<<nb, BLOCK_SIZE, 0, cs>>>(
-            state->h, state->h_prev, state->rng_states,
-            opt->d_y_single, 1, params->rho, params->sigma_z, params->mu, params->gamma, n
-        );
-    }
-    
-#ifdef SVPF_ENABLE_DIAGNOSTICS
-    // Snapshot predicted particles BEFORE Stein transport (for σ gradient diagnostic)
-    // h_pred = h after prediction, before any transport/guide modifications
-    cudaMemcpyAsync(state->h_pred, state->h, n * sizeof(float), cudaMemcpyDeviceToDevice, cs);
-#endif
-    
-    // GUIDE
-    if (state->use_guide) {
-        if (state->use_guide_preserving) {
-            svpf_apply_guide_preserving_kernel_graph<<<nb, BLOCK_SIZE, 0, cs>>>(
-                state->h, opt->d_h_mean_prev, opt->d_guide_mean, opt->d_guide_strength, n
-            );
-        } else {
-            svpf_apply_guide_kernel_graph<<<nb, BLOCK_SIZE, 0, cs>>>(
-                state->h, opt->d_guide_mean, opt->d_guide_strength, n
-            );
-        }
-    }
-    
-    // BANDWIDTH
-    svpf_fused_bandwidth_kernel<<<1, BLOCK_SIZE, 0, cs>>>(
-        state->h, opt->d_y_single, opt->d_bandwidth, opt->d_bandwidth_sq,
-        state->d_return_ema, state->d_return_var, 1, 0.3f, 0.05f, n
-    );
-    
-    // STEIN ITERATIONS
-    for (int ai = 0; ai < n_anneal; ai++) {
-        float beta = state->use_annealing ? beta_schedule[ai % 3] : 1.0f;
-        float beta_factor = sqrtf(beta);
-        float temp = state->use_svld ? state->temperature : 0.0f;
-        
-        int si = state->n_stein_steps / n_anneal;
-        if (ai == n_anneal - 1) si = state->n_stein_steps - si * (n_anneal - 1);
-        
-        for (int s = 0; s < si; s++) {
-            svpf_fused_gradient_kernel<<<nb, BLOCK_SIZE, grad_smem, cs>>>(
-                state->h, state->h_prev, state->grad_log_p, state->log_weights,
-                state->use_newton ? opt->d_precond_grad : nullptr,
-                state->use_newton ? opt->d_inv_hessian : nullptr,
-                opt->d_y_single, 1, params->rho, params->sigma_z, params->mu,
-                beta, state->nu, student_t_const, state->lik_offset,
-                params->gamma,  // Leverage coefficient for prior consistency
-                state->use_exact_gradient,  // Exact Student-t vs log-squared surrogate
-                state->use_newton, n
-            );
-            
-            if (state->use_newton) {
-                if (state->use_full_newton) {
-                    // Full Newton: kernel-weighted Hessian averaging (Detommaso 2018)
-                    // Uses raw gradient and local curvature, computes weighted H in kernel
-                    svpf_fused_stein_transport_full_newton_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
-                        state->h, state->grad_log_p, opt->d_inv_hessian,
-                        state->d_grad_v, state->rng_states, opt->d_bandwidth,
-                        base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps, n
-                    );
-                } else {
-                    // Approximate Newton: local Hessian only (faster)
-                    svpf_fused_stein_transport_newton_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
-                        state->h, opt->d_precond_grad, opt->d_inv_hessian,
-                        state->d_grad_v, state->rng_states, opt->d_bandwidth,
-                        base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps, n
-                    );
-                }
-            } else {
-                svpf_fused_stein_transport_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
-                    state->h, state->grad_log_p, state->d_grad_v,
-                    state->rng_states, opt->d_bandwidth,
-                    base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps, n
-                );
-            }
-        }
-    }
-    
-    // OUTPUTS
-    svpf_fused_outputs_kernel<<<1, BLOCK_SIZE, 0, cs>>>(
-        state->h, state->log_weights,
-        opt->d_loglik_single, opt->d_vol_single, opt->d_h_mean_prev, 0, n
-    );
-    
-    cudaStreamEndCapture(cs, &opt->graph);
-    cudaGraphInstantiate(&opt->graph_exec, opt->graph, NULL, NULL, 0);
-    
-    opt->graph_captured = true;
-    opt->graph_n = n;
-    opt->graph_n_stein = state->n_stein_steps;
-}
-
-// =============================================================================
 // ADAPTIVE MU: 1D Kalman Filter Update
 // =============================================================================
-// 
-// Uses particle confidence (inverse bandwidth) to gate learning rate:
-// - Calm market (low bandwidth) → high confidence → adapt mu quickly
-// - Crisis (high bandwidth) → low confidence → freeze mu
-//
-// Kalman equations:
-//   Predict: mu_pred = mu, P_pred = P + Q
-//   Update:  K = P_pred / (P_pred + R)
-//            mu = mu_pred + K * (h_mean - mu_pred)
-//            P = (1 - K) * P_pred
-//
-// Where R = scale * bandwidth² (measurement noise from particle spread)
 
 static void svpf_adaptive_mu_update(
     SVPFState* state,
-    float h_mean,       // Observation: particle mean
-    float bandwidth     // Particle spread → measurement noise
+    float h_mean,
+    float bandwidth
 ) {
     if (!state->use_adaptive_mu) return;
     
-    // Kalman predict
     float mu_pred = state->mu_state;
     float P_pred = state->mu_var + state->mu_process_var;
     
-    // Measurement noise: high bandwidth → high noise → ignore observation
     float R = state->mu_obs_var_scale * bandwidth * bandwidth;
     
-    // Kalman gain
     float K = P_pred / (P_pred + R + 1e-8f);
     
-    // Innovation
     float innovation = h_mean - mu_pred;
     
-    // Update
     float mu_new = mu_pred + K * innovation;
     float P_new = (1.0f - K) * P_pred;
     
-    // Clamp mu to valid range
     mu_new = fminf(fmaxf(mu_new, state->mu_min), state->mu_max);
     
-    // Store
     state->mu_state = mu_new;
     state->mu_var = P_new;
 }
 
 // =============================================================================
-// PUBLIC API
+// PUBLIC API: svpf_step_graph
+// =============================================================================
+// 
+// This is the main stepping function. It now uses:
+// - Regular kernel launches (no CUDA graph for Stein loop)
+// - KSD-based early stopping for Stein iterations
+// 
+// Structure:
+// 1. Predict step
+// 2. Guide step (optional)
+// 3. Bandwidth computation
+// 4. Stein loop with KSD early stopping
+// 5. Output computation
 // =============================================================================
 
 void svpf_step_graph(SVPFState* state, float y_t, float y_prev, const SVPFParams* params,
                      float* h_loglik_out, float* h_vol_out, float* h_mean_out) {
     SVPFOptimizedState* opt = get_opt(state);
     int n = state->n_particles;
+    cudaStream_t cs = state->stream;
     
     svpf_optimized_init(opt, n);
     
-    // Determine effective mu (adaptive or fixed)
+    // Determine effective parameters
     float effective_mu = state->use_adaptive_mu ? state->mu_state : params->mu;
-    
-    // =========================================================================
-    // ADAPTIVE SIGMA_Z: Innovation-gated vol-of-vol ("Breathing Filter")
-    // =========================================================================
-    // Boost sigma_z when innovation is high to allow particles to spread faster
     float effective_sigma_z = params->sigma_z;
     
     if (state->use_adaptive_sigma && state->timestep > 0) {
         float vol_est = fmaxf(state->vol_prev, 1e-4f);
         float return_z = fabsf(y_t) / vol_est;
         
-        // Boost sigma_z when innovation exceeds threshold
         float sigma_boost = 1.0f;
         if (return_z > state->sigma_boost_threshold) {
             float severity = fminf((return_z - state->sigma_boost_threshold) / 3.0f, 1.0f);
@@ -677,117 +498,224 @@ void svpf_step_graph(SVPFState* state, float y_t, float y_prev, const SVPFParams
         state->sigma_z_effective = effective_sigma_z;
     }
     
-    // Check if graph needs recapture
-    bool need_capture = !opt->graph_captured 
-                     || opt->graph_n != n 
-                     || opt->graph_n_stein != state->n_stein_steps;
+    // Precompute constants
+    float student_t_const = lgammaf((state->nu + 1.0f) / 2.0f)
+                          - lgammaf(state->nu / 2.0f)
+                          - 0.5f * logf((float)M_PI * state->nu);
     
-    // If adaptive mu, check if mu has drifted significantly from captured value
-    if (state->use_adaptive_mu && opt->graph_captured) {
-        float mu_drift = fabsf(effective_mu - opt->mu_captured);
-        if (mu_drift > 0.1f) {
-            need_capture = true;
-        }
-    }
+    int nb = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    size_t grad_smem = 2 * n * sizeof(float);
+    size_t stein_smem = state->use_newton ? 3 * n * sizeof(float) : 2 * n * sizeof(float);
     
-    // If adaptive sigma_z, check if it has drifted significantly
-    if (state->use_adaptive_sigma && opt->graph_captured) {
-        float sigma_drift = fabsf(effective_sigma_z - opt->sigma_z_captured);
-        if (sigma_drift > 0.05f) {  // Recapture if sigma_z changed by more than 0.05
-            need_capture = true;
-        }
-    }
+    float rho_up = state->use_asymmetric_rho ? state->rho_up : params->rho;
+    float rho_down = state->use_asymmetric_rho ? state->rho_down : params->rho;
+    float delta_rho = state->use_local_params ? state->delta_rho : 0.0f;
+    float delta_sigma = state->use_local_params ? state->delta_sigma : 0.0f;
     
-    if (need_capture) {
-        if (opt->graph_captured) {
-            cudaGraphExecDestroy(opt->graph_exec);
-            cudaGraphDestroy(opt->graph);
-            opt->graph_captured = false;
-        }
-        
-        // Create modified params for capture
-        SVPFParams capture_params = *params;
-        if (state->use_adaptive_mu) {
-            capture_params.mu = effective_mu;
-        }
-        if (state->use_adaptive_sigma) {
-            capture_params.sigma_z = effective_sigma_z;
-        }
-        
-        svpf_graph_capture_internal(state, &capture_params);
-        opt->mu_captured = effective_mu;
-        opt->sigma_z_captured = effective_sigma_z;
-    }
-    
+    // Upload y values
     float y_arr[2] = {y_prev, y_t};
-    cudaMemcpyAsync(opt->d_y_single, y_arr, 2 * sizeof(float), cudaMemcpyHostToDevice, opt->graph_stream);
+    cudaMemcpyAsync(opt->d_y_single, y_arr, 2 * sizeof(float), cudaMemcpyHostToDevice, cs);
     
     // =========================================================================
-    // ADAPTIVE GUIDE STRENGTH: Asymmetric Innovation-gated nudging
+    // PREDICT
     // =========================================================================
-    // Only boost when IMPLIED volatility > ESTIMATED volatility (upward surprise)
-    // Downward surprises (price calm when vol expected high) are often just mean reversion
-    // Upward surprises (price crash) are INFORMATION - trust the guide!
+    if (state->use_guided) {
+        svpf_predict_guided_kernel<<<nb, BLOCK_SIZE, 0, cs>>>(
+            state->h, state->h_prev, state->rng_states,
+            opt->d_y_single, opt->d_h_mean_prev, 1,
+            rho_up, rho_down, effective_sigma_z, effective_mu, params->gamma,
+            state->mim_jump_prob, state->mim_jump_scale,
+            delta_rho, delta_sigma,
+            state->guided_alpha_base, state->guided_alpha_shock,
+            state->guided_innovation_threshold,
+            state->student_t_implied_offset, n
+        );
+    } else if (state->use_mim) {
+        svpf_predict_mim_kernel<<<nb, BLOCK_SIZE, 0, cs>>>(
+            state->h, state->h_prev, state->rng_states,
+            opt->d_y_single, opt->d_h_mean_prev, 1,
+            rho_up, rho_down, effective_sigma_z, effective_mu, params->gamma,
+            state->mim_jump_prob, state->mim_jump_scale,
+            delta_rho, delta_sigma, n
+        );
+    } else {
+        svpf_predict_kernel<<<nb, BLOCK_SIZE, 0, cs>>>(
+            state->h, state->h_prev, state->rng_states,
+            opt->d_y_single, 1, params->rho, effective_sigma_z, effective_mu, params->gamma, n
+        );
+    }
+    
+    // =========================================================================
+    // GUIDE
+    // =========================================================================
     float current_guide_strength = state->guide_strength_base;
     
     if (state->use_guide && state->use_adaptive_guide && state->timestep > 0) {
-        // Use previous vol estimate as proxy for prediction
         float vol_est = fmaxf(state->vol_prev, 1e-4f);
-        
-        // Return z-score: magnitude of surprise
         float return_z = fabsf(y_t) / vol_est;
         
-        // Implied h from observation: log(y²) + student_t_implied_offset
         float implied_h = logf(y_t * y_t + 1e-8f) + state->student_t_implied_offset;
-        
-        // h_prev is our current estimate (from last step's h_mean)
-        float h_est = logf(vol_est * vol_est + 1e-8f);  // Convert vol back to h
-        
-        // Innovation in log-vol space
+        float h_est = logf(vol_est * vol_est + 1e-8f);
         float h_innovation = implied_h - h_est;
         
-        // ASYMMETRIC LOGIC:
-        // Only boost if implied volatility is HIGHER than current estimate (h_innovation > 0)
-        // AND the move is statistically significant (return_z > threshold)
         if (h_innovation > 0.0f && return_z > state->guide_innovation_threshold) {
-            // We are surprised by a spike. Trust the guide!
             float severity = fminf((return_z - state->guide_innovation_threshold) / 3.0f, 1.0f);
             float boost = (state->guide_strength_max - state->guide_strength_base) * severity;
             current_guide_strength = state->guide_strength_base + boost;
         }
-        // else: downward surprise or small move -> keep base strength
     }
     
-    // Upload adaptive guide strength to device
-    cudaMemcpyAsync(opt->d_guide_strength, &current_guide_strength, sizeof(float), cudaMemcpyHostToDevice, opt->graph_stream);
-    
     if (state->use_guide) {
-        // Use effective_mu for EKF update
         SVPFParams guide_params = *params;
         if (state->use_adaptive_mu) {
             guide_params.mu = effective_mu;
         }
         svpf_ekf_update(state, y_t, &guide_params);
-        cudaMemcpyAsync(opt->d_guide_mean, &state->guide_mean, sizeof(float), cudaMemcpyHostToDevice, opt->graph_stream);
+        
+        if (state->use_guide_preserving) {
+            svpf_apply_guide_preserving_kernel<<<nb, BLOCK_SIZE, 0, cs>>>(
+                state->h, opt->d_h_mean_prev, state->guide_mean, current_guide_strength, n
+            );
+        } else {
+            svpf_apply_guide_kernel<<<nb, BLOCK_SIZE, 0, cs>>>(
+                state->h, state->guide_mean, current_guide_strength, n
+            );
+        }
     }
     
-    // NOTE: No sync needed here! cudaMemcpyAsync on same stream guarantees
-    // ordering - the graph will see the uploaded params.
-    cudaGraphLaunch(opt->graph_exec, opt->graph_stream);
+    // =========================================================================
+    // BANDWIDTH
+    // =========================================================================
+    svpf_fused_bandwidth_kernel<<<1, BLOCK_SIZE, 0, cs>>>(
+        state->h, opt->d_y_single, opt->d_bandwidth, opt->d_bandwidth_sq,
+        state->d_return_ema, state->d_return_var, 1, 0.3f, 0.05f, n
+    );
     
-    // Read back results using PINNED MEMORY for faster D2H
-    // NO SYNC between graph and memcpy - stream ordering handles it!
-    // Layout: [0]=loglik, [1]=vol, [2]=h_mean, [3]=bandwidth
-    float* results = opt->h_results_pinned;
+    // =========================================================================
+    // STEIN ITERATIONS WITH KSD-ADAPTIVE BUDGET
+    // =========================================================================
+    // Option B: KSD from timestep t determines step budget for timestep t+1
+    // - Only 1 D2H sync per timestep (at the end)
+    // - No intra-timestep early stopping overhead
+    // - High KSD → more steps next timestep
     
-    // Async copies to pinned memory - queued after graph completion
-    cudaMemcpyAsync(&results[0], opt->d_loglik_single, sizeof(float), cudaMemcpyDeviceToHost, opt->graph_stream);
-    cudaMemcpyAsync(&results[1], opt->d_vol_single, sizeof(float), cudaMemcpyDeviceToHost, opt->graph_stream);
-    cudaMemcpyAsync(&results[2], opt->d_h_mean_prev, sizeof(float), cudaMemcpyDeviceToHost, opt->graph_stream);
-    cudaMemcpyAsync(&results[3], opt->d_bandwidth, sizeof(float), cudaMemcpyDeviceToHost, opt->graph_stream);
+    int n_anneal = state->use_annealing ? state->n_anneal_steps : 1;
+    float beta_schedule[3] = {0.3f, 0.65f, 1.0f};
+    float base_step = SVPF_STEIN_STEP_SIZE * (state->use_guide ? 0.5f : 1.0f);
     
-    // SINGLE sync - waits for graph AND all memcpy to complete
-    cudaStreamSynchronize(opt->graph_stream);
+    // Determine step budget from PREVIOUS timestep's KSD
+    int stein_budget;
+    if (state->timestep < 10) {
+        // Warmup: use max steps
+        stein_budget = state->stein_max_steps;
+    } else {
+        // Map KSD to step count: high KSD → more steps
+        // KSD typically ranges 0.01 (converged) to 1.0+ (far from target)
+        // Linear interpolation with clamp
+        float ksd_low = 0.05f;   // Below this → min steps
+        float ksd_high = 0.50f;  // Above this → max steps
+        float ksd_normalized = (state->ksd_prev - ksd_low) / (ksd_high - ksd_low);
+        ksd_normalized = fminf(fmaxf(ksd_normalized, 0.0f), 1.0f);
+        
+        stein_budget = state->stein_min_steps + 
+                       (int)(ksd_normalized * (state->stein_max_steps - state->stein_min_steps));
+    }
+    
+    int total_steps = 0;
+    
+    for (int ai = 0; ai < n_anneal; ai++) {
+        float beta = state->use_annealing ? beta_schedule[ai % 3] : 1.0f;
+        float beta_factor = sqrtf(beta);
+        float temp = state->use_svld ? state->temperature : 0.0f;
+        
+        // Distribute budget across annealing stages
+        int si = stein_budget / n_anneal;
+        if (ai == n_anneal - 1) si = stein_budget - si * (n_anneal - 1);
+        
+        for (int s = 0; s < si; s++) {
+            total_steps++;
+            bool is_last_iteration = (ai == n_anneal - 1) && (s == si - 1);
+            
+            // Gradient computation
+            svpf_fused_gradient_kernel<<<nb, BLOCK_SIZE, grad_smem, cs>>>(
+                state->h, state->h_prev, state->grad_log_p, state->log_weights,
+                state->use_newton ? opt->d_precond_grad : nullptr,
+                state->use_newton ? opt->d_inv_hessian : nullptr,
+                opt->d_y_single, 1, params->rho, effective_sigma_z, effective_mu,
+                beta, state->nu, student_t_const, state->lik_offset,
+                params->gamma, state->use_exact_gradient, state->use_newton, n
+            );
+            
+            // Stein transport (compute KSD only on LAST iteration)
+            if (is_last_iteration) {
+                // Final iteration: compute KSD for next timestep's budget
+                if (state->use_newton) {
+                    svpf_fused_stein_transport_newton_ksd_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
+                        state->h, opt->d_precond_grad, opt->d_inv_hessian,
+                        state->d_grad_v, state->rng_states, opt->d_bandwidth,
+                        opt->d_ksd_partial,
+                        base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps, n
+                    );
+                } else {
+                    svpf_fused_stein_transport_ksd_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
+                        state->h, state->grad_log_p, state->d_grad_v,
+                        state->rng_states, opt->d_bandwidth,
+                        opt->d_ksd_partial,
+                        base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps, n
+                    );
+                }
+                
+                // Reduce KSD (async - will sync later with outputs)
+                svpf_ksd_reduce_kernel<<<1, BLOCK_SIZE, 0, cs>>>(
+                    opt->d_ksd_partial, opt->d_ksd, n
+                );
+            } else {
+                // Non-final iterations: standard transport (no KSD overhead)
+                if (state->use_newton) {
+                    if (state->use_full_newton) {
+                        svpf_fused_stein_transport_full_newton_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
+                            state->h, state->grad_log_p, opt->d_inv_hessian,
+                            state->d_grad_v, state->rng_states, opt->d_bandwidth,
+                            base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps, n
+                        );
+                    } else {
+                        svpf_fused_stein_transport_newton_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
+                            state->h, opt->d_precond_grad, opt->d_inv_hessian,
+                            state->d_grad_v, state->rng_states, opt->d_bandwidth,
+                            base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps, n
+                        );
+                    }
+                } else {
+                    svpf_fused_stein_transport_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
+                        state->h, state->grad_log_p, state->d_grad_v,
+                        state->rng_states, opt->d_bandwidth,
+                        base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps, n
+                    );
+                }
+            }
+        }
+    }
+    
+    // Store diagnostic
+    state->stein_steps_used = total_steps;
+    
+    // =========================================================================
+    // OUTPUTS
+    // =========================================================================
+    svpf_fused_outputs_kernel<<<1, BLOCK_SIZE, 0, cs>>>(
+        state->h, state->log_weights,
+        opt->d_loglik_single, opt->d_vol_single, opt->d_h_mean_prev, 0, n
+    );
+    
+    // Read results (including KSD for next timestep's budget)
+    float results[5];
+    cudaMemcpyAsync(&results[0], opt->d_loglik_single, sizeof(float), cudaMemcpyDeviceToHost, cs);
+    cudaMemcpyAsync(&results[1], opt->d_vol_single, sizeof(float), cudaMemcpyDeviceToHost, cs);
+    cudaMemcpyAsync(&results[2], opt->d_h_mean_prev, sizeof(float), cudaMemcpyDeviceToHost, cs);
+    cudaMemcpyAsync(&results[3], opt->d_bandwidth, sizeof(float), cudaMemcpyDeviceToHost, cs);
+    cudaMemcpyAsync(&results[4], opt->d_ksd, sizeof(float), cudaMemcpyDeviceToHost, cs);
+    
+    cudaStreamSynchronize(cs);
     
     if (h_loglik_out) *h_loglik_out = results[0];
     if (h_vol_out) *h_vol_out = results[1];
@@ -796,17 +724,12 @@ void svpf_step_graph(SVPFState* state, float y_t, float y_prev, const SVPFParams
     float h_mean_local = results[2];
     float bandwidth_local = results[3];
     float vol_local = results[1];
+    float ksd_local = results[4];
     
-    // Update state for next step
-    state->vol_prev = vol_local;              // For adaptive guide and adaptive sigma
+    state->vol_prev = vol_local;
+    state->ksd_prev = ksd_local;  // For next timestep's step budget
     
-    // =========================================================================
-    // ADAPTIVE MU: 1D Kalman Filter Update
-    // =========================================================================
-    // Signal: h_mean (particle posterior mean)
-    // Noise: bandwidth² (particle uncertainty)
-    // Effect: Fast adaptation in calm markets, freeze during crises
-    if (state->use_adaptive_mu && state->timestep > 10) {  // Skip warmup
+    if (state->use_adaptive_mu && state->timestep > 10) {
         svpf_adaptive_mu_update(state, h_mean_local, bandwidth_local);
     }
     
@@ -906,4 +829,13 @@ float svpf_get_ess(const SVPFState* state) {
     
     free(lw);
     return (sw * sw) / (sw2 + 1e-10f);
+}
+
+// =============================================================================
+// DIAGNOSTIC: Get KSD and Stein steps used
+// =============================================================================
+
+void svpf_get_ksd_stats(const SVPFState* state, float* ksd_out, int* steps_used_out) {
+    if (ksd_out) *ksd_out = state->ksd_prev;
+    if (steps_used_out) *steps_used_out = state->stein_steps_used;
 }

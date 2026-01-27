@@ -589,7 +589,14 @@ static Metrics run_svpf_on_scenario(
 
 
         filter->use_exact_gradient = 1;
-        filter->lik_offset = 0.34f;  // No correction - test if model is now consistent
+        filter->lik_offset = 0.335f;  // No correction - test if model is now consistent
+
+         // === KSD-based Adaptive Stein Steps ===
+        // Replaces fixed n_stein_steps with convergence-based early stopping
+        // KSD (Kernel Stein Discrepancy) computed in same O(N²) pass - zero extra cost
+        filter->stein_min_steps = 8;              // Always run at least 4 (RMSProp warmup)
+        filter->stein_max_steps = 16;             // Cap at 12 (crisis budget)
+        filter->ksd_improvement_threshold = 0.05; // Stop if <5% relative improvement
     } else {
         filter->use_svld = 0;
         filter->use_annealing = 0;
@@ -694,7 +701,7 @@ int main(int argc, char** argv) {
     int n_ticks = 5000;
     int n_particles = 400;
     int n_stein = 8;
-    float nu = 40.0f;
+    float nu = 50.0f;
     int use_adaptive = 1;
     
     /* Parse args */

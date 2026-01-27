@@ -302,6 +302,18 @@ __global__ void svpf_fused_stein_transport_kernel(
     float rho_rmsprop, float epsilon, int n
 );
 
+// Stein + Transport + KSD (computes KSD in same O(N²) pass, zero extra cost)
+__global__ void svpf_fused_stein_transport_ksd_kernel(
+    float* __restrict__ h,
+    const float* __restrict__ grad,
+    float* __restrict__ v_rmsprop,
+    curandStatePhilox4_32_10_t* __restrict__ rng,
+    const float* __restrict__ d_bandwidth,
+    float* __restrict__ d_ksd_partial,  // Output: partial KSD sums [n floats]
+    float step_size, float beta_factor, float temperature,
+    float rho_rmsprop, float epsilon, int n
+);
+
 __global__ void svpf_fused_stein_transport_newton_kernel(
     float* __restrict__ h,
     const float* __restrict__ precond_grad,
@@ -309,6 +321,19 @@ __global__ void svpf_fused_stein_transport_newton_kernel(
     float* __restrict__ v_rmsprop,
     curandStatePhilox4_32_10_t* __restrict__ rng,
     const float* __restrict__ d_bandwidth,
+    float step_size, float beta_factor, float temperature,
+    float rho_rmsprop, float epsilon, int n
+);
+
+// Newton + KSD variant
+__global__ void svpf_fused_stein_transport_newton_ksd_kernel(
+    float* __restrict__ h,
+    const float* __restrict__ precond_grad,
+    const float* __restrict__ inv_hessian,
+    float* __restrict__ v_rmsprop,
+    curandStatePhilox4_32_10_t* __restrict__ rng,
+    const float* __restrict__ d_bandwidth,
+    float* __restrict__ d_ksd_partial,  // Output: partial KSD sums [n floats]
     float step_size, float beta_factor, float temperature,
     float rho_rmsprop, float epsilon, int n
 );
@@ -342,6 +367,18 @@ __global__ void svpf_fused_bandwidth_kernel(
     float* __restrict__ d_return_ema,
     float* __restrict__ d_return_var,
     int y_idx, float alpha_bw, float alpha_ret, int n
+);
+
+// =============================================================================
+// KSD REDUCTION KERNEL
+// =============================================================================
+// Reduces partial KSD sums to final KSD value
+// KSD = sqrt((1/N²) * Σᵢ partial[i])
+
+__global__ void svpf_ksd_reduce_kernel(
+    const float* __restrict__ d_ksd_partial,
+    float* __restrict__ d_ksd,
+    int n
 );
 
 // =============================================================================
