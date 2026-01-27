@@ -553,7 +553,7 @@ static Metrics run_svpf_on_scenario(
         // - Asymmetric gating only activates on UPWARD shocks (spikes)
         filter->use_guided = 1;
         filter->guided_alpha_base = 0.0f;             // 0% when model fits
-        filter->guided_alpha_shock = 0.50f;            // 50% when model fails
+        filter->guided_alpha_shock = 0.40f;            // 50% when model fails
         filter->guided_innovation_threshold = 1.5f;   // 1.5σ = "surprised"
         
         // EKF Guide density
@@ -572,9 +572,9 @@ static Metrics run_svpf_on_scenario(
         filter->guide_strength_max = 0.30f;        // Max during surprises
         filter->guide_innovation_threshold = 1.0f; // Z-score to start boosting
 
-        filter->use_adaptive_sigma = 0;
-        filter->sigma_boost_threshold = 1.0f; // Start boosting when |z| > 1
-        filter->sigma_boost_max = 3.0f;       // Max 3x boost
+        filter->use_adaptive_sigma = 1;
+        filter->sigma_boost_threshold = 0.95f; // Start boosting when |z| > 1
+        filter->sigma_boost_max = 3.2f;       // Max 3x boost
 
         filter->use_exact_gradient = 1;
         filter->lik_offset = 0.35f;  // No correction - test if model is now consistent
