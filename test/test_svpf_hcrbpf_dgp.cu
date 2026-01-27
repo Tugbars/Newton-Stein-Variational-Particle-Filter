@@ -515,6 +515,9 @@ static Metrics run_svpf_on_scenario(
     
     /* Create filter */
     SVPFState* filter = svpf_create(n_particles, n_stein, nu, NULL);
+
+    //svpf_set_stein_sign_mode(filter, SVPF_STEIN_SIGN_PAPER);  // or just: filter->stein_repulsive_sign = 1;
+
     
     /* 
      * SVPF parameters - note these are MISSPECIFIED for this DGP!

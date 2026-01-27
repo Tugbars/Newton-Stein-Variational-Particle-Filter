@@ -29,7 +29,7 @@
 
 // Default to legacy behavior for backwards compatibility
 #ifndef SVPF_STEIN_SIGN_MODE_DEFAULT
-#define SVPF_STEIN_SIGN_MODE_DEFAULT 0
+#define SVPF_STEIN_SIGN_MODE_DEFAULT 1
 #endif
 
 // =============================================================================
