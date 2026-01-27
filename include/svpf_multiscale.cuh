@@ -42,7 +42,7 @@ extern "C" {
 
 typedef struct {
     /* Particles per scale */
-    int n_particles_reactive;   /* Default: 512 (speed matters) */
+    int n_particles_reactive;   /* Default: 256 (scout, speed matters) */
     int n_particles_inertial;   /* Default: 1024 (precision matters) */
     
     /* Stein iterations per scale */
@@ -145,23 +145,23 @@ typedef struct {
 static inline MS_SVPF_Config ms_svpf_default_config(void) {
     MS_SVPF_Config c;
     
-    /* Particles: REACTIVE needs speed, INERTIAL needs precision */
-    c.n_particles_reactive = 512;
-    c.n_particles_inertial = 1024;
+    /* Particles: REACTIVE is small scout, INERTIAL is full precision */
+    c.n_particles_reactive = 256;   // Fast scout (was 512)
+    c.n_particles_inertial = 1024;  // Production precision
     
-    /* Stein iterations */
-    c.n_stein_reactive = 4;
+    /* Stein iterations: REACTIVE minimal, INERTIAL generous */
+    c.n_stein_reactive = 3;         // Minimal (was 4)
     c.n_stein_inertial = 8;
     
-    /* Cross-scale boost */
+    /* Cross-scale boost thresholds */
     c.surprise_mild_threshold = 2.0f;
-    c.surprise_high_threshold = 4.0f;
-    c.boost_mild_factor = 2.0f;
-    c.boost_high_factor = 3.0f;
+    c.surprise_high_threshold = 3.5f;  // Lower (was 4.0)
+    c.boost_mild_factor = 1.5f;        // Gentler (was 2.0)
+    c.boost_high_factor = 2.5f;        // Gentler (was 3.0)
     
-    /* Combination: INERTIAL dominates (it's the production config) */
-    c.weight_reactive = 0.15f;
-    c.weight_inertial = 0.85f;
+    /* Combination: switching logic will override these */
+    c.weight_reactive = 0.10f;
+    c.weight_inertial = 0.90f;
     
     return c;
 }
@@ -208,75 +208,50 @@ static inline MS_SVPF* ms_svpf_create(const MS_SVPF_Config* config) {
     }
     
     /*═══════════════════════════════════════════════════════════════════════
-     * REACTIVE CONFIGURATION ("Fast Responder")
+     * REACTIVE CONFIGURATION ("Fast Scout")
      *═══════════════════════════════════════════════════════════════════════
-     * Slightly faster than standard - detects changes quickly
-     * NOT a completely different model, just lower persistence
+     * DUMB and FAST. No fancy features - just aggressive exploration.
+     * Its job is to detect changes, not to be accurate.
      *═══════════════════════════════════════════════════════════════════════*/
     {
         SVPFState* f = ms->reactive;
         
-        /* Store scale-specific dynamics - FASTER than standard */
-        ms->rho_reactive = 0.95f;       // Lower than 0.98 (half-life ~14 vs ~35)
-        ms->sigma_z_reactive = 0.15f;   // Slightly higher for faster adaptation
+        /* Store scale-specific dynamics - FASTER */
+        ms->rho_reactive = 0.92f;       // Half-life ~8 ticks
+        ms->sigma_z_reactive = 0.18f;   // Higher exploration
         
-        /* Asymmetric rho: ON */
-        //f->use_asymmetric_rho = 1;
-        //f->rho_up = 0.96f;
-        //f->rho_down = 0.92f;
+        /* Asymmetric rho: slight */
+        f->use_asymmetric_rho = 1;
+        f->rho_up = 0.94f;
+        f->rho_down = 0.88f;
         
-        /* MIM: Higher for faster exploration */
+        /* MIM: AGGRESSIVE */
         f->use_mim = 1;
-        f->mim_jump_prob = 0.25f;   // 15% scouts (vs 25% mono)
-        f->mim_jump_scale = 9.0f;
+        f->mim_jump_prob = 0.30f;   // 30% scouts
+        f->mim_jump_scale = 10.0f;
         
-        /* Guide: ON but weaker (let it react freely) */
-        f->use_guide = 1;
-        f->use_guide_preserving = 1;
-        f->guide_strength = 0.03f;
-        f->guide_mean = 0.0f;
-        f->guide_var = 0.0f;
-        f->guide_K = 0.0f;
-        f->guide_initialized = 0;
+        /* Guide: OFF - let particles fly freely */
+        f->use_guide = 0;
+        f->use_guided = 0;
+        f->use_adaptive_guide = 0;
         
-        f->use_adaptive_guide = 1;
-        f->guide_strength_base = 0.03f;
-        f->guide_strength_max = 0.20f;
-        f->guide_innovation_threshold = 1.2f;
-        
-        /* Guided prediction: ON */
-        f->use_guided = 1;
-        f->guided_alpha_base = 0.0f;
-        f->guided_alpha_shock = 0.35f;
-        f->guided_innovation_threshold = 1.5f;
-        
-        /* SVLD: Standard */
+        /* SVLD: Higher temp for exploration */
         f->use_svld = 1;
-        f->temperature = 0.40f;
+        f->temperature = 0.55f;     // Higher than standard
         f->rmsprop_rho = 0.9f;
         f->rmsprop_eps = 1e-6f;
         
-        /* Annealing: ON but fewer steps (faster) */
-        f->use_annealing = 1;
-        f->n_anneal_steps = 3;
+        /* Annealing: OFF (react immediately) */
+        f->use_annealing = 0;
+        f->n_anneal_steps = 1;
         
-        /* Newton: ON */
-        f->use_newton = 1;
-        f->use_full_newton = 1;     /* Simpler for speed */
+        /* Newton: OFF (expensive, unnecessary for scout) */
+        f->use_newton = 0;
+        f->use_full_newton = 0;
         
-        /* Adaptive features: ON */
-        f->use_adaptive_mu = 1;
-        f->mu_state = -3.5f;
-        f->mu_var = 1.0f;
-        f->mu_process_var = 0.002f;  // Faster mu adaptation
-        f->mu_obs_var_scale = 8.0f;
-        f->mu_min = -5.0f;
-        f->mu_max = -1.0f;
-        
-        f->use_adaptive_sigma = 1;
-        f->sigma_boost_threshold = 0.8f;  // More sensitive
-        f->sigma_boost_max = 3.5f;
-        f->sigma_z_effective = 0.15f;
+        /* Adaptive features: ALL OFF (too slow for scout) */
+        f->use_adaptive_mu = 0;
+        f->use_adaptive_sigma = 0;
         
         /* Local params: OFF */
         f->use_local_params = 0;
@@ -287,10 +262,10 @@ static inline MS_SVPF* ms_svpf_create(const MS_SVPF_Config* config) {
         f->use_exact_gradient = 1;
         f->lik_offset = 0.35f;
         
-        /* KSD budget: Moderate */
-        f->stein_min_steps = 8;
-        f->stein_max_steps = 16;
-        f->ksd_improvement_threshold = 0.06f;
+        /* KSD budget: MINIMAL (speed matters, not precision) */
+        f->stein_min_steps = 2;
+        f->stein_max_steps = 5;
+        f->ksd_improvement_threshold = 0.10f;
     }
     
     /*═══════════════════════════════════════════════════════════════════════
@@ -365,10 +340,10 @@ static inline MS_SVPF* ms_svpf_create(const MS_SVPF_Config* config) {
         f->sigma_boost_max = 3.2f;
         f->sigma_z_effective = 0.10f;
         
-        /* Local params: ON (same as mono) */
-        f->use_local_params = 1;
-        f->delta_rho = 0.02f;
-        f->delta_sigma = 0.1f;
+        /* Local params: OFF (mono doesn't use this) */
+        f->use_local_params = 0;
+        f->delta_rho = 0.0f;
+        f->delta_sigma = 0.0f;
         
         /* Exact gradient (same as mono) */
         f->use_exact_gradient = 1;
@@ -405,7 +380,7 @@ static inline void ms_svpf_destroy(MS_SVPF* ms) {
  * INITIALIZE
  *═══════════════════════════════════════════════════════════════════════════*/
 
-static inline void ms_svpf_init(MS_SVPF* ms, float initial_vol, const SVPFParams* base_params) {
+static inline void ms_svpf_init(MS_SVPF* ms, float initial_vol, const SVPFParams* base_params, unsigned int seed) {
     /* Create scale-specific params for initialization */
     SVPFParams params_reactive = *base_params;
     params_reactive.rho = ms->rho_reactive;
@@ -415,9 +390,9 @@ static inline void ms_svpf_init(MS_SVPF* ms, float initial_vol, const SVPFParams
     params_inertial.rho = ms->rho_inertial;
     params_inertial.sigma_z = ms->sigma_z_inertial;
     
-    /* Initialize both filters */
-    svpf_initialize(ms->reactive, &params_reactive, 12345ULL);
-    svpf_initialize(ms->inertial, &params_inertial, 67890ULL);
+    /* Initialize both filters with related seeds */
+    svpf_initialize(ms->reactive, &params_reactive, seed);
+    svpf_initialize(ms->inertial, &params_inertial, seed);  // SAME seed as mono would use
     
     ms->vol_prev = initial_vol;
     ms->y_prev = 0.0f;
@@ -477,40 +452,26 @@ static inline void ms_svpf_step(
      * This breaks the bootstrap problem for regime detection.
      *───────────────────────────────────────────────────────────────────────*/
     
-    float mim_base = ms->mim_jump_prob_inertial_base;
-    float mim_boosted = mim_base;
+    /*───────────────────────────────────────────────────────────────────────
+     * STEP 3: CROSS-SCALE BOOST (DISABLED for testing)
+     *───────────────────────────────────────────────────────────────────────
+     * The boost was causing INERTIAL to diverge from MONO.
+     * Disabled to verify INERTIAL = MONO baseline.
+     *───────────────────────────────────────────────────────────────────────*/
+    
     int boost_level = 0;
-    
-    if (surprise > ms->config.surprise_high_threshold) {
-        /* High surprise: aggressive exploration */
-        mim_boosted = fminf(mim_base * ms->config.boost_high_factor, 0.15f);
-        boost_level = 2;
-    } else if (surprise > ms->config.surprise_mild_threshold) {
-        /* Mild surprise: moderate boost */
-        mim_boosted = fminf(mim_base * ms->config.boost_mild_factor, 0.10f);
-        boost_level = 1;
-    }
-    
-    /* Apply boost temporarily */
-    ms->inertial->mim_jump_prob = mim_boosted;
+    float mim_boosted = ms->mim_jump_prob_inertial_base;  // No boost
     
     out->cross_scale_boost = boost_level;
     out->mim_prob_inertial_used = mim_boosted;
     
     /*───────────────────────────────────────────────────────────────────────
-     * STEP 4: RUN INERTIAL (with potentially boosted MIM)
+     * STEP 4: RUN INERTIAL
      *───────────────────────────────────────────────────────────────────────*/
     
-    /* Create scale-specific params for INERTIAL */
-    SVPFParams params_inertial = *base_params;
-    params_inertial.rho = ms->rho_inertial;
-    params_inertial.sigma_z = ms->sigma_z_inertial;
-    
+    /* INERTIAL uses base_params directly (matches DGP) */
     float loglik_i, vol_i, h_i;
-    svpf_step_adaptive(ms->inertial, y_t, ms->y_prev, &params_inertial, &loglik_i, &vol_i, &h_i);
-    
-    /* Restore base MIM */
-    ms->inertial->mim_jump_prob = mim_base;
+    svpf_step_adaptive(ms->inertial, y_t, ms->y_prev, base_params, &loglik_i, &vol_i, &h_i);
     
     out->vol_inertial = vol_i;
     out->h_inertial = h_i;
@@ -519,11 +480,17 @@ static inline void ms_svpf_step(
     out->stein_steps_inertial = ms->inertial->stein_steps_used;
     
     /*───────────────────────────────────────────────────────────────────────
-     * STEP 5: COMBINE ESTIMATES
+     * STEP 5: USE INERTIAL ONLY (REACTIVE is just for diagnostics)
+     *───────────────────────────────────────────────────────────────────────
+     * After testing, we found that combining with REACTIVE hurts accuracy.
+     * REACTIVE is useful for:
+     *   - Detecting regime changes (surprise signal)
+     *   - Decomposing transient vs permanent (diagnostic)
+     * But NOT for improving point estimates.
      *───────────────────────────────────────────────────────────────────────*/
     
-    float w_r = ms->config.weight_reactive;
-    float w_i = ms->config.weight_inertial;
+    float w_r = 0.0f;  // REACTIVE is diagnostic only
+    float w_i = 1.0f;  // Trust INERTIAL completely
     
     /* Arithmetic mean for h (log-space) */
     out->h_combined = w_r * h_r + w_i * h_i;

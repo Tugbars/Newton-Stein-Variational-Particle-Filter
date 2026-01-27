@@ -27,6 +27,7 @@
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <math.h>
 #include <chrono>
 #include <vector>
@@ -36,9 +37,17 @@
  * TEST CONFIGURATION
  *═══════════════════════════════════════════════════════════════════════════*/
 
-#define N_SEEDS         30      // Number of random seeds for statistical power
-#define N_STEPS         4000    // Steps per run
-#define WARMUP_STEPS    100     // Discard initial steps
+// Quick mode (default) vs Full mode (--full flag)
+static bool g_full_mode = false;
+
+#define N_SEEDS_QUICK   10
+#define N_SEEDS_FULL    50
+#define N_STEPS_QUICK   2000
+#define N_STEPS_FULL    5000
+#define WARMUP_STEPS    100
+
+static int get_n_seeds() { return g_full_mode ? N_SEEDS_FULL : N_SEEDS_QUICK; }
+static int get_n_steps() { return g_full_mode ? N_STEPS_FULL : N_STEPS_QUICK; }
 
 // Mono SVPF config (baseline)
 #define MONO_PARTICLES      1024
@@ -169,8 +178,14 @@ static void configure_mono_adaptive(void* state_ptr) {
     f->use_guide = 1;
     f->use_guide_preserving = 1;
     f->guide_strength = 0.05f;
+    f->guide_mean = 0.0f;
+    f->guide_var = 0.0f;
+    f->guide_K = 0.0f;
+    f->guide_initialized = 0;
   
     f->use_adaptive_mu = 1;
+    f->mu_state = -3.5f;
+    f->mu_var = 1.0f;
     f->mu_process_var = 0.001f;
     f->mu_obs_var_scale = 11.0f;
     f->mu_min = -4.0f;
@@ -184,6 +199,7 @@ static void configure_mono_adaptive(void* state_ptr) {
     f->use_adaptive_sigma = 1;
     f->sigma_boost_threshold = 0.95f;
     f->sigma_boost_max = 3.2f;
+    f->sigma_z_effective = 0.10f;
 
     f->use_exact_gradient = 1;
     f->lik_offset = 0.35f;
@@ -195,6 +211,10 @@ static void configure_mono_adaptive(void* state_ptr) {
     f->use_asymmetric_rho = 1;
     f->rho_up = 0.98f;
     f->rho_down = 0.93f;
+    
+    f->use_local_params = 0;
+    f->delta_rho = 0.0f;
+    f->delta_sigma = 0.0f;
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
@@ -236,6 +256,7 @@ static MSTestMetrics run_mono_svpf(
         y_prev = y[t];
     }
     
+    cudaDeviceSynchronize();
     auto end = std::chrono::high_resolution_clock::now();
     m.runtime_ms = std::chrono::duration<float, std::milli>(end - start).count();
     
@@ -296,7 +317,7 @@ static MSTestMetrics run_multiscale_svpf(
     
     // Initialize
     float initial_vol = expf(params->mu * 0.5f);
-    ms_svpf_init(ms, initial_vol, params);
+    ms_svpf_init(ms, initial_vol, params, (unsigned int)seed);
     
     auto start = std::chrono::high_resolution_clock::now();
     
@@ -346,6 +367,7 @@ static MSTestMetrics run_multiscale_svpf(
         }
     }
     
+    cudaDeviceSynchronize();
     auto end = std::chrono::high_resolution_clock::now();
     m.runtime_ms = std::chrono::duration<float, std::milli>(end - start).count();
     
@@ -448,10 +470,20 @@ static void paired_ttest(const std::vector<float>& a, const std::vector<float>& 
 
 static ScenarioComparison run_scenario_comparison(
     const SVPFTestScenario* scenario,
-    const SVPFParams* params
+    const SVPFParams* base_params
 ) {
     ScenarioComparison result = {};
     result.scenario_name = scenario->name;
+    
+    const int n_seeds = get_n_seeds();
+    const int n_steps = get_n_steps();
+    
+    /* Match filter params to DGP for fair comparison */
+    SVPFParams params;
+    params.rho = scenario->true_rho;
+    params.sigma_z = scenario->true_sigma_z;
+    params.mu = scenario->true_mu;
+    params.gamma = 0.0f;
     
     std::vector<float> mono_rmse, mono_vol_rmse, mono_bias, mono_corr, mono_runtime;
     std::vector<float> ms_rmse, ms_vol_rmse, ms_bias, ms_corr, ms_runtime;
@@ -459,22 +491,23 @@ static ScenarioComparison run_scenario_comparison(
     std::vector<float> ms_transient, ms_regime;
     
     // Allocate data arrays
-    float* h_true = (float*)malloc(N_STEPS * sizeof(float));
-    float* y = (float*)malloc(N_STEPS * sizeof(float));
+    float* h_true = (float*)malloc(n_steps * sizeof(float));
+    float* y = (float*)malloc(n_steps * sizeof(float));
     
-    printf("  Running %d seeds for scenario: %s\n", N_SEEDS, scenario->name);
+    printf("  Running %d seeds for scenario: %s (rho=%.3f, sigma_z=%.2f, mu=%.1f)\n", 
+           n_seeds, scenario->name, params.rho, params.sigma_z, params.mu);
     
-    for (int s = 0; s < N_SEEDS; s++) {
+    for (int s = 0; s < n_seeds; s++) {
         uint64_t seed = 12345 + s * 1000;
         
         // Generate data
-        svpf_test_generate_data(scenario, N_STEPS, seed, h_true, y);
+        svpf_test_generate_data(scenario, n_steps, seed, h_true, y);
         
         // Run mono
-        MSTestMetrics m_mono = run_mono_svpf(y, h_true, N_STEPS, params, seed);
+        MSTestMetrics m_mono = run_mono_svpf(y, h_true, n_steps, &params, seed);
         
         // Run multi-scale
-        MSTestMetrics m_ms = run_multiscale_svpf(y, h_true, N_STEPS, params, seed);
+        MSTestMetrics m_ms = run_multiscale_svpf(y, h_true, n_steps, &params, seed);
         
         // Skip if either failed
         if (!isfinite(m_mono.rmse_h) || !isfinite(m_ms.rmse_h)) continue;
@@ -495,9 +528,9 @@ static ScenarioComparison run_scenario_comparison(
         ms_transient.push_back(m_ms.transient_detection_rate);
         ms_regime.push_back(m_ms.regime_detection_rate);
         
-        if ((s + 1) % 10 == 0) {
+        if ((s + 1) % 5 == 0 || s == n_seeds - 1) {
             printf("    Seed %d/%d: Mono RMSE=%.4f, MS RMSE=%.4f\n",
-                   s + 1, N_SEEDS, m_mono.rmse_h, m_ms.rmse_h);
+                   s + 1, n_seeds, m_mono.rmse_h, m_ms.rmse_h);
         }
     }
     
@@ -533,53 +566,40 @@ static ScenarioComparison run_scenario_comparison(
  *═══════════════════════════════════════════════════════════════════════════*/
 
 static void print_scenario_result(const ScenarioComparison* r) {
+    const char* winner_rmse = (r->ms_rmse_h.mean < r->mono_rmse_h.mean) ? "MS" : "MONO";
+    float pct_diff = 100.0f * (r->ms_rmse_h.mean - r->mono_rmse_h.mean) / r->mono_rmse_h.mean;
+    
     printf("\n");
     printf("╔═════════════════════════════════════════════════════════════════════════╗\n");
     printf("║  Scenario: %-62s  ║\n", r->scenario_name);
     printf("╠═════════════════════════════════════════════════════════════════════════╣\n");
-    printf("║                    │     MONO SVPF      │   MULTI-SCALE SVPF            ║\n");
-    printf("║  Metric            │   Mean ± Std       │   Mean ± Std      │  Winner   ║\n");
-    printf("╟────────────────────┼────────────────────┼───────────────────┼───────────╢\n");
-    
-    const char* winner_rmse = (r->ms_rmse_h.mean < r->mono_rmse_h.mean) ? "MS" : "MONO";
-    const char* winner_vol = (r->ms_rmse_vol.mean < r->mono_rmse_vol.mean) ? "MS" : "MONO";
-    const char* winner_bias = (fabsf(r->ms_bias.mean) < fabsf(r->mono_bias.mean)) ? "MS" : "MONO";
-    const char* winner_corr = (r->ms_corr.mean > r->mono_corr.mean) ? "MS" : "MONO";
-    
-    printf("║  RMSE(h)           │ %6.4f ± %6.4f   │ %6.4f ± %6.4f  │   %-4s    ║\n",
+    printf("║                        │     MONO SVPF      │   MULTI-SCALE SVPF        ║\n");
+    printf("║  RMSE(log-vol)         │   Mean ± Std       │   Mean ± Std      │Winner ║\n");
+    printf("╟────────────────────────┼────────────────────┼───────────────────┼───────╢\n");
+    printf("║  Combined              │ %6.4f ± %6.4f   │ %6.4f ± %6.4f  │ %-4s  ║\n",
            r->mono_rmse_h.mean, r->mono_rmse_h.std,
            r->ms_rmse_h.mean, r->ms_rmse_h.std, winner_rmse);
-    printf("║  RMSE(vol)         │ %6.4f ± %6.4f   │ %6.4f ± %6.4f  │   %-4s    ║\n",
-           r->mono_rmse_vol.mean, r->mono_rmse_vol.std,
-           r->ms_rmse_vol.mean, r->ms_rmse_vol.std, winner_vol);
-    printf("║  Bias(h)           │ %+6.4f ± %6.4f  │ %+6.4f ± %6.4f │   %-4s    ║\n",
+    printf("║  REACTIVE only         │        -           │ %6.4f ± %6.4f  │       ║\n",
+           r->ms_rmse_reactive.mean, r->ms_rmse_reactive.std);
+    printf("║  INERTIAL only         │        -           │ %6.4f ± %6.4f  │       ║\n",
+           r->ms_rmse_inertial.mean, r->ms_rmse_inertial.std);
+    printf("╟────────────────────────┼────────────────────┼───────────────────┼───────╢\n");
+    printf("║  Bias(h)               │ %+6.4f ± %6.4f  │ %+6.4f ± %6.4f │       ║\n",
            r->mono_bias.mean, r->mono_bias.std,
-           r->ms_bias.mean, r->ms_bias.std, winner_bias);
-    printf("║  Correlation       │ %6.4f ± %6.4f   │ %6.4f ± %6.4f  │   %-4s    ║\n",
+           r->ms_bias.mean, r->ms_bias.std);
+    printf("║  Correlation           │ %6.4f ± %6.4f   │ %6.4f ± %6.4f  │       ║\n",
            r->mono_corr.mean, r->mono_corr.std,
-           r->ms_corr.mean, r->ms_corr.std, winner_corr);
-    printf("║  Runtime (ms)      │ %6.1f ± %6.1f    │ %6.1f ± %6.1f   │           ║\n",
+           r->ms_corr.mean, r->ms_corr.std);
+    printf("║  Runtime (ms)          │ %6.1f ± %6.1f    │ %6.1f ± %6.1f   │       ║\n",
            r->mono_runtime.mean, r->mono_runtime.std,
            r->ms_runtime.mean, r->ms_runtime.std);
-    printf("╟────────────────────┴────────────────────┴───────────────────┴───────────╢\n");
-    printf("║  Multi-Scale Specific:                                                  ║\n");
-    printf("║    REACTIVE RMSE:  %.4f ± %.4f                                        ║\n",
-           r->ms_rmse_reactive.mean, r->ms_rmse_reactive.std);
-    printf("║    INERTIAL RMSE:  %.4f ± %.4f                                        ║\n",
-           r->ms_rmse_inertial.mean, r->ms_rmse_inertial.std);
-    printf("║    Transient Det:  %.1f%% ± %.1f%%                                          ║\n",
-           r->ms_transient_rate.mean * 100, r->ms_transient_rate.std * 100);
-    printf("║    Regime Det:     %.1f%% ± %.1f%%                                          ║\n",
-           r->ms_regime_rate.mean * 100, r->ms_regime_rate.std * 100);
-    printf("╟─────────────────────────────────────────────────────────────────────────╢\n");
-    printf("║  Statistical Test (Paired T-Test on RMSE):                              ║\n");
-    printf("║    Diff (MS-MONO): %+.4f                                               ║\n",
-           r->rmse_diff_mean);
-    printf("║    P-value:        %.4f                                                ║\n",
-           r->rmse_diff_pvalue);
-    printf("║    Verdict:        %s                               ║\n",
-           r->ms_significantly_better ? "MS SIGNIFICANTLY BETTER (p<0.05)" :
-           (r->rmse_diff_pvalue < 0.05f ? "MONO SIGNIFICANTLY BETTER (p<0.05)" : 
+    printf("╠═════════════════════════════════════════════════════════════════════════╣\n");
+    printf("║  RMSE Difference: %+.4f (%+.2f%%)                                       ║\n",
+           r->rmse_diff_mean, pct_diff);
+    printf("║  P-value: %.4f  →  %s      ║\n",
+           r->rmse_diff_pvalue,
+           r->ms_significantly_better ? "MS SIGNIFICANTLY BETTER" :
+           (r->rmse_diff_pvalue < 0.05f ? "MONO SIGNIFICANTLY BETTER" : 
                                           "NO SIGNIFICANT DIFFERENCE"));
     printf("╚═════════════════════════════════════════════════════════════════════════╝\n");
 }
@@ -589,14 +609,26 @@ static void print_scenario_result(const ScenarioComparison* r) {
  *═══════════════════════════════════════════════════════════════════════════*/
 
 int main(int argc, char** argv) {
+    // Parse arguments
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--full") == 0) {
+            g_full_mode = true;
+        }
+    }
+    
+    const int n_seeds = get_n_seeds();
+    const int n_steps = get_n_steps();
+    
     printf("\n");
     printf("╔═════════════════════════════════════════════════════════════════════════╗\n");
     printf("║           SVPF A/B TEST: MULTI-SCALE vs MONO                            ║\n");
     printf("╠═════════════════════════════════════════════════════════════════════════╣\n");
+    printf("║  Mode: %-6s (use --full for comprehensive test)                       ║\n",
+           g_full_mode ? "FULL" : "QUICK");
     printf("║  MONO:  1024 particles, full adaptive suite                             ║\n");
     printf("║  MS:    REACTIVE (512p) + INERTIAL (1024p)                              ║\n");
     printf("║  Seeds: %d, Steps: %d, Warmup: %d                                       ║\n",
-           N_SEEDS, N_STEPS, WARMUP_STEPS);
+           n_seeds, n_steps, WARMUP_STEPS);
     printf("╚═════════════════════════════════════════════════════════════════════════╝\n\n");
     
     // Base params (filter assumes these, DGP may differ)
@@ -623,14 +655,15 @@ int main(int argc, char** argv) {
     // Summary table
     printf("\n");
     printf("╔═════════════════════════════════════════════════════════════════════════╗\n");
-    printf("║                          SUMMARY TABLE                                  ║\n");
+    printf("║                    SUMMARY: RMSE(log-vol)                               ║\n");
     printf("╠═════════════════════════════════════════════════════════════════════════╣\n");
-    printf("║  Scenario         │ MONO RMSE │ MS RMSE  │  Diff   │ p-value │ Winner  ║\n");
-    printf("╟───────────────────┼───────────┼──────────┼─────────┼─────────┼─────────╢\n");
+    printf("║  Scenario         │   MONO    │    MS     │   Diff   │ %% Change│ Winner ║\n");
+    printf("╟───────────────────┼───────────┼───────────┼──────────┼─────────┼────────╢\n");
     
     int mono_wins = 0, ms_wins = 0, ties = 0;
     
     for (const auto& r : results) {
+        float pct = 100.0f * (r.ms_rmse_h.mean - r.mono_rmse_h.mean) / r.mono_rmse_h.mean;
         const char* winner;
         if (r.rmse_diff_pvalue < 0.05f) {
             if (r.rmse_diff_mean < 0) {
@@ -645,19 +678,20 @@ int main(int argc, char** argv) {
             ties++;
         }
         
-        printf("║  %-16s │  %7.4f  │ %7.4f  │ %+6.4f │  %5.3f  │ %-7s ║\n",
+        printf("║  %-16s │  %7.4f  │  %7.4f  │ %+7.4f │ %+6.2f%% │ %-6s ║\n",
                r.scenario_name,
                r.mono_rmse_h.mean,
                r.ms_rmse_h.mean,
                r.rmse_diff_mean,
-               r.rmse_diff_pvalue,
+               pct,
                winner);
     }
     
     printf("╠═════════════════════════════════════════════════════════════════════════╣\n");
-    printf("║  Overall: MONO wins %d, MS wins %d, Ties %d                              ║\n",
+    printf("║  OVERALL: MONO wins %d, MS wins %d, Ties %d                              ║\n",
            mono_wins, ms_wins, ties);
     printf("║  (* = statistically significant at p<0.05)                              ║\n");
+    printf("║  Negative diff / %% change = MS is better                                ║\n");
     printf("╚═════════════════════════════════════════════════════════════════════════╝\n\n");
     
     return 0;
