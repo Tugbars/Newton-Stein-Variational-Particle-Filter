@@ -553,7 +553,7 @@ static Metrics run_svpf_on_scenario(
         // - Asymmetric gating only activates on UPWARD shocks (spikes)
         filter->use_guided = 1;
         filter->guided_alpha_base = 0.0f;             // 0% when model fits
-        filter->guided_alpha_shock = 0.40f;            // 50% when model fails
+        filter->guided_alpha_shock = 0.40f;           // 40% when model fails
         filter->guided_innovation_threshold = 1.5f;   // 1.5σ = "surprised"
         
         // EKF Guide density
