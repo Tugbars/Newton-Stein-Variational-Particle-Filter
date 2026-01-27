@@ -289,7 +289,9 @@ __global__ void svpf_fused_gradient_kernel(
     float lik_offset,  // Likelihood center offset (only used if !use_exact_gradient)
     float gamma,       // Leverage coefficient
     bool use_exact_gradient,  // true = exact Student-t, false = log-squared surrogate
-    bool use_newton, int n
+    bool use_newton,
+    bool use_fan_mode,  // Fan mode: uniform weights, no annealing
+    int n
 );
 
 __global__ void svpf_fused_stein_transport_kernel(

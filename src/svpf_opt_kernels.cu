@@ -321,6 +321,7 @@ __global__ void svpf_fused_gradient_kernel(
     float gamma,
     bool use_exact_gradient,
     bool use_newton,
+    bool use_fan_mode,
     int n
 ) {
     extern __shared__ float smem[];
@@ -378,8 +379,14 @@ __global__ void svpf_fused_gradient_kernel(
     float A = scaled_y_sq / nu;
     float one_plus_A = 1.0f + A;
     
-    log_w[j] = student_t_const - 0.5f * h_j
-             - (nu + 1.0f) * 0.5f * log1pf(fmaxf(A, -0.999f));
+    // Fan mode: uniform weights (log_w = 0)
+    // Hybrid mode: importance weights from likelihood
+    if (use_fan_mode) {
+        log_w[j] = 0.0f;
+    } else {
+        log_w[j] = student_t_const - 0.5f * h_j
+                 - (nu + 1.0f) * 0.5f * log1pf(fmaxf(A, -0.999f));
+    }
     
     float grad_lik;
     if (use_exact_gradient) {
@@ -392,7 +399,10 @@ __global__ void svpf_fused_gradient_kernel(
     }
     
     // ===== COMBINE =====
-    float g = grad_prior + beta * grad_lik;
+    // Fan mode: full likelihood (beta effectively 1.0)
+    // Hybrid mode: annealed likelihood
+    float effective_beta = use_fan_mode ? 1.0f : beta;
+    float g = grad_prior + effective_beta * grad_lik;
     g = fminf(fmaxf(g, -10.0f), 10.0f);
     grad_combined[j] = g;
     
@@ -443,8 +453,8 @@ __global__ void svpf_fused_stein_transport_kernel(
     if (i >= n) return;
     
     float h_i = sh_h[i];
-    float bandwidth = *d_bandwidth;
-    float bw_sq = bandwidth * bandwidth;
+    float global_bw = *d_bandwidth;
+    float bw_sq = global_bw * global_bw;
     float inv_bw_sq = 1.0f / bw_sq;
     float inv_n = 1.0f / (float)n;
     
@@ -465,8 +475,6 @@ __global__ void svpf_fused_stein_transport_kernel(
         float K_sq = K * K;
         
         k_sum += K * sh_grad[j];
-        // Kernel gradient: sign_mult * 2 * diff / h² * k²
-        // Legacy: -2*diff (attraction), Paper: +2*diff (repulsion)
         gk_sum += sign_mult * 2.0f * diff * inv_bw_sq * K_sq;
     }
     
@@ -538,8 +546,8 @@ __global__ void svpf_fused_stein_transport_ksd_kernel(
     
     float h_i = sh_h[i];
     float s_i = sh_grad[i];  // Score at particle i
-    float bandwidth = *d_bandwidth;
-    float bw_sq = bandwidth * bandwidth;
+    float global_bw = *d_bandwidth;
+    float bw_sq = global_bw * global_bw;
     float inv_bw_sq = 1.0f / bw_sq;
     float inv_n = 1.0f / (float)n;
     
@@ -566,15 +574,9 @@ __global__ void svpf_fused_stein_transport_ksd_kernel(
         
         // ----- Stein operator -----
         k_sum += K * s_j;
-        // Kernel gradient with configurable sign
         gk_sum += sign_mult * 2.0f * diff * inv_bw_sq * K_sq;
         
         // ----- KSD Stein kernel -----
-        // u(x,y) = k·sₓ·sᵧ + sₓ·∇ᵧk + sᵧ·∇ₓk + ∇ₓ∇ᵧk
-        // For IMQ:
-        //   ∇ₓk = -2·diff/h²·k²
-        //   ∇ᵧk = +2·diff/h²·k²
-        //   ∇ₓ∇ᵧk = 2k²/h²·(4·dist_sq·k - 1)
         float grad_x_k = -2.0f * diff * inv_bw_sq * K_sq;
         float grad_y_k = -grad_x_k;
         float hess_xy_k = 2.0f * inv_bw_sq * K_sq * (4.0f * dist_sq * K - 1.0f);
@@ -669,8 +671,8 @@ __global__ void svpf_fused_stein_transport_newton_kernel(
     if (i >= n) return;
     
     float h_i = sh_h[i];
-    float bandwidth = *d_bandwidth;
-    float bw_sq = bandwidth * bandwidth;
+    float global_bw = *d_bandwidth;
+    float bw_sq = global_bw * global_bw;
     float inv_bw_sq = 1.0f / bw_sq;
     float inv_n = 1.0f / (float)n;
     
@@ -690,7 +692,6 @@ __global__ void svpf_fused_stein_transport_newton_kernel(
         float K_sq = K * K;
         
         k_sum += K * sh_precond_grad[j];
-        // Kernel gradient with configurable sign, scaled by inv_hessian
         gk_sum += sign_mult * 2.0f * diff * inv_bw_sq * K_sq * sh_inv_hess[j];
     }
     
@@ -750,8 +751,8 @@ __global__ void svpf_fused_stein_transport_newton_ksd_kernel(
     
     float h_i = sh_h[i];
     float s_i = sh_precond_grad[i];
-    float bandwidth = *d_bandwidth;
-    float bw_sq = bandwidth * bandwidth;
+    float global_bw = *d_bandwidth;
+    float bw_sq = global_bw * global_bw;
     float inv_bw_sq = 1.0f / bw_sq;
     float inv_n = 1.0f / (float)n;
     
@@ -775,10 +776,9 @@ __global__ void svpf_fused_stein_transport_newton_ksd_kernel(
         float K_sq = K * K;
         
         k_sum += K * s_j;
-        // Kernel gradient with configurable sign, scaled by inv_hessian
         gk_sum += sign_mult * 2.0f * diff * inv_bw_sq * K_sq * sh_inv_hess[j];
         
-        // KSD (always uses mathematically correct derivatives for discrepancy measure)
+        // KSD
         float grad_x_k = -2.0f * diff * inv_bw_sq * K_sq;
         float grad_y_k = -grad_x_k;
         float hess_xy_k = 2.0f * inv_bw_sq * K_sq * (4.0f * dist_sq * K - 1.0f);
@@ -841,8 +841,8 @@ __global__ void svpf_fused_stein_transport_full_newton_kernel(
     if (i >= n) return;
     
     float h_i = sh_h[i];
-    float bandwidth = *d_bandwidth;
-    float bw_sq = bandwidth * bandwidth;
+    float global_bw = *d_bandwidth;
+    float bw_sq = global_bw * global_bw;
     float inv_bw_sq = 1.0f / bw_sq;
     float inv_n = 1.0f / (float)n;
     
@@ -869,8 +869,6 @@ __global__ void svpf_fused_stein_transport_full_newton_kernel(
         K_sum_norm += K;
         
         k_grad_sum += K * sh_grad[j];
-        // Kernel gradient with configurable sign
-        // Legacy: -2*diff (attraction), Paper: +2*diff (repulsion)
         gk_sum += sign_mult * 2.0f * diff * inv_bw_sq * K_sq;
     }
     

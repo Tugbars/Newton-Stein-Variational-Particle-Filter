@@ -451,6 +451,20 @@ typedef struct {
     // Paper mode is mathematically correct but may need parameter retuning.
     int stein_repulsive_sign;
     
+    // =========================================================================
+    // FAN MODE (Fan et al. 2021 - Weightless SVGD)
+    // =========================================================================
+    // Pure Stein-based particle filter without importance weights.
+    // Key changes when enabled:
+    //   1. Uniform weights: log_w = 0 for all particles (no weighting)
+    //   2. No annealing: beta = 1.0 always (full likelihood from start)
+    //   3. No resampling: Stein repulsion maintains diversity
+    //   4. Paper sign: uses correct repulsive sign (+) automatically
+    //
+    // Theoretical benefit: avoids weight degeneracy that causes variance collapse.
+    // Trade-off: relies entirely on Stein operator for posterior approximation.
+    int use_fan_mode;  // 0 = hybrid (default), 1 = weightless SVGD
+    
     // Optimized backend (embedded for thread safety)
     SVPFOptimizedState opt_backend;
 
@@ -551,6 +565,43 @@ static inline void svpf_set_stein_sign_mode(SVPFState* state, int mode) {
  */
 static inline int svpf_get_stein_sign_mode(const SVPFState* state) {
     return state->stein_repulsive_sign;
+}
+
+// =============================================================================
+// API: Fan Mode (Weightless SVGD - Fan et al. 2021)
+// =============================================================================
+
+/**
+ * @brief Enable/disable Fan mode (weightless SVGD)
+ * 
+ * Fan mode implements pure Stein variational inference without importance weights:
+ *   - All particles have uniform weight (log_w = 0)
+ *   - No likelihood annealing (beta = 1.0)
+ *   - No resampling (Stein repulsion maintains diversity)
+ *   - Automatically uses correct repulsive sign
+ * 
+ * Benefits: Avoids weight degeneracy that causes variance collapse
+ * Trade-offs: Relies entirely on Stein operator for posterior approximation
+ * 
+ * @param state SVPF state
+ * @param enable 1 to enable Fan mode, 0 for hybrid mode (default)
+ * 
+ * Call svpf_graph_invalidate() after changing if using CUDA graphs.
+ */
+static inline void svpf_set_fan_mode(SVPFState* state, int enable) {
+    state->use_fan_mode = enable ? 1 : 0;
+    // Fan mode implies paper sign (repulsive)
+    if (enable) {
+        state->stein_repulsive_sign = SVPF_STEIN_SIGN_PAPER;
+    }
+}
+
+/**
+ * @brief Get current Fan mode status
+ * @return 1 if Fan mode enabled, 0 otherwise
+ */
+static inline int svpf_get_fan_mode(const SVPFState* state) {
+    return state->use_fan_mode;
 }
 
 // =============================================================================

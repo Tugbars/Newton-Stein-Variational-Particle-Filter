@@ -187,6 +187,10 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     // 1 = paper (add, repulsion) - mathematically correct per Fan et al. 2021
     state->stein_repulsive_sign = SVPF_STEIN_SIGN_DEFAULT;
     
+    // === Fan mode (weightless SVGD) ===
+    // 0 = hybrid (default), 1 = pure Stein without importance weights
+    state->use_fan_mode = 0;
+    
     // === KSD-based Adaptive Stein Steps ===
     state->stein_min_steps = 4;              // Always run at least this many
     state->stein_max_steps = 12;             // Never exceed this
@@ -648,7 +652,8 @@ void svpf_step_graph(SVPFState* state, float y_t, float y_prev, const SVPFParams
                 state->use_newton ? opt->d_inv_hessian : nullptr,
                 opt->d_y_single, 1, params->rho, effective_sigma_z, effective_mu,
                 beta, state->nu, student_t_const, state->lik_offset,
-                params->gamma, state->use_exact_gradient, state->use_newton, n
+                params->gamma, state->use_exact_gradient, state->use_newton,
+                state->use_fan_mode, n
             );
             
             // Stein transport (compute KSD only on LAST iteration)

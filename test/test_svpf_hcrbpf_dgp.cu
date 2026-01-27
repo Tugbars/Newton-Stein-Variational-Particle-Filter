@@ -582,6 +582,9 @@ static Metrics run_svpf_on_scenario(
         filter->use_exact_gradient = 1;
         filter->lik_offset = 0.35f;  // No correction - test if model is now consistent
 
+        // Test B: Fan mode (weightless SVGD)
+        svpf_set_fan_mode(filter, 1);
+
          // === KSD-based Adaptive Stein Steps ===
         // Replaces fixed n_stein_steps with convergence-based early stopping
         // KSD (Kernel Stein Discrepancy) computed in same O(N²) pass - zero extra cost
