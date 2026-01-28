@@ -17,6 +17,12 @@ if sys.platform == 'win32':
     if os.path.exists(cuda_path):
         os.add_dll_directory(cuda_path)
         os.environ['PATH'] = cuda_path + ';' + os.environ.get('PATH', '')
+        
+if sys.platform == 'win32':
+    # Intel runtime
+    os.add_dll_directory(r"C:\Program Files (x86)\Intel\oneAPI\compiler\latest\bin")
+    # CUDA runtime
+    os.add_dll_directory(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1\bin")
 
 import numpy as np
 import pysvpf as svpf
