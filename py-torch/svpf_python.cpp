@@ -90,41 +90,63 @@ public:
     void set_defaults() {
         // Observation model
         state_->nu = 30.0f;
-        state_->lik_offset = 0.70f;
+        state_->lik_offset = 0.345f;
         
         // Asymmetric persistence
         state_->use_asymmetric_rho = 1;
-        state_->rho_up = 0.99f;
-        state_->rho_down = 0.92f;
+        state_->rho_up = 0.98f;
+        state_->rho_down = 0.93f;
         
         // SVLD
         state_->use_svld = 1;
-        state_->temperature = 0.3f;
+        state_->temperature = 0.45f;
         state_->rmsprop_rho = 0.9f;
         state_->rmsprop_eps = 1e-6f;
         
         // Annealing
         state_->use_annealing = 1;
-        state_->n_anneal_steps = 3;
+        state_->n_anneal_steps = 5;
         
         // MIM
         state_->use_mim = 1;
-        state_->mim_jump_prob = 0.05f;
-        state_->mim_jump_scale = 5.0f;
+        state_->mim_jump_prob = 0.25f;
+        state_->mim_jump_scale = 9.0f;
+        
+        // Adaptive beta (KSD-based)
+        state_->use_adaptive_beta = 1;
+        
+        // Rejuvenation
+        state_->use_rejuvenation = 1;
+        state_->rejuv_ksd_threshold = 0.05f;
+        state_->rejuv_prob = 0.30f;
+        state_->rejuv_blend = 0.30f;
         
         // Newton-Stein
         state_->use_newton = 1;
+        state_->use_full_newton = 1;
+        
+        // Exact gradient
+        state_->use_exact_gradient = 1;
+        
+        // Stein steps
+        state_->stein_min_steps = 8;
+        state_->stein_max_steps = 16;
+        state_->ksd_improvement_threshold = 0.05f;
         
         // Guided prediction
         state_->use_guided = 1;
         state_->guided_alpha_base = 0.0f;
-        state_->guided_alpha_shock = 0.5f;
+        state_->guided_alpha_shock = 0.40f;
         state_->guided_innovation_threshold = 1.5f;
         
         // EKF Guide
         state_->use_guide = 1;
         state_->use_guide_preserving = 1;
         state_->guide_strength = 0.05f;
+        state_->guide_mean = 0.0f;
+        state_->guide_var = 0.0f;
+        state_->guide_K = 0.0f;
+        state_->guide_initialized = 0;
         
         // Adaptive guide
         state_->use_adaptive_guide = 1;
@@ -134,15 +156,23 @@ public:
         
         // Adaptive mu
         state_->use_adaptive_mu = 1;
+        state_->mu_state = -3.5f;
+        state_->mu_var = 1.0f;
         state_->mu_process_var = 0.001f;
-        state_->mu_obs_var_scale = 11.5f;
+        state_->mu_obs_var_scale = 11.0f;
         state_->mu_min = -4.0f;
         state_->mu_max = -1.0f;
         
         // Adaptive sigma_z
         state_->use_adaptive_sigma = 1;
-        state_->sigma_boost_threshold = 1.0f;
-        state_->sigma_boost_max = 3.0f;
+        state_->sigma_boost_threshold = 0.95f;
+        state_->sigma_boost_max = 3.2f;
+        state_->sigma_z_effective = 0.10f;
+        
+        // Local params
+        state_->use_local_params = 0;
+        state_->delta_rho = 0.0f;
+        state_->delta_sigma = 0.0f;
     }
     
     // --------------------------------------------------------------------------
@@ -150,7 +180,7 @@ public:
     // --------------------------------------------------------------------------
     
     void set_adaptive_mu(bool enabled, float process_var = 0.001f, 
-                         float obs_var_scale = 11.5f,
+                         float obs_var_scale = 11.0f,
                          float mu_min = -4.0f, float mu_max = -1.0f) {
         state_->use_adaptive_mu = enabled ? 1 : 0;
         state_->mu_process_var = process_var;
@@ -160,7 +190,7 @@ public:
         invalidate_graph();
     }
     
-    void set_adaptive_sigma(bool enabled, float threshold = 1.0f, float max_boost = 3.0f) {
+    void set_adaptive_sigma(bool enabled, float threshold = 0.95f, float max_boost = 3.2f) {
         state_->use_adaptive_sigma = enabled ? 1 : 0;
         state_->sigma_boost_threshold = threshold;
         state_->sigma_boost_max = max_boost;
@@ -176,27 +206,27 @@ public:
         invalidate_graph();
     }
     
-    void set_asymmetric_rho(bool enabled, float rho_up = 0.99f, float rho_down = 0.92f) {
+    void set_asymmetric_rho(bool enabled, float rho_up = 0.98f, float rho_down = 0.93f) {
         state_->use_asymmetric_rho = enabled ? 1 : 0;
         state_->rho_up = rho_up;
         state_->rho_down = rho_down;
         invalidate_graph();
     }
     
-    void set_mim(bool enabled, float jump_prob = 0.05f, float jump_scale = 5.0f) {
+    void set_mim(bool enabled, float jump_prob = 0.25f, float jump_scale = 9.0f) {
         state_->use_mim = enabled ? 1 : 0;
         state_->mim_jump_prob = jump_prob;
         state_->mim_jump_scale = jump_scale;
         invalidate_graph();
     }
     
-    void set_svld(bool enabled, float temperature = 0.3f) {
+    void set_svld(bool enabled, float temperature = 0.45f) {
         state_->use_svld = enabled ? 1 : 0;
         state_->temperature = temperature;
         invalidate_graph();
     }
     
-    void set_annealing(bool enabled, int n_steps = 3) {
+    void set_annealing(bool enabled, int n_steps = 5) {
         state_->use_annealing = enabled ? 1 : 0;
         state_->n_anneal_steps = n_steps;
         invalidate_graph();
@@ -213,7 +243,53 @@ public:
         invalidate_graph();
     }
     
+    // --------------------------------------------------------------------------
+    // NEW: Additional Config Setters for Full Production Config
+    // --------------------------------------------------------------------------
+    
+    void set_adaptive_beta(bool enabled) {
+        state_->use_adaptive_beta = enabled ? 1 : 0;
+        invalidate_graph();
+    }
+    
+    void set_full_newton(bool enabled) {
+        state_->use_full_newton = enabled ? 1 : 0;
+        invalidate_graph();
+    }
+    
+    void set_exact_gradient(bool enabled) {
+        state_->use_exact_gradient = enabled ? 1 : 0;
+        invalidate_graph();
+    }
+    
+    void set_stein_steps(int min_steps = 8, int max_steps = 16, float ksd_threshold = 0.05f) {
+        state_->stein_min_steps = min_steps;
+        state_->stein_max_steps = max_steps;
+        state_->ksd_improvement_threshold = ksd_threshold;
+        invalidate_graph();
+    }
+    
+    void set_guided_innovation(float alpha_base = 0.0f, float alpha_shock = 0.40f, 
+                               float threshold = 1.5f) {
+        state_->guided_alpha_base = alpha_base;
+        state_->guided_alpha_shock = alpha_shock;
+        state_->guided_innovation_threshold = threshold;
+        invalidate_graph();
+    }
+    
+    void set_rejuvenation(bool enabled, float ksd_threshold = 0.05f, 
+                          float prob = 0.30f, float blend = 0.30f) {
+        state_->use_rejuvenation = enabled ? 1 : 0;
+        state_->rejuv_ksd_threshold = ksd_threshold;
+        state_->rejuv_prob = prob;
+        state_->rejuv_blend = blend;
+        invalidate_graph();
+    }
+    
+    // --------------------------------------------------------------------------
     // Property setters
+    // --------------------------------------------------------------------------
+    
     void set_nu(float nu) { 
         state_->nu = nu; 
         // Recompute Student-t constant
@@ -458,15 +534,15 @@ PYBIND11_MODULE(pysvpf, m) {
         .def("set_adaptive_mu", &PySVPF::set_adaptive_mu,
              py::arg("enabled"),
              py::arg("process_var") = 0.001f,
-             py::arg("obs_var_scale") = 11.5f,
+             py::arg("obs_var_scale") = 11.0f,
              py::arg("mu_min") = -4.0f,
              py::arg("mu_max") = -1.0f,
              "Configure adaptive mu (Kalman filter on mean level)")
         
         .def("set_adaptive_sigma", &PySVPF::set_adaptive_sigma,
              py::arg("enabled"),
-             py::arg("threshold") = 1.0f,
-             py::arg("max_boost") = 3.0f,
+             py::arg("threshold") = 0.95f,
+             py::arg("max_boost") = 3.2f,
              "Configure adaptive sigma_z (breathing filter)")
         
         .def("set_adaptive_guide", &PySVPF::set_adaptive_guide,
@@ -478,24 +554,24 @@ PYBIND11_MODULE(pysvpf, m) {
         
         .def("set_asymmetric_rho", &PySVPF::set_asymmetric_rho,
              py::arg("enabled"),
-             py::arg("rho_up") = 0.99f,
-             py::arg("rho_down") = 0.92f,
+             py::arg("rho_up") = 0.98f,
+             py::arg("rho_down") = 0.93f,
              "Configure asymmetric persistence")
         
         .def("set_mim", &PySVPF::set_mim,
              py::arg("enabled"),
-             py::arg("jump_prob") = 0.05f,
-             py::arg("jump_scale") = 5.0f,
+             py::arg("jump_prob") = 0.25f,
+             py::arg("jump_scale") = 9.0f,
              "Configure Mixture Innovation Model (scout particles)")
         
         .def("set_svld", &PySVPF::set_svld,
              py::arg("enabled"),
-             py::arg("temperature") = 0.3f,
+             py::arg("temperature") = 0.45f,
              "Configure SVLD (Langevin noise)")
         
         .def("set_annealing", &PySVPF::set_annealing,
              py::arg("enabled"),
-             py::arg("n_steps") = 3,
+             py::arg("n_steps") = 5,
              "Configure annealed Stein updates")
         
         .def("set_newton", &PySVPF::set_newton,
@@ -513,6 +589,38 @@ PYBIND11_MODULE(pysvpf, m) {
              py::arg("mu"),
              py::arg("gamma"),
              "Update model parameters")
+        
+        // NEW: Additional config setters for full production config
+        .def("set_adaptive_beta", &PySVPF::set_adaptive_beta,
+             py::arg("enabled"),
+             "Enable/disable KSD-adaptive beta tempering")
+        
+        .def("set_full_newton", &PySVPF::set_full_newton,
+             py::arg("enabled"),
+             "Enable/disable full Newton-Stein (Hessian preconditioning)")
+        
+        .def("set_exact_gradient", &PySVPF::set_exact_gradient,
+             py::arg("enabled"),
+             "Enable/disable exact Student-t gradient")
+        
+        .def("set_stein_steps", &PySVPF::set_stein_steps,
+             py::arg("min_steps") = 8,
+             py::arg("max_steps") = 16,
+             py::arg("ksd_threshold") = 0.05f,
+             "Configure Stein iteration limits and KSD convergence threshold")
+        
+        .def("set_guided_innovation", &PySVPF::set_guided_innovation,
+             py::arg("alpha_base") = 0.0f,
+             py::arg("alpha_shock") = 0.40f,
+             py::arg("threshold") = 1.5f,
+             "Configure innovation-gated guided prediction")
+        
+        .def("set_rejuvenation", &PySVPF::set_rejuvenation,
+             py::arg("enabled"),
+             py::arg("ksd_threshold") = 0.05f,
+             py::arg("prob") = 0.30f,
+             py::arg("blend") = 0.30f,
+             "Configure partial rejuvenation (nudge stuck particles toward guide)")
         
         // Properties
         .def_property("nu", &PySVPF::get_nu, &PySVPF::set_nu,
