@@ -311,36 +311,18 @@ __global__ void compute_median_bandwidth(
     float* d_bandwidth,
     int n
 ) {
-    // Simple O(n^2) median computation (just for diagnostic, not production)
-    __shared__ float distances[256 * 256];  // Assuming n <= 256
-    
-    if (n > 256) {
-        if (threadIdx.x == 0) *d_bandwidth = 0.5f;
-        return;
-    }
-    
-    // Compute all pairwise distances
-    int idx = 0;
-    for (int i = 0; i < n; i++) {
-        for (int j = i + 1; j < n; j++) {
-            distances[idx++] = fabsf(h[i] - h[j]);
+    // Use global memory or smaller batches
+    if (threadIdx.x == 0) {
+        // Simple variance-based estimate instead of true median
+        float sum = 0, sum_sq = 0;
+        for (int i = 0; i < n; i++) {
+            sum += h[i];
+            sum_sq += h[i] * h[i];
         }
+        float mean = sum / n;
+        float var = sum_sq / n - mean * mean;
+        *d_bandwidth = sqrtf(var) * 1.06f * powf(n, -0.2f);  // Silverman
     }
-    int n_pairs = idx;
-    
-    // Bubble sort (terrible, but fine for small n in diagnostic)
-    for (int i = 0; i < n_pairs - 1; i++) {
-        for (int j = 0; j < n_pairs - i - 1; j++) {
-            if (distances[j] > distances[j + 1]) {
-                float tmp = distances[j];
-                distances[j] = distances[j + 1];
-                distances[j + 1] = tmp;
-            }
-        }
-    }
-    
-    // Median
-    *d_bandwidth = distances[n_pairs / 2];
 }
 
 void run_bandwidth_diagnostic_test() {

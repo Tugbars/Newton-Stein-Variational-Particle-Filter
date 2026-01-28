@@ -16,6 +16,7 @@ target_include_directories(svpf_scenarios
 target_link_libraries(svpf_scenarios
     PRIVATE
         svpf
+        svpf_tools 
         CUDA::cudart
         CUDA::curand
 )
@@ -38,6 +39,7 @@ target_include_directories(svpf_hcrbpf_dgp
 target_link_libraries(svpf_hcrbpf_dgp
     PRIVATE
         svpf
+        svpf_tools 
         CUDA::cudart
         CUDA::curand
 )
@@ -60,6 +62,7 @@ target_include_directories(svpf_gradient_dgp
 target_link_libraries(svpf_gradient_dgp
     PRIVATE
         svpf
+        svpf_tools 
         CUDA::cudart
         CUDA::curand
 )
@@ -82,6 +85,7 @@ target_include_directories(svpf_gradient_market
 target_link_libraries(svpf_gradient_market
     PRIVATE
         svpf
+        svpf_tools 
         CUDA::cudart
         CUDA::curand
 )
@@ -104,6 +108,7 @@ target_include_directories(svpf_gradient_sigma
 target_link_libraries(svpf_gradient_sigma
     PRIVATE
         svpf
+        svpf_tools 
         CUDA::cudart
         CUDA::curand
 )
@@ -161,6 +166,7 @@ target_include_directories(profile_svpf
 target_link_libraries(profile_svpf
     PRIVATE
         svpf
+        svpf_tools 
         CUDA::cudart
         CUDA::curand
 )
@@ -183,6 +189,7 @@ target_include_directories(run_svpf_tests
 target_link_libraries(run_svpf_tests
     PRIVATE
         svpf
+        svpf_tools   
         CUDA::cudart
         CUDA::curand
 )
@@ -211,6 +218,7 @@ target_include_directories(svpf_multiscale_test
 target_link_libraries(svpf_multiscale_test
     PRIVATE
         svpf
+        svpf_tools 
         CUDA::cudart
         CUDA::curand
 )

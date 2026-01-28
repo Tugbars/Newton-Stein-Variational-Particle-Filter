@@ -1,51 +1,55 @@
 # =============================================================================
-# SVPF Core Library
+# SVPF Tools Library
 # =============================================================================
 
-set(SVPF_CORE_SOURCES
-    svpf_optimized_graph.cu
-    svpf_opt_kernels.cu
-    svpf_diagnostics.cu
+set(SVPF_TOOLS_SOURCES
+    svpf_finite_diff.cu
+    svpf_gradient_diagnostic.cu
+    svpf_test_framework.cu
 )
 
 # =============================================================================
 # Static Library
 # =============================================================================
-add_library(svpf STATIC ${SVPF_CORE_SOURCES})
+add_library(svpf_tools STATIC ${SVPF_TOOLS_SOURCES})
 
-target_include_directories(svpf
+target_include_directories(svpf_tools
     PUBLIC
         ${CMAKE_SOURCE_DIR}/include
     PRIVATE
         ${CUDAToolkit_INCLUDE_DIRS}
 )
 
-target_link_libraries(svpf
+target_link_libraries(svpf_tools
     PUBLIC
+        svpf
         CUDA::cudart
         CUDA::curand
 )
 
-# CUDA properties
-set_target_properties(svpf PROPERTIES
+set_target_properties(svpf_tools PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
     POSITION_INDEPENDENT_CODE ON
 )
 
 # =============================================================================
-# Tools subdirectory
+# Standalone Diagnostic (has its own main)
 # =============================================================================
-add_subdirectory(tools)
+add_executable(bandwidth_diagnostic svpf_bandwidth_diagnostic.cu)
 
-# =============================================================================
-# Installation
-# =============================================================================
-install(TARGETS svpf
-    ARCHIVE DESTINATION lib
-    LIBRARY DESTINATION lib
+target_include_directories(bandwidth_diagnostic
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CUDAToolkit_INCLUDE_DIRS}
 )
 
-install(FILES ${CMAKE_SOURCE_DIR}/include/svpf.cuh
-    DESTINATION include
+target_link_libraries(bandwidth_diagnostic
+    PRIVATE
+        CUDA::cudart
+        CUDA::curand
+)
+
+set_target_properties(bandwidth_diagnostic PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
 )
