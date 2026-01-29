@@ -816,6 +816,10 @@ void svpf_step_graph(SVPFState* state, float y_t, float y_prev, const SVPFParams
     
     int total_steps = 0;
     
+    // =========================================================================
+    // STANDARD STEIN LOOP (per-iteration kernel launches)
+    // =========================================================================
+    
     for (int ai = 0; ai < n_anneal; ai++) {
         // Beta computation: adaptive (KSD-based) or fixed schedule
         float beta;

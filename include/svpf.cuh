@@ -223,6 +223,8 @@ typedef struct {
 
     float *d_ksd_partial; // Partial sums for KSD reduction [n floats]
     float *d_ksd;         // Final KSD value [1 float]
+
+    float* d_beta_schedule;    // [8] Beta schedule for persistent kernel
 } SVPFOptimizedState;
 
 /**
@@ -493,13 +495,19 @@ typedef struct {
     int use_student_t_state; // 0 = Gaussian, 1 = Student-t
     float nu_state;          // Degrees of freedom (recommended: 5-7)
 
-    int use_smoothing;                        // 0 = off, 1 = on
-int smooth_lag;                           // Window size (1-5 recommended)
-int smooth_output_lag;                    // Output delay: 0=raw, 1=h[t-1], etc.
-int smooth_head;                          // Circular buffer index
-float smooth_h_mean[SVPF_SMOOTH_MAX_LAG]; // Stored h estimates
-float smooth_h_var[SVPF_SMOOTH_MAX_LAG];  // Stored uncertainties
-float smooth_y[SVPF_SMOOTH_MAX_LAG];      // Stored observations
+    int use_smoothing;     // 0 = off, 1 = on
+    int smooth_lag;        // Window size (1-5 recommended)
+    int smooth_output_lag; // Output delay: 0=raw, 1=h[t-1], etc.
+    int smooth_head;       // Circular buffer index
+    float smooth_h_mean[SVPF_SMOOTH_MAX_LAG]; // Stored h estimates
+    float smooth_h_var[SVPF_SMOOTH_MAX_LAG];  // Stored uncertainties
+    float smooth_y[SVPF_SMOOTH_MAX_LAG];      // Stored observations
+
+    // === Persistent Kernel Mode ===
+    int use_persistent_kernel;       // 0 = standard, 1 = persistent
+    int persistent_kernel_supported; // Set at creation
+
+
 
 } SVPFState;
 

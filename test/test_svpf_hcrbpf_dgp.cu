@@ -603,6 +603,8 @@ static Metrics run_svpf_on_scenario(
         filter->use_smoothing = 1;
         filter->smooth_lag = 3;        // Buffer last 3 estimates
         filter->smooth_output_lag = 1; // Output h[t-1] (smoothed by y[t])
+
+        filter->use_persistent_kernel = 1;
     } else {
         filter->use_svld = 0;
         filter->use_annealing = 0;

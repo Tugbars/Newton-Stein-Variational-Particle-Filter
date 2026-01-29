@@ -262,3 +262,25 @@ set_tests_properties(StudentTABTest PROPERTIES
     TIMEOUT 600
     LABELS "student-t;state-dynamics;ab-test"
 )
+
+# Fully Fused Kernel
+add_executable(test_fully_fused_v2
+    test_fully_fused_v2.cu
+)
+
+target_include_directories(test_fully_fused_v2
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CUDAToolkit_INCLUDE_DIRS}
+)
+
+target_link_libraries(test_fully_fused_v2
+    PRIVATE
+        svpf
+        CUDA::cudart
+        CUDA::curand
+)
+
+set_target_properties(test_fully_fused_v2 PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+)
