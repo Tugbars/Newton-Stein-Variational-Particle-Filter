@@ -431,13 +431,13 @@ static void configure_svpf(SVPFState* filter, int use_student_t_state) {
     // SVLD + Annealing
     filter->use_svld = 1;
     filter->use_annealing = 1;
-    filter->n_anneal_steps = 5;
+    filter->n_anneal_steps = 3;
     filter->temperature = 0.45f;
     filter->rmsprop_rho = 0.9f;
     filter->rmsprop_eps = 1e-6f;
     
     // MIM
-    filter->use_mim = 1;
+    filter->use_mim = 0;
     filter->mim_jump_prob = 0.25f;
     filter->mim_jump_scale = 9.0f;
     filter->use_adaptive_beta = 1;
@@ -461,17 +461,17 @@ static void configure_svpf(SVPFState* filter, int use_student_t_state) {
     // EKF Guide
     filter->use_guide = 1;
     filter->use_guide_preserving = 1;
-    filter->guide_strength = 0.05f;
+    filter->guide_strength = 0.08f;
     
     // Adaptive mu
     filter->use_adaptive_mu = 1;
-    filter->mu_process_var = 0.001f;
-    filter->mu_obs_var_scale = 11.0f;
-    filter->mu_min = -4.0f;
-    filter->mu_max = -1.0f;
+    filter->mu_process_var = 0.005f;
+    filter->mu_obs_var_scale = 12.0f;
+    filter->mu_min = -3.0f;
+    filter->mu_max =  3.0f;
     
     // Adaptive guide
-    filter->use_adaptive_guide = 1;
+    filter->use_adaptive_guide = 0;
     filter->guide_strength_base = 0.05f;
     filter->guide_strength_max = 0.30f;
     filter->guide_innovation_threshold = 1.0f;
@@ -483,7 +483,7 @@ static void configure_svpf(SVPFState* filter, int use_student_t_state) {
     
     // Exact gradient
     filter->use_exact_gradient = 1;
-    filter->lik_offset = 0.345f;
+    filter->lik_offset = 0.35f;
     
     // KSD-adaptive Stein steps
     filter->stein_min_steps = 8;
@@ -492,7 +492,7 @@ static void configure_svpf(SVPFState* filter, int use_student_t_state) {
     
     // ===== THE A/B VARIABLE =====
     filter->use_student_t_state = use_student_t_state;
-    filter->nu_state = 8.0f;  // Your setting
+    filter->nu_state = 25.0f;  // Your setting
 }
 
 /*═══════════════════════════════════════════════════════════════════════════

@@ -592,12 +592,17 @@ static Metrics run_svpf_on_scenario(
         // Replaces fixed n_stein_steps with convergence-based early stopping
         // KSD (Kernel Stein Discrepancy) computed in same O(N²) pass - zero extra cost
         filter->stein_min_steps = 8;              // Always run at least 4 (RMSProp warmup)
-        filter->stein_max_steps = 16;             // Cap at 12 (crisis budget)
+        filter->stein_max_steps = 12;             // Cap at 12 (crisis budget)
         filter->ksd_improvement_threshold = 0.05; // Stop if <5% relative improvement
 
         // Enable Student-t state dynamics
-        filter->use_student_t_state = 1;
+        filter->use_student_t_state = 0;
         filter->nu_state = 30.0f; // 5-7 recommended, lower = fatter tails
+
+        // Enable smoothing with 1-tick output lag
+        filter->use_smoothing = 1;
+        filter->smooth_lag = 3;        // Buffer last 3 estimates
+        filter->smooth_output_lag = 1; // Output h[t-1] (smoothed by y[t])
     } else {
         filter->use_svld = 0;
         filter->use_annealing = 0;
@@ -702,7 +707,7 @@ int main(int argc, char** argv) {
     int n_ticks = 5000;
     int n_particles = 512;
     int n_stein = 8;
-    float nu = 30.0f;
+    float nu = 50.0f;
     int use_adaptive = 1;
     
     /* Parse args */

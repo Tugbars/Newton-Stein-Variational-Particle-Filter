@@ -27,6 +27,11 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+// Maximum smoothing window size
+#ifndef SVPF_SMOOTH_MAX_LAG
+#define SVPF_SMOOTH_MAX_LAG 8
+#endif
+
 // =============================================================================
 // BASIC UTILITY KERNELS
 // =============================================================================
@@ -210,6 +215,18 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     state->ksd_improvement_threshold = 0.05f; // Stop if relative improvement < 5%
     state->ksd_prev = 1e10f;                 // Initialize high
     state->stein_steps_used = n_stein_steps; // Diagnostic
+    
+    // === Backward Smoothing (Fan et al. 2021 sliding window, lightweight) ===
+    // Applies RTS-style correction to past estimates using recent observations
+    state->use_smoothing = 0;                // OFF by default
+    state->smooth_lag = 3;                   // Window size (1-5 recommended)
+    state->smooth_output_lag = 1;            // Output h[t-1] instead of h[t]
+    for (int i = 0; i < SVPF_SMOOTH_MAX_LAG; i++) {
+        state->smooth_h_mean[i] = 0.0f;
+        state->smooth_h_var[i] = 1.0f;
+        state->smooth_y[i] = 0.0f;
+    }
+    state->smooth_head = 0;
     
     // Device scalars
     cudaMalloc(&state->d_scalar_max, sizeof(float));
@@ -494,6 +511,101 @@ static void svpf_adaptive_mu_update(
     
     state->mu_state = mu_new;
     state->mu_var = P_new;
+}
+
+// =============================================================================
+// BACKWARD SMOOTHING: Lightweight RTS-style correction
+// =============================================================================
+// 
+// Implements a simplified Rauch-Tung-Striebel smoother on stored summary stats.
+// After each forward filter step, we:
+// 1. Store h_mean, h_var, y in circular buffer
+// 2. Run backward pass to refine past estimates using "future" observations
+// 3. Output lagged smoothed estimate instead of raw filtered estimate
+// 
+// This is NOT true joint inference over trajectories (like full sliding window),
+// but captures most of the benefit at minimal cost (O(k) scalar ops per step).
+// =============================================================================
+
+static void svpf_smooth_backward(
+    SVPFState* state,
+    float h_mean_new,
+    float h_var_new,
+    float y_t,
+    const SVPFParams* params
+) {
+    if (!state->use_smoothing) return;
+    
+    int k = state->smooth_lag;
+    if (k > SVPF_SMOOTH_MAX_LAG) k = SVPF_SMOOTH_MAX_LAG;
+    if (k < 1) k = 1;
+    
+    // Store current estimate in buffer
+    int head = state->smooth_head;
+    state->smooth_h_mean[head] = h_mean_new;
+    state->smooth_h_var[head] = h_var_new;
+    state->smooth_y[head] = y_t;
+    
+    // Advance head (circular)
+    state->smooth_head = (head + 1) % k;
+    
+    // Skip backward pass until buffer is full
+    if (state->timestep < k) return;
+    
+    // Get AR(1) parameters
+    float rho = params->rho;
+    float mu = state->use_adaptive_mu ? state->mu_state : params->mu;
+    float sigma_z_sq = params->sigma_z * params->sigma_z;
+    
+    // Backward pass: newest to oldest
+    // At index idx_next is the "future" estimate, at idx_curr is current
+    // We correct idx_curr using information from idx_next
+    for (int lag = 1; lag < k; lag++) {
+        int idx_curr = (state->smooth_head - lag - 1 + k) % k;
+        int idx_next = (state->smooth_head - lag + k) % k;
+        
+        float h_curr = state->smooth_h_mean[idx_curr];
+        float h_next = state->smooth_h_mean[idx_next];
+        float var_curr = state->smooth_h_var[idx_curr];
+        
+        // What did h_curr predict for h_next?
+        float h_pred = mu + rho * (h_curr - mu);
+        
+        // Prediction variance
+        float pred_var = rho * rho * var_curr + sigma_z_sq;
+        
+        // Innovation: how far was the prediction off?
+        float innovation = h_next - h_pred;
+        
+        // Backward (RTS) gain: how much should past estimate adjust?
+        float J = rho * var_curr / (pred_var + 1e-8f);
+        
+        // Correct past estimate
+        state->smooth_h_mean[idx_curr] = h_curr + J * innovation;
+        
+        // Reduce uncertainty (we've learned from future)
+        state->smooth_h_var[idx_curr] = var_curr * (1.0f - J * rho);
+    }
+}
+
+// Get smoothed output (with configured lag)
+static float svpf_get_smoothed_output(SVPFState* state, float h_mean_raw) {
+    if (!state->use_smoothing) return h_mean_raw;
+    
+    int k = state->smooth_lag;
+    if (k > SVPF_SMOOTH_MAX_LAG) k = SVPF_SMOOTH_MAX_LAG;
+    
+    // If not enough history yet, return raw
+    if (state->timestep < k) return h_mean_raw;
+    
+    int output_lag = state->smooth_output_lag;
+    if (output_lag <= 0) return h_mean_raw;  // No lag = raw output
+    if (output_lag >= k) output_lag = k - 1;  // Cap at buffer size
+    
+    // Get lagged smoothed estimate
+    // output_lag=1 means output h[t-1] which has seen y[t]
+    int idx = (state->smooth_head - output_lag - 1 + k) % k;
+    return state->smooth_h_mean[idx];
 }
 
 // =============================================================================
@@ -838,14 +950,25 @@ void svpf_step_graph(SVPFState* state, float y_t, float y_prev, const SVPFParams
     
     cudaStreamSynchronize(cs);
     
-    if (h_loglik_out) *h_loglik_out = results[0];
-    if (h_vol_out) *h_vol_out = results[1];
-    if (h_mean_out) *h_mean_out = results[2];
-    
     float h_mean_local = results[2];
     float bandwidth_local = results[3];
     float vol_local = results[1];
     float ksd_local = results[4];
+    
+    // =========================================================================
+    // BACKWARD SMOOTHING (Optional)
+    // =========================================================================
+    // Estimate variance from bandwidth (heuristic: var ≈ bw²)
+    float h_var_est = bandwidth_local * bandwidth_local;
+    svpf_smooth_backward(state, h_mean_local, h_var_est, y_t, params);
+    
+    // Get smoothed output (if smoothing enabled and output_lag > 0)
+    float h_mean_output = svpf_get_smoothed_output(state, h_mean_local);
+    
+    // Return outputs
+    if (h_loglik_out) *h_loglik_out = results[0];
+    if (h_vol_out) *h_vol_out = vol_local;
+    if (h_mean_out) *h_mean_out = h_mean_output;  // Smoothed if enabled
     
     state->vol_prev = vol_local;
     state->ksd_prev = ksd_local;  // For next timestep's step budget

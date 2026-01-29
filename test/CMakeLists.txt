@@ -232,3 +232,33 @@ set_tests_properties(MultiscaleABTest PROPERTIES
     TIMEOUT 1200
     LABELS "multiscale;comparison;ab-test"
 )
+
+# -----------------------------------------------------------------------------
+# Student-t State Dynamics A/B Test (Gaussian vs Student-t AR(1))
+# Tests robustness when DGP has fat-tailed innovations
+# -----------------------------------------------------------------------------
+add_executable(svpf_student_t_test svpf_student_t_test.cu)
+
+target_include_directories(svpf_student_t_test
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CUDAToolkit_INCLUDE_DIRS}
+)
+
+target_link_libraries(svpf_student_t_test
+    PRIVATE
+        svpf
+        svpf_tools 
+        CUDA::cudart
+        CUDA::curand
+)
+
+set_target_properties(svpf_student_t_test PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+)
+
+add_test(NAME StudentTABTest COMMAND svpf_student_t_test)
+set_tests_properties(StudentTABTest PROPERTIES
+    TIMEOUT 600
+    LABELS "student-t;state-dynamics;ab-test"
+)
