@@ -995,6 +995,114 @@ __global__ void svpf_fused_stein_transport_full_newton_kernel(
 }
 
 // =============================================================================
+// FUSED: Stein + Transport (Full Newton with KSD)
+// =============================================================================
+// Same as full_newton but also computes KSD for adaptive stepping
+
+__global__ void svpf_fused_stein_transport_full_newton_ksd_kernel(
+    float* __restrict__ h,
+    const float* __restrict__ grad,
+    const float* __restrict__ local_hessian,
+    float* __restrict__ v_rmsprop,
+    curandStatePhilox4_32_10_t* __restrict__ rng,
+    const float* __restrict__ d_bandwidth,
+    float* __restrict__ d_ksd_partial,
+    float step_size,
+    float beta_factor,
+    float temperature,
+    float rho_rmsprop,
+    float epsilon,
+    int stein_sign_mode,  // 0=legacy(subtract), 1=paper(add)
+    int n
+) {
+    extern __shared__ float smem[];
+    float* sh_h = smem;
+    float* sh_grad = smem + n;
+    float* sh_hess = smem + 2 * n;
+    
+    for (int k = threadIdx.x; k < n; k += blockDim.x) {
+        sh_h[k] = h[k];
+        sh_grad[k] = grad[k];
+        sh_hess[k] = local_hessian[k];
+    }
+    __syncthreads();
+    
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    
+    float h_i = sh_h[i];
+    float s_i = sh_grad[i];  // Raw score for KSD
+    float global_bw = *d_bandwidth;
+    float bw_sq = global_bw * global_bw;
+    float inv_bw_sq = 1.0f / bw_sq;
+    float inv_n = 1.0f / (float)n;
+    
+    // Sign multiplier: -1 for legacy (attraction), +1 for paper (repulsion)
+    float sign_mult = (stein_sign_mode == 1) ? 1.0f : -1.0f;
+    
+    float H_weighted = 0.0f;
+    float K_sum_norm = 0.0f;
+    float k_grad_sum = 0.0f;
+    float gk_sum = 0.0f;
+    float ksd_sum = 0.0f;
+    
+    #pragma unroll 4
+    for (int j = 0; j < n; j++) {
+        float h_j = sh_h[j];
+        float s_j = sh_grad[j];
+        float diff = h_i - h_j;
+        float diff_sq = diff * diff;
+        float dist_sq = diff_sq * inv_bw_sq;
+        
+        float base = 1.0f + dist_sq;
+        float K = 1.0f / base;
+        float K_sq = K * K;
+        
+        // ----- Full Newton: Hessian weighting -----
+        H_weighted += sh_hess[j] * K;
+        float Nk = 2.0f * inv_bw_sq * K_sq * fabsf(3.0f * dist_sq - 1.0f);
+        H_weighted += Nk;
+        K_sum_norm += K;
+        
+        k_grad_sum += K * s_j;
+        gk_sum += sign_mult * 2.0f * diff * inv_bw_sq * K_sq;
+        
+        // ----- KSD Stein kernel (uses raw gradients) -----
+        float grad_x_k = -2.0f * diff * inv_bw_sq * K_sq;
+        float grad_y_k = -grad_x_k;
+        float hess_xy_k = 2.0f * inv_bw_sq * K_sq * (4.0f * dist_sq * K - 1.0f);
+        float u_ij = K * s_i * s_j + s_i * grad_y_k + s_j * grad_x_k + hess_xy_k;
+        ksd_sum += u_ij;
+    }
+    
+    // Store partial KSD sum
+    d_ksd_partial[i] = ksd_sum;
+    
+    // Full Newton preconditioning
+    H_weighted = H_weighted / fmaxf(K_sum_norm, 1e-6f);
+    H_weighted = fminf(fmaxf(H_weighted, 0.1f), 100.0f);
+    float inv_H_i = 1.0f / H_weighted;
+    
+    float phi_i = (k_grad_sum + gk_sum) * inv_n * inv_H_i * 0.7f;
+    
+    float v_prev = v_rmsprop[i];
+    float v_new = rho_rmsprop * v_prev + (1.0f - rho_rmsprop) * phi_i * phi_i;
+    v_rmsprop[i] = v_new;
+    
+    float effective_step = step_size * beta_factor;
+    float precond = rsqrtf(v_new + epsilon);
+    float drift = effective_step * phi_i * precond;
+    
+    float diffusion = 0.0f;
+    if (temperature > 1e-6f) {
+        float noise = curand_normal(&rng[i]);
+        diffusion = sqrtf(2.0f * effective_step * temperature) * noise;
+    }
+    
+    h[i] = clamp_logvol(h_i + drift + diffusion);
+}
+
+// =============================================================================
 // FUSED: Outputs
 // =============================================================================
 

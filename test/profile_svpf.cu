@@ -6,11 +6,13 @@
  *   - Total step latency (P50, P99, max)
  *   - Kernel breakdown (predict, gradient, transport, etc.)
  *   - Memory operations
- *   - Graph replay vs non-graph overhead
+ *   - KSD-adaptive step statistics
+ *   - Multi-instrument scaling
+ *   - Accuracy vs Latency Pareto curve
  * 
  * Usage:
  *   ./profile_svpf [n_particles] [n_steps] [warmup]
- *   ./profile_svpf 4096 10000 100
+ *   ./profile_svpf 512 5000 100
  */
 
 #include "svpf.cuh"
@@ -530,6 +532,434 @@ static void profile_memory_estimate(int n_particles) {
 }
 
 // =============================================================================
+// Profile: KSD-Adaptive Stein Steps Diagnostics
+// =============================================================================
+
+static void profile_ksd_adaptive_stats(int n_particles, int n_steps, int warmup) {
+    printf("\n");
+    printf("═══════════════════════════════════════════════════════════════════\n");
+    printf(" Profile: KSD-Adaptive Stein Steps (N=%d)\n", n_particles);
+    printf("═══════════════════════════════════════════════════════════════════\n");
+    
+    // Generate test data with varying volatility to trigger different step counts
+    int total_steps = warmup + n_steps;
+    float* returns = (float*)malloc(total_steps * sizeof(float));
+    
+    // Generate with regime changes to stress test adaptive stepping
+    srand(54321);
+    float h = -4.5f;
+    float rho = 0.98f;
+    float sigma = 0.15f;
+    float mu = -4.5f;
+    
+    for (int t = 0; t < total_steps; t++) {
+        // Inject volatility spikes every 500 steps
+        if (t % 500 == 250) {
+            h += 2.0f;  // Sudden spike
+        }
+        
+        float u1 = (rand() + 1.0f) / (RAND_MAX + 2.0f);
+        float u2 = (rand() + 1.0f) / (RAND_MAX + 2.0f);
+        float z1 = sqrtf(-2.0f * logf(u1)) * cosf(2.0f * 3.14159f * u2);
+        float z2 = sqrtf(-2.0f * logf(u1)) * sinf(2.0f * 3.14159f * u2);
+        
+        h = mu + rho * (h - mu) + sigma * z1;
+        if (h < -10.0f) h = -10.0f;
+        if (h > 2.0f) h = 2.0f;
+        
+        float vol = expf(h / 2.0f);
+        returns[t] = vol * z2;
+    }
+    
+    // Create filter with KSD-adaptive enabled
+    SVPFState* state = svpf_create(n_particles, 12, 5.0f, nullptr);
+    SVPFParams params = {0.98f, 0.15f, -4.5f, 0.0f};
+    
+    // Enable adaptive features
+    state->use_svld = 1;
+    state->use_annealing = 1;
+    state->use_mim = 1;
+    state->mim_jump_prob = 0.15f;
+    state->mim_jump_scale = 6.0f;
+    state->use_newton = 1;
+    state->use_full_newton = 1;
+    state->use_guided = 1;
+    state->use_guide = 1;
+    state->stein_min_steps = 4;
+    state->stein_max_steps = 16;
+    state->ksd_improvement_threshold = 0.05f;
+    
+    svpf_initialize(state, &params, 12345);
+    
+    // Collect step counts
+    std::vector<int> step_counts;
+    std::vector<float> ksd_values;
+    step_counts.reserve(n_steps);
+    ksd_values.reserve(n_steps);
+    
+    float y_prev = 0.0f;
+    
+    // Warmup
+    for (int t = 0; t < warmup; t++) {
+        float loglik, vol, h_mean;
+        svpf_step_graph(state, returns[t], y_prev, &params, &loglik, &vol, &h_mean);
+        y_prev = returns[t];
+    }
+    
+    // Collect stats
+    for (int t = warmup; t < total_steps; t++) {
+        float loglik, vol, h_mean;
+        svpf_step_graph(state, returns[t], y_prev, &params, &loglik, &vol, &h_mean);
+        
+        step_counts.push_back(state->stein_steps_used);
+        ksd_values.push_back(state->ksd_prev);
+        
+        y_prev = returns[t];
+    }
+    
+    // Compute histogram of step counts
+    int histogram[32] = {0};
+    int min_steps = 100, max_steps = 0;
+    double sum_steps = 0;
+    
+    for (int s : step_counts) {
+        if (s < 32) histogram[s]++;
+        if (s < min_steps) min_steps = s;
+        if (s > max_steps) max_steps = s;
+        sum_steps += s;
+    }
+    
+    float mean_steps = (float)(sum_steps / step_counts.size());
+    
+    // Compute KSD stats
+    std::sort(ksd_values.begin(), ksd_values.end());
+    float ksd_min = ksd_values[0];
+    float ksd_max = ksd_values[ksd_values.size() - 1];
+    float ksd_median = ksd_values[ksd_values.size() / 2];
+    float ksd_p99 = ksd_values[(int)(ksd_values.size() * 0.99)];
+    
+    printf("\n  Stein Steps Distribution:\n");
+    printf("    Min: %d, Max: %d, Mean: %.1f\n\n", min_steps, max_steps, mean_steps);
+    
+    printf("  Steps | Count | Histogram\n");
+    printf("  ------+-------+--------------------------------------------------\n");
+    
+    int max_count = 0;
+    for (int i = min_steps; i <= max_steps; i++) {
+        if (histogram[i] > max_count) max_count = histogram[i];
+    }
+    
+    for (int i = min_steps; i <= max_steps; i++) {
+        if (histogram[i] > 0) {
+            int bar_len = (histogram[i] * 40) / max_count;
+            printf("  %5d | %5d | ", i, histogram[i]);
+            for (int b = 0; b < bar_len; b++) printf("█");
+            printf("\n");
+        }
+    }
+    
+    printf("\n  KSD Statistics:\n");
+    printf("    Min: %.4f, Median: %.4f, P99: %.4f, Max: %.4f\n", 
+           ksd_min, ksd_median, ksd_p99, ksd_max);
+    
+    // Interpretation
+    printf("\n  Interpretation:\n");
+    if (mean_steps < (state->stein_min_steps + state->stein_max_steps) / 2.0f) {
+        printf("    → Filter converges quickly (good particle coverage)\n");
+    } else {
+        printf("    → Filter needs more iterations (consider more particles)\n");
+    }
+    
+    if (max_steps == state->stein_max_steps) {
+        int at_max = histogram[max_steps];
+        float pct = 100.0f * at_max / n_steps;
+        printf("    → Hit max steps %d times (%.1f%%) - might need higher max\n", at_max, pct);
+    }
+    
+    svpf_destroy(state);
+    free(returns);
+}
+
+// =============================================================================
+// Profile: Multi-Instrument Parallel Execution
+// =============================================================================
+
+static void profile_multi_instrument(int max_filters, int n_particles, int n_steps, int warmup) {
+    printf("\n");
+    printf("═══════════════════════════════════════════════════════════════════\n");
+    printf(" Profile: Multi-Instrument Scaling (N=%d per filter)\n", n_particles);
+    printf("═══════════════════════════════════════════════════════════════════\n");
+    
+    int total_steps = warmup + n_steps;
+    
+    // Generate different data for each instrument
+    std::vector<float*> returns_all;
+    for (int f = 0; f < max_filters; f++) {
+        float* returns = (float*)malloc(total_steps * sizeof(float));
+        generate_sv_returns(returns, total_steps, -4.5f + 0.1f * f, 0.98f, 0.10f, 12345 + f * 1000);
+        returns_all.push_back(returns);
+    }
+    
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    
+    printf("\n");
+    printf("  Filters | Total μs |  Per-Filter | Throughput |  Scaling\n");
+    printf("  --------+----------+-------------+------------+----------\n");
+    
+    float baseline_per_filter = 0.0f;
+    
+    int filter_counts[] = {1, 2, 4, 8, 12, 16, 20, 24};
+    int n_counts = sizeof(filter_counts) / sizeof(filter_counts[0]);
+    
+    for (int c = 0; c < n_counts; c++) {
+        int n_filters = filter_counts[c];
+        if (n_filters > max_filters) break;
+        
+        // Create all filters
+        std::vector<SVPFState*> filters;
+        SVPFParams params = {0.98f, 0.10f, -4.5f, 0.0f};
+        
+        for (int f = 0; f < n_filters; f++) {
+            SVPFState* state = svpf_create(n_particles, 8, 5.0f, nullptr);
+            svpf_initialize(state, &params, 12345 + f);
+            filters.push_back(state);
+        }
+        
+        // Track y_prev for each filter
+        std::vector<float> y_prevs(n_filters, 0.0f);
+        
+        // Warmup all filters
+        for (int t = 0; t < warmup; t++) {
+            for (int f = 0; f < n_filters; f++) {
+                float loglik, vol, h_mean;
+                svpf_step_graph(filters[f], returns_all[f][t], y_prevs[f], &params, 
+                               &loglik, &vol, &h_mean);
+                y_prevs[f] = returns_all[f][t];
+            }
+        }
+        cudaDeviceSynchronize();
+        
+        // Time all filters together
+        std::vector<float> times;
+        times.reserve(n_steps);
+        
+        for (int t = warmup; t < total_steps; t++) {
+            cudaEventRecord(start);
+            
+            // Run all filters for this timestep
+            for (int f = 0; f < n_filters; f++) {
+                float loglik, vol, h_mean;
+                svpf_step_graph(filters[f], returns_all[f][t], y_prevs[f], &params,
+                               &loglik, &vol, &h_mean);
+                y_prevs[f] = returns_all[f][t];
+            }
+            
+            cudaEventRecord(stop);
+            cudaEventSynchronize(stop);
+            
+            float ms;
+            cudaEventElapsedTime(&ms, start, stop);
+            times.push_back(ms * 1000.0f);
+        }
+        
+        TimingStats s = compute_stats(times);
+        float per_filter = s.mean_us / n_filters;
+        float throughput = n_filters * 1e6f / s.mean_us;
+        
+        if (n_filters == 1) baseline_per_filter = per_filter;
+        float scaling = baseline_per_filter / per_filter;
+        
+        printf("  %7d | %7.1f μs | %8.1f μs | %7.0f/s | %6.2fx\n",
+               n_filters, s.mean_us, per_filter, throughput, scaling);
+        
+        // Cleanup
+        for (SVPFState* state : filters) {
+            svpf_destroy(state);
+        }
+    }
+    
+    printf("\n  Scaling > 1.0x means GPU parallelism is utilized\n");
+    printf("  Scaling ≈ 1.0x means filters run sequentially\n");
+    
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    
+    for (float* r : returns_all) free(r);
+}
+
+// =============================================================================
+// Profile: Accuracy vs Latency Pareto Curve
+// =============================================================================
+
+struct ParetoResult {
+    int particles;
+    int stein;
+    float latency;
+    float rmse;
+};
+
+static void profile_accuracy_latency_tradeoff(int n_steps, int warmup) {
+    printf("\n");
+    printf("═══════════════════════════════════════════════════════════════════\n");
+    printf(" Profile: Accuracy vs Latency Pareto Curve\n");
+    printf("═══════════════════════════════════════════════════════════════════\n");
+    
+    // Generate ground truth data
+    int total_steps = warmup + n_steps;
+    float* returns = (float*)malloc(total_steps * sizeof(float));
+    float* true_h = (float*)malloc(total_steps * sizeof(float));
+    
+    srand(99999);
+    float h = -4.5f;
+    float rho = 0.98f;
+    float sigma = 0.12f;
+    float mu = -4.5f;
+    
+    for (int t = 0; t < total_steps; t++) {
+        float u1 = (rand() + 1.0f) / (RAND_MAX + 2.0f);
+        float u2 = (rand() + 1.0f) / (RAND_MAX + 2.0f);
+        float z1 = sqrtf(-2.0f * logf(u1)) * cosf(2.0f * 3.14159f * u2);
+        float z2 = sqrtf(-2.0f * logf(u1)) * sinf(2.0f * 3.14159f * u2);
+        
+        h = mu + rho * (h - mu) + sigma * z1;
+        if (h < -10.0f) h = -10.0f;
+        if (h > 2.0f) h = 2.0f;
+        
+        true_h[t] = h;
+        float vol = expf(h / 2.0f);
+        returns[t] = vol * z2;
+    }
+    
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    
+    // Grid of configurations
+    int particle_counts[] = {128, 256, 384, 512, 768, 1024};
+    int stein_counts[] = {2, 4, 6, 8, 12, 16};
+    int n_particles_opts = sizeof(particle_counts) / sizeof(particle_counts[0]);
+    int n_stein_opts = sizeof(stein_counts) / sizeof(stein_counts[0]);
+    
+    printf("\n  Testing %d × %d = %d configurations...\n\n", 
+           n_particles_opts, n_stein_opts, n_particles_opts * n_stein_opts);
+    
+    // Store results for Pareto analysis
+    std::vector<ParetoResult> results;
+    
+    for (int pi = 0; pi < n_particles_opts; pi++) {
+        for (int si = 0; si < n_stein_opts; si++) {
+            int n_particles = particle_counts[pi];
+            int n_stein = stein_counts[si];
+            
+            SVPFState* state = svpf_create(n_particles, n_stein, 5.0f, nullptr);
+            SVPFParams params = {rho, sigma, mu, 0.0f};
+            
+            // Enable standard features
+            state->use_svld = 1;
+            state->use_annealing = 1;
+            state->use_mim = 1;
+            state->use_newton = 1;
+            
+            svpf_initialize(state, &params, 12345);
+            
+            std::vector<float> times;
+            std::vector<float> estimates;
+            times.reserve(n_steps);
+            estimates.reserve(n_steps);
+            
+            float y_prev = 0.0f;
+            
+            // Warmup
+            for (int t = 0; t < warmup; t++) {
+                float loglik, vol, h_mean;
+                svpf_step_graph(state, returns[t], y_prev, &params, &loglik, &vol, &h_mean);
+                y_prev = returns[t];
+            }
+            cudaDeviceSynchronize();
+            
+            // Profile
+            for (int t = warmup; t < total_steps; t++) {
+                cudaEventRecord(start);
+                
+                float loglik, vol, h_mean;
+                svpf_step_graph(state, returns[t], y_prev, &params, &loglik, &vol, &h_mean);
+                
+                cudaEventRecord(stop);
+                cudaEventSynchronize(stop);
+                
+                float ms;
+                cudaEventElapsedTime(&ms, start, stop);
+                times.push_back(ms * 1000.0f);
+                estimates.push_back(h_mean);
+                
+                y_prev = returns[t];
+            }
+            
+            // Compute accuracy
+            double sum_sq = 0.0;
+            for (int i = 0; i < n_steps; i++) {
+                float err = estimates[i] - true_h[warmup + i];
+                sum_sq += err * err;
+            }
+            float rmse = sqrtf((float)(sum_sq / n_steps));
+            
+            TimingStats s = compute_stats(times);
+            
+            results.push_back({n_particles, n_stein, s.mean_us, rmse});
+            
+            svpf_destroy(state);
+        }
+    }
+    
+    // Identify Pareto frontier
+    // A point is Pareto-optimal if no other point is better in BOTH latency and RMSE
+    std::vector<bool> is_pareto(results.size(), true);
+    for (size_t i = 0; i < results.size(); i++) {
+        for (size_t j = 0; j < results.size(); j++) {
+            if (i == j) continue;
+            // j dominates i if j is better in both dimensions
+            if (results[j].latency <= results[i].latency && 
+                results[j].rmse <= results[i].rmse &&
+                (results[j].latency < results[i].latency || results[j].rmse < results[i].rmse)) {
+                is_pareto[i] = false;
+                break;
+            }
+        }
+    }
+    
+    // Print results
+    printf("  Particles | Stein |  Latency  |   RMSE   | Pareto?\n");
+    printf("  ----------+-------+-----------+----------+--------\n");
+    
+    for (size_t i = 0; i < results.size(); i++) {
+        const ParetoResult& r = results[i];
+        printf("  %9d | %5d | %7.1f μs | %7.4f  | %s\n",
+               r.particles, r.stein, r.latency, r.rmse,
+               is_pareto[i] ? "  ★" : "");
+    }
+    
+    printf("\n  ★ = Pareto optimal (no config is better in both latency AND accuracy)\n");
+    
+    // Print Pareto frontier summary
+    printf("\n  Pareto Frontier:\n");
+    printf("  ────────────────\n");
+    for (size_t i = 0; i < results.size(); i++) {
+        if (is_pareto[i]) {
+            const ParetoResult& r = results[i];
+            printf("    N=%4d, Stein=%2d → %6.1f μs, RMSE=%.4f\n",
+                   r.particles, r.stein, r.latency, r.rmse);
+        }
+    }
+    
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    free(returns);
+    free(true_h);
+}
+
+// =============================================================================
 // Main
 // =============================================================================
 
@@ -563,6 +993,11 @@ int main(int argc, char** argv) {
     profile_stein_scaling(n_particles, n_steps, warmup);
     profile_overhead_breakdown(n_particles, n_steps);
     profile_memory_estimate(n_particles);
+    
+    // New profiles
+    profile_ksd_adaptive_stats(n_particles, n_steps, warmup);
+    profile_multi_instrument(24, n_particles, n_steps, warmup);
+    profile_accuracy_latency_tradeoff(n_steps, warmup);
     
     printf("\n═══════════════════════════════════════════════════════════════════\n");
     printf(" Done. For kernel-level analysis, use:\n");

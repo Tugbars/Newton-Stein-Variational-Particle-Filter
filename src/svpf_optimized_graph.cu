@@ -857,14 +857,27 @@ void svpf_step_graph(SVPFState* state, float y_t, float y_prev, const SVPFParams
             if (is_last_iteration) {
                 // Final iteration: compute KSD for next timestep's budget
                 if (state->use_newton) {
-                    svpf_fused_stein_transport_newton_ksd_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
-                        state->h, opt->d_precond_grad, opt->d_inv_hessian,
-                        state->d_grad_v, state->rng_states, opt->d_bandwidth,
-                        opt->d_ksd_partial,
-                        base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps,
-                        state->stein_repulsive_sign, n
-                    );
+                    if (state->use_full_newton) {
+                        // Full Newton with KSD
+                        svpf_fused_stein_transport_full_newton_ksd_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
+                            state->h, state->grad_log_p, opt->d_inv_hessian,
+                            state->d_grad_v, state->rng_states, opt->d_bandwidth,
+                            opt->d_ksd_partial,
+                            base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps,
+                            state->stein_repulsive_sign, n
+                        );
+                    } else {
+                        // Regular Newton with KSD (uses preconditioned gradient)
+                        svpf_fused_stein_transport_newton_ksd_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
+                            state->h, opt->d_precond_grad, opt->d_inv_hessian,
+                            state->d_grad_v, state->rng_states, opt->d_bandwidth,
+                            opt->d_ksd_partial,
+                            base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps,
+                            state->stein_repulsive_sign, n
+                        );
+                    }
                 } else {
+                    // No Newton with KSD
                     svpf_fused_stein_transport_ksd_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
                         state->h, state->grad_log_p, state->d_grad_v,
                         state->rng_states, opt->d_bandwidth,

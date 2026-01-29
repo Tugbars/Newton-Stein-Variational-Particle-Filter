@@ -367,6 +367,21 @@ __global__ void svpf_fused_stein_transport_full_newton_kernel(
     int n
 );
 
+// Full Newton with KSD computation
+__global__ void svpf_fused_stein_transport_full_newton_ksd_kernel(
+    float* __restrict__ h,
+    const float* __restrict__ grad,
+    const float* __restrict__ local_hessian,
+    float* __restrict__ v_rmsprop,
+    curandStatePhilox4_32_10_t* __restrict__ rng,
+    const float* __restrict__ d_bandwidth,
+    float* __restrict__ d_ksd_partial,
+    float step_size, float beta_factor, float temperature,
+    float rho_rmsprop, float epsilon,
+    int stein_sign_mode,
+    int n
+);
+
 __global__ void svpf_fused_outputs_kernel(
     const float* __restrict__ h,
     const float* __restrict__ log_w,
