@@ -39,6 +39,7 @@ __global__ void svpf_predict_kernel(
     const float* __restrict__ d_y,
     int t,
     float rho, float sigma_z, float mu, float gamma,
+    int use_student_t_state, float nu_state,
     int n
 );
 
@@ -53,6 +54,7 @@ __global__ void svpf_predict_mim_kernel(
     float sigma_z, float mu, float gamma,
     float jump_prob, float jump_scale,
     float delta_rho, float delta_sigma,
+    int use_student_t_state, float nu_state,
     int n
 );
 
@@ -70,6 +72,7 @@ __global__ void svpf_predict_guided_kernel(
     float alpha_base, float alpha_shock,
     float innovation_threshold,
     float implied_offset,  // Student-t implied h offset (replaces hardcoded 1.27)
+    int use_student_t_state, float nu_state,
     int n
 );
 
@@ -291,6 +294,8 @@ __global__ void svpf_fused_gradient_kernel(
     bool use_exact_gradient,  // true = exact Student-t, false = log-squared surrogate
     bool use_newton,
     bool use_fan_mode,  // Fan mode: uniform weights, no annealing
+    int use_student_t_state,  // 0 = Gaussian AR(1), 1 = Student-t AR(1)
+    float nu_state,           // Degrees of freedom for state dynamics
     int n
 );
 

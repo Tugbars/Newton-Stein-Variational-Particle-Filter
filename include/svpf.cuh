@@ -487,6 +487,9 @@ typedef struct {
     float ksd_prev;                  // KSD from previous iteration (internal)
     int stein_steps_used; // Diagnostic: how many steps were actually used
 
+    int use_student_t_state; // 0 = Gaussian, 1 = Student-t
+    float nu_state;          // Degrees of freedom (recommended: 5-7)
+
 } SVPFState;
 
 /**

@@ -198,6 +198,12 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     // 0 = hybrid (default), 1 = pure Stein without importance weights
     state->use_fan_mode = 0;
     
+    // === Student-t state dynamics ===
+    // 0 = Gaussian AR(1) (default), 1 = Student-t AR(1) with bounded gradients
+    state->use_student_t_state = 0;
+    state->nu_state = 5.0f;  // Degrees of freedom for state dynamics (recommended: 5-7, min: 3)
+    // Note: nu_state is clamped to >= 2.5 in svpf_initialize to ensure finite variance
+    
     // === KSD-based Adaptive Stein Steps ===
     state->stein_min_steps = 4;              // Always run at least this many
     state->stein_max_steps = 12;             // Never exceed this
@@ -285,7 +291,25 @@ void svpf_initialize(SVPFState* state, const SVPFParams* params, unsigned long l
     
     float rho = params->rho;
     float sigma_z = params->sigma_z;
-    float stationary_var = (sigma_z * sigma_z) / (1.0f - rho * rho + 1e-6f);
+    
+    // Clamp nu_state to ensure finite variance (requires nu > 2)
+    float nu_state_clamped = fmaxf(state->nu_state, 2.5f);
+    state->nu_state = nu_state_clamped;
+    
+    // Compute stationary variance
+    // Gaussian: sigma²/(1-rho²)
+    // Student-t: (nu/(nu-2)) * sigma²/(1-rho²)  for nu > 2
+    float base_var = (sigma_z * sigma_z) / (1.0f - rho * rho + 1e-6f);
+    float stationary_var;
+    
+    if (state->use_student_t_state) {
+        // Student-t has larger variance due to heavier tails
+        float var_scale = nu_state_clamped / (nu_state_clamped - 2.0f);
+        stationary_var = var_scale * base_var;
+    } else {
+        stationary_var = base_var;
+    }
+    
     float stationary_std = sqrtf(stationary_var);
     
     svpf_init_particles_kernel<<<grid, SVPF_BLOCK_SIZE, 0, state->stream>>>(
@@ -544,7 +568,9 @@ void svpf_step_graph(SVPFState* state, float y_t, float y_prev, const SVPFParams
             delta_rho, delta_sigma,
             state->guided_alpha_base, state->guided_alpha_shock,
             state->guided_innovation_threshold,
-            state->student_t_implied_offset, n
+            state->student_t_implied_offset,
+            state->use_student_t_state, state->nu_state,
+            n
         );
     } else if (state->use_mim) {
         svpf_predict_mim_kernel<<<nb, BLOCK_SIZE, 0, cs>>>(
@@ -552,12 +578,16 @@ void svpf_step_graph(SVPFState* state, float y_t, float y_prev, const SVPFParams
             opt->d_y_single, opt->d_h_mean_prev, 1,
             rho_up, rho_down, effective_sigma_z, effective_mu, params->gamma,
             state->mim_jump_prob, state->mim_jump_scale,
-            delta_rho, delta_sigma, n
+            delta_rho, delta_sigma,
+            state->use_student_t_state, state->nu_state,
+            n
         );
     } else {
         svpf_predict_kernel<<<nb, BLOCK_SIZE, 0, cs>>>(
             state->h, state->h_prev, state->rng_states,
-            opt->d_y_single, 1, params->rho, effective_sigma_z, effective_mu, params->gamma, n
+            opt->d_y_single, 1, params->rho, effective_sigma_z, effective_mu, params->gamma,
+            state->use_student_t_state, state->nu_state,
+            n
         );
     }
     
@@ -706,7 +736,9 @@ void svpf_step_graph(SVPFState* state, float y_t, float y_prev, const SVPFParams
                 opt->d_y_single, 1, params->rho, effective_sigma_z, effective_mu,
                 beta, state->nu, student_t_const, state->lik_offset,
                 params->gamma, state->use_exact_gradient, state->use_newton,
-                state->use_fan_mode, n
+                state->use_fan_mode,
+                state->use_student_t_state, state->nu_state,
+                n
             );
             
             // Stein transport (compute KSD only on LAST iteration)

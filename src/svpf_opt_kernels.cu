@@ -25,6 +25,33 @@ __device__ __forceinline__ float safe_exp(float x) {
     return __expf(fminf(x, 20.0f));
 }
 
+// Sample from Student-t distribution via ratio of Gaussian to sqrt(Chi-squared/nu)
+// For small nu (5-7), this is ~5-7 extra curand_normal calls per particle - negligible
+// Note: This implementation assumes integer nu. For nu > 30, Student-t ≈ Gaussian.
+__device__ __forceinline__ float sample_student_t(curandStatePhilox4_32_10_t* rng, float nu) {
+    // Large nu: Student-t converges to Gaussian
+    if (nu > 30.0f) {
+        return curand_normal(rng);
+    }
+    
+    float z = curand_normal(rng);
+    
+    // Chi-squared(nu) via sum of nu squared standard normals
+    // Rounded to nearest integer - use integer nu for correctness
+    int nu_int = (int)(nu + 0.5f);
+    nu_int = max(nu_int, 3);  // Safety floor
+    
+    float chi2 = 0.0f;
+    #pragma unroll 8
+    for (int i = 0; i < nu_int; i++) {
+        float u = curand_normal(rng);
+        chi2 += u * u;
+    }
+    
+    // t = z / sqrt(chi2 / nu) = z * sqrt(nu / chi2)
+    return z * sqrtf((float)nu_int / (chi2 + 1e-8f));
+}
+
 __device__ __forceinline__ float warp_reduce_sum(float val) {
     #pragma unroll
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
@@ -102,6 +129,7 @@ __global__ void svpf_predict_kernel(
     const float* __restrict__ d_y,
     int t,
     float rho, float sigma_z, float mu, float gamma,
+    int use_student_t_state, float nu_state,
     int n
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -112,7 +140,14 @@ __global__ void svpf_predict_kernel(
     
     float y_prev = (t > 0) ? d_y[t - 1] : 0.0f;
     
-    float noise = curand_normal(&rng[i]);
+    // Sample innovation: Gaussian or Student-t
+    float noise;
+    if (use_student_t_state) {
+        noise = sample_student_t(&rng[i], nu_state);
+    } else {
+        noise = curand_normal(&rng[i]);
+    }
+    
     float vol_prev = safe_exp(h_i / 2.0f);
     float leverage = gamma * y_prev / (vol_prev + 1e-8f);
     
@@ -130,6 +165,7 @@ __global__ void svpf_predict_mim_kernel(
     float sigma_z, float mu, float gamma,
     float jump_prob, float jump_scale,
     float delta_rho, float delta_sigma,
+    int use_student_t_state, float nu_state,
     int n
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -147,7 +183,13 @@ __global__ void svpf_predict_mim_kernel(
     float rho_adjust = delta_rho * tanh_dev;
     float sigma_scale = 1.0f + delta_sigma * abs_dev;
 
-    float noise = curand_normal(&rng[i]);
+    // Sample innovation: Gaussian or Student-t
+    float noise;
+    if (use_student_t_state) {
+        noise = sample_student_t(&rng[i], nu_state);
+    } else {
+        noise = curand_normal(&rng[i]);
+    }
     float selector = curand_uniform(&rng[i]);
 
     float scale = (selector < jump_prob) ? jump_scale : 1.0f;
@@ -177,6 +219,7 @@ __global__ void svpf_predict_guided_kernel(
     float alpha_base, float alpha_shock,
     float innovation_threshold,
     float implied_offset,
+    int use_student_t_state, float nu_state,
     int n
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -194,7 +237,13 @@ __global__ void svpf_predict_guided_kernel(
     float rho_adjust = delta_rho * tanh_dev;
     float sigma_scale = 1.0f + delta_sigma * abs_dev;
 
-    float noise = curand_normal(&rng[i]);
+    // Sample innovation: Gaussian or Student-t
+    float noise;
+    if (use_student_t_state) {
+        noise = sample_student_t(&rng[i], nu_state);
+    } else {
+        noise = curand_normal(&rng[i]);
+    }
     float selector = curand_uniform(&rng[i]);
     float scale = (selector < jump_prob) ? jump_scale : 1.0f;
 
@@ -322,6 +371,8 @@ __global__ void svpf_fused_gradient_kernel(
     bool use_exact_gradient,
     bool use_newton,
     bool use_fan_mode,
+    int use_student_t_state,
+    float nu_state,
     int n
 ) {
     extern __shared__ float smem[];
@@ -349,28 +400,77 @@ __global__ void svpf_fused_gradient_kernel(
     
     // ===== PRIOR GRADIENT =====
     float sigma_z_sq = sigma_z * sigma_z;
-    float inv_2sigma_sq = 0.5f / sigma_z_sq;
-    float inv_sigma_sq = 1.0f / sigma_z_sq;
+    float grad_prior;
+    float hess_prior;
     
-    float log_r_max = -1e10f;
-    #pragma unroll 8
-    for (int i = 0; i < n; i++) {
-        float diff = h_j - sh_mu_i[i];
-        float log_r_i = -diff * diff * inv_2sigma_sq;
-        log_r_max = fmaxf(log_r_max, log_r_i);
+    if (use_student_t_state) {
+        // Student-t prior: bounded gradient
+        // log p(h|mu) = const - ((nu_state+1)/2) * log(1 + (h-mu)²/(nu_state*sigma²))
+        // grad = -(nu_state+1) * (h-mu) / (nu_state*sigma² + (h-mu)²)
+        float nu_sigma_sq = nu_state * sigma_z_sq;
+        float nu_plus_1 = nu_state + 1.0f;
+        float half_nu_plus_1 = 0.5f * nu_plus_1;
+        
+        float log_r_max = -1e10f;
+        #pragma unroll 8
+        for (int i = 0; i < n; i++) {
+            float diff = h_j - sh_mu_i[i];
+            float diff_sq = diff * diff;
+            // log r_i = -((nu+1)/2) * log(1 + diff²/(nu*sigma²))
+            float log_r_i = -half_nu_plus_1 * __logf(1.0f + diff_sq / nu_sigma_sq);
+            log_r_max = fmaxf(log_r_max, log_r_i);
+        }
+        
+        float sum_r = 0.0f;
+        float weighted_grad = 0.0f;
+        float weighted_hess = 0.0f;
+        #pragma unroll 8
+        for (int i = 0; i < n; i++) {
+            float diff = h_j - sh_mu_i[i];
+            float diff_sq = diff * diff;
+            float denom = nu_sigma_sq + diff_sq;
+            
+            float log_r_i = -half_nu_plus_1 * __logf(1.0f + diff_sq / nu_sigma_sq);
+            float r_i = __expf(log_r_i - log_r_max);
+            sum_r += r_i;
+            
+            // Bounded gradient: -(nu+1) * diff / (nu*sigma² + diff²)
+            weighted_grad -= r_i * nu_plus_1 * diff / denom;
+            
+            // Hessian for Student-t: d²/dh² log p
+            // = -(nu+1) * (nu*sigma² - diff²) / (nu*sigma² + diff²)²
+            float hess_i = -nu_plus_1 * (nu_sigma_sq - diff_sq) / (denom * denom);
+            weighted_hess += r_i * hess_i;
+        }
+        grad_prior = weighted_grad / (sum_r + 1e-8f);
+        hess_prior = weighted_hess / (sum_r + 1e-8f);
+        
+    } else {
+        // Gaussian prior: original unbounded gradient
+        float inv_2sigma_sq = 0.5f / sigma_z_sq;
+        float inv_sigma_sq = 1.0f / sigma_z_sq;
+        
+        float log_r_max = -1e10f;
+        #pragma unroll 8
+        for (int i = 0; i < n; i++) {
+            float diff = h_j - sh_mu_i[i];
+            float log_r_i = -diff * diff * inv_2sigma_sq;
+            log_r_max = fmaxf(log_r_max, log_r_i);
+        }
+        
+        float sum_r = 0.0f;
+        float weighted_grad = 0.0f;
+        #pragma unroll 8
+        for (int i = 0; i < n; i++) {
+            float diff = h_j - sh_mu_i[i];
+            float log_r_i = -diff * diff * inv_2sigma_sq;
+            float r_i = __expf(log_r_i - log_r_max);
+            sum_r += r_i;
+            weighted_grad -= r_i * diff * inv_sigma_sq;
+        }
+        grad_prior = weighted_grad / (sum_r + 1e-8f);
+        hess_prior = -inv_sigma_sq;
     }
-    
-    float sum_r = 0.0f;
-    float weighted_grad = 0.0f;
-    #pragma unroll 8
-    for (int i = 0; i < n; i++) {
-        float diff = h_j - sh_mu_i[i];
-        float log_r_i = -diff * diff * inv_2sigma_sq;
-        float r_i = __expf(log_r_i - log_r_max);
-        sum_r += r_i;
-        weighted_grad -= r_i * diff * inv_sigma_sq;
-    }
-    float grad_prior = weighted_grad / (sum_r + 1e-8f);
     
     // ===== LIKELIHOOD GRADIENT =====
     float vol = safe_exp(h_j);
@@ -409,7 +509,6 @@ __global__ void svpf_fused_gradient_kernel(
     // ===== HESSIAN =====
     if (use_newton && precond_grad != nullptr) {
         float hess_lik = -0.5f * (nu + 1.0f) * A / (one_plus_A * one_plus_A);
-        float hess_prior = -inv_sigma_sq;
         
         float curvature = -(hess_lik + hess_prior);
         curvature = fminf(fmaxf(curvature, 0.1f), 100.0f);
@@ -938,7 +1037,8 @@ __global__ void svpf_fused_outputs_kernel(
     
     if (threadIdx.x == 0) {
         float inv_n = 1.0f / (float)n;
-        d_loglik[t_out] = max_log_w + __logf(local_sum_exp * inv_n + 1e-10f);
+        float safe_sum = fmaxf(local_sum_exp * inv_n, 1e-10f);
+        d_loglik[t_out] = max_log_w + __logf(safe_sum);
         d_vol[t_out] = local_sum_vol * inv_n;
         *d_h_mean = local_sum_h * inv_n;
     }
