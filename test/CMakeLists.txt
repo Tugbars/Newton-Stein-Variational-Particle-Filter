@@ -284,3 +284,27 @@ target_link_libraries(test_fully_fused_v2
 set_target_properties(test_fully_fused_v2 PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
 )
+
+
+# Fully Fused Kernel
+add_executable(test_fused_v2_scenario test_fused_v2_scenario.cu)
+
+target_include_directories(test_fused_v2_scenario
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CUDAToolkit_INCLUDE_DIRS}
+)
+
+target_link_libraries(test_fused_v2_scenario
+    PRIVATE
+        svpf
+        CUDA::cudart
+        CUDA::curand
+)
+
+set_target_properties(test_fused_v2_scenario PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+)
+
+
+

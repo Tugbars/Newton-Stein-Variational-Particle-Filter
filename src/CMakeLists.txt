@@ -6,7 +6,6 @@ set(SVPF_CORE_SOURCES
     svpf_optimized_graph.cu
     svpf_opt_kernels.cu
     svpf_diagnostics.cu
-    svpf_fully_fused.cu  
     svpf_fully_fused_v2.cu  
 )
 
