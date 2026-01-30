@@ -21,13 +21,13 @@
 // =============================================================================
 
 // Test intensity (trade-off: speed vs statistical power)
-#define N_SEEDS         30      // 30 = good balance, 100 = publication quality
+#define N_SEEDS         10      // 30 = good balance, 100 = publication quality
 #define N_STEPS         3000    // 3000 = reasonable, 5000 = thorough
 #define WARMUP_STEPS    100
 
 // Filter settings
 #define N_PARTICLES     512
-#define N_STEIN_STEPS   5
+#define N_STEIN_STEPS   8
 
 // =============================================================================
 // FILTER CONFIGURATION FUNCTIONS
@@ -57,24 +57,24 @@ static void configure_baseline(void* state_ptr) {
     // Core
     f->use_svld = 1;
     f->use_annealing = 1;
-    f->n_anneal_steps = 3;
+    f->n_anneal_steps = 5;
     f->temperature = 0.45f;
     f->rmsprop_rho = 0.9f;
     f->rmsprop_eps = 1e-6f;
     
     // MIM
     f->use_mim = 1;
-    f->mim_jump_prob = 0.15f;
-    f->mim_jump_scale = 7.0f;
+    f->mim_jump_prob = 0.25f;
+    f->mim_jump_scale = 9.0f;
     
     // Asymmetric rho
-    f->use_asymmetric_rho = 1;
-    f->rho_up = 0.99f;
-    f->rho_down = 0.92f;
+    //f->use_asymmetric_rho = 0;
+    //f->rho_up = 0.99f;
+    //f->rho_down = 0.92f;
     
     // Newton-Stein (simplified - more robust under misspecification)
     f->use_newton = 1;
-    f->use_full_newton = 0;
+    f->use_full_newton = 1;
     
     // Guided prediction
     f->use_guided = 1;
@@ -103,18 +103,39 @@ static void configure_baseline(void* state_ptr) {
     // Adaptive sigma (breathing)
     f->use_adaptive_sigma = 1;
     f->sigma_boost_threshold = 1.0f;
-    f->sigma_boost_max = 3.0f;
+    f->sigma_boost_max = 3.2f;
     
     // Likelihood / gradient
     f->use_exact_gradient = 1;
-    f->lik_offset = 0.34f;
-    
+    f->lik_offset = 0.345f;
+
     // =========================================================================
     // FEATURE UNDER TEST - OFF in baseline
     // =========================================================================
     f->use_local_params = 0;
     f->delta_rho = 0.0f;
     f->delta_sigma = 0.0f;
+
+    // === KSD-based Adaptive Stein Steps ===
+    // Replaces fixed n_stein_steps with convergence-based early stopping
+    // KSD (Kernel Stein Discrepancy) computed in same O(N²) pass - zero extra
+    // cost
+    f->stein_min_steps = 8;  // Always run at least 4 (RMSProp warmup)
+    f->stein_max_steps = 16; // Cap at 12 (crisis budget)
+    f->ksd_improvement_threshold = 0.05; // Stop if <5% relative improvement
+
+    // Enable Student-t state dynamics
+    f->use_student_t_state = 1;
+    f->nu_state = 5.0f; // 5-7 recommended, lower = fatter tails
+
+    // Enable smoothing with 1-tick output lag
+    f->use_smoothing = 1;
+    f->smooth_lag = 3;        // Buffer last 3 estimates
+    f->smooth_output_lag = 1; // Output h[t-1] (smoothed by y[t])
+
+    f->use_persistent_kernel = 1;
+
+    //f->use_heun = 1;
 }
 
 /**
@@ -129,9 +150,10 @@ static void configure_modified(void* state_ptr) {
     // =========================================================================
     // FEATURE UNDER TEST - ON in modified
     // =========================================================================
-    f->use_local_params = 1;
-    f->delta_sigma = 0.15f;  // State-dependent sigma: wider when far from mu
+    //f->use_local_params = 1;
+   // f->delta_sigma = 0.15f;  // State-dependent sigma: wider when far from mu
     // f->delta_rho = 0.04f; // Could also test state-dependent rho
+    f->use_heun = 1;
 }
 
 /**
