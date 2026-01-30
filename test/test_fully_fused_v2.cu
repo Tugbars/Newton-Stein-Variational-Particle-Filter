@@ -1,6 +1,8 @@
 /**
  * @file test_fully_fused_v2.cu
  * @brief Test fully fused v2 kernel - latency AND accuracy comparison
+ * 
+ * FIXED: Now passes student_t_implied_offset parameter
  */
 
 #include "svpf.cuh"
@@ -19,10 +21,27 @@ __global__ void init_rng_v2_kernel(curandStatePhilox4_32_10_t* states, int n, un
     }
 }
 
+// Compute student_t_implied_offset (same formula as svpf_create)
+float compute_student_t_implied_offset(float nu) {
+    float psi_half = -1.9635100260214235f;  // digamma(0.5)
+    float nu_half = nu / 2.0f;
+    float psi_nu_half;
+    
+    if (nu_half >= 1.0f) {
+        // Asymptotic approximation for digamma
+        psi_nu_half = logf(nu_half) - 1.0f/(2.0f*nu_half) - 1.0f/(12.0f*nu_half*nu_half);
+    } else {
+        psi_nu_half = -0.5772156649f - 1.0f/nu_half;
+    }
+    
+    float expected_log_t_sq = logf(nu) + psi_half - psi_nu_half;
+    return -expected_log_t_sq;  // ≈ +1.057 for nu=5
+}
+
 int main() {
     printf("\n");
     printf("╔═══════════════════════════════════════════════════════════════════╗\n");
-    printf("║     SVPF Fully Fused V2 - Complete Feature Test                   ║\n");
+    printf("║     SVPF Fully Fused V2 - Complete Feature Test (FIXED)           ║\n");
     printf("╚═══════════════════════════════════════════════════════════════════╝\n\n");
     
     int n = 512;
@@ -73,11 +92,19 @@ int main() {
     float rho = 0.98f, sigma_z = 0.10f, mu = -4.5f, nu = 5.0f;
     float lik_offset = 0.345f;
     float gamma = 0.0f;  // Match standard test (no leverage in synthetic data)
+    
+    // Compute student_t constants
     float student_t_const = lgammaf((nu + 1.0f) / 2.0f) - lgammaf(nu / 2.0f) - 0.5f * logf(3.14159f * nu);
+    float student_t_implied_offset = compute_student_t_implied_offset(nu);
+    
+    printf("Student-t constants (nu=%.1f):\n", nu);
+    printf("  student_t_const = %.4f\n", student_t_const);
+    printf("  student_t_implied_offset = %.4f\n\n", student_t_implied_offset);
+    
     float delta_rho = 0.0f, delta_sigma = 0.0f;
     float mim_jump_prob = 0.25f, mim_jump_scale = 9.0f;
     float guide_strength_base = 0.05f, guide_strength_max = 0.30f, guide_innovation_threshold = 1.0f;
-    float guided_alpha_base = 0.0f, guided_alpha_shock = 0.40f, guided_innov_thresh = 1.5f;
+    float guided_alpha_base = 0.0f, guided_alpha_shock = 0.40f, guided_innov_thresh_predict = 1.5f;
     int use_guide = 1, use_guided_predict = 1, use_guide_preserving = 1;
     int use_newton = 1, use_full_newton = 1;
     int use_rejuvenation = 1;
@@ -117,15 +144,20 @@ int main() {
     
     float y_prev = 0.0f, h_mean_prev = mu, vol_prev = expf(mu * 0.5f), ksd_prev = 0.1f;
     
+    // Check for errors on first call
+    cudaError_t err;
+    
     for (int t = 0; t < warmup; t++) {
-        svpf_fully_fused_step_v2(
+        err = svpf_fully_fused_step_v2(
             d_h, d_h_prev, d_grad, d_logw, d_grad_v, d_inv_hess, d_rng,
             returns[t], y_prev, h_mean_prev, vol_prev, ksd_prev,
             d_h_mean, d_vol, d_loglik, d_bandwidth, d_ksd, d_guide_mean, d_guide_var,
-            rho, sigma_z, mu, nu, lik_offset, student_t_const, gamma,
+            rho, sigma_z, mu, nu, lik_offset, student_t_const,
+            student_t_implied_offset,  // <-- NEW PARAMETER
+            gamma,
             delta_rho, delta_sigma, mim_jump_prob, mim_jump_scale,
             guide_strength_base, guide_strength_max, guide_innovation_threshold,
-            guided_alpha_base, guided_alpha_shock, guided_innov_thresh,
+            guided_alpha_base, guided_alpha_shock, guided_innov_thresh_predict,
             use_guide, use_guided_predict, use_guide_preserving,
             use_newton, use_full_newton,
             use_rejuvenation, rejuv_ksd_threshold, rejuv_prob, rejuv_blend,
@@ -135,12 +167,28 @@ int main() {
             n_stein_steps, n_anneal_steps, stein_sign_mode,
             n, t, 0
         );
+        
+        // Check for errors on first iteration
+        if (t == 0) {
+            if (err != cudaSuccess) {
+                printf("CUDA launch error at t=0: %s\n", cudaGetErrorString(err));
+                return 1;
+            }
+            err = cudaDeviceSynchronize();
+            if (err != cudaSuccess) {
+                printf("CUDA execution error at t=0: %s\n", cudaGetErrorString(err));
+                return 1;
+            }
+            printf("  First iteration OK\n");
+        }
+        
         cudaMemcpy(&h_mean_prev, d_h_mean, sizeof(float), cudaMemcpyDeviceToHost);
         cudaMemcpy(&vol_prev, d_vol, sizeof(float), cudaMemcpyDeviceToHost);
         cudaMemcpy(&ksd_prev, d_ksd, sizeof(float), cudaMemcpyDeviceToHost);
         y_prev = returns[t];
     }
     cudaDeviceSynchronize();
+    printf("  Warmup complete (%d steps)\n\n", warmup);
     
     float total_time = 0.0f;
     for (int t = warmup; t < n_steps; t++) {
@@ -149,10 +197,12 @@ int main() {
             d_h, d_h_prev, d_grad, d_logw, d_grad_v, d_inv_hess, d_rng,
             returns[t], y_prev, h_mean_prev, vol_prev, ksd_prev,
             d_h_mean, d_vol, d_loglik, d_bandwidth, d_ksd, d_guide_mean, d_guide_var,
-            rho, sigma_z, mu, nu, lik_offset, student_t_const, gamma,
+            rho, sigma_z, mu, nu, lik_offset, student_t_const,
+            student_t_implied_offset,  // <-- NEW PARAMETER
+            gamma,
             delta_rho, delta_sigma, mim_jump_prob, mim_jump_scale,
             guide_strength_base, guide_strength_max, guide_innovation_threshold,
-            guided_alpha_base, guided_alpha_shock, guided_innov_thresh,
+            guided_alpha_base, guided_alpha_shock, guided_innov_thresh_predict,
             use_guide, use_guided_predict, use_guide_preserving,
             use_newton, use_full_newton,
             use_rejuvenation, rejuv_ksd_threshold, rejuv_prob, rejuv_blend,
@@ -204,10 +254,12 @@ int main() {
             d_h, d_h_prev, d_grad, d_logw, d_grad_v, d_inv_hess, d_rng,
             returns[t], y_prev, h_mean_prev, vol_prev, ksd_prev,
             d_h_mean, d_vol, d_loglik, d_bandwidth, d_ksd, d_guide_mean, d_guide_var,
-            rho, sigma_z, mu, nu, lik_offset, student_t_const, gamma,
+            rho, sigma_z, mu, nu, lik_offset, student_t_const,
+            student_t_implied_offset,  // <-- NEW PARAMETER
+            gamma,
             delta_rho, delta_sigma, mim_jump_prob, mim_jump_scale,
             guide_strength_base, guide_strength_max, guide_innovation_threshold,
-            guided_alpha_base, guided_alpha_shock, guided_innov_thresh,
+            guided_alpha_base, guided_alpha_shock, guided_innov_thresh_predict,
             use_guide, use_guided_predict, use_guide_preserving,
             use_newton, use_full_newton,
             use_rejuvenation, rejuv_ksd_threshold, rejuv_prob, rejuv_blend,
@@ -254,7 +306,6 @@ int main() {
     state->use_adaptive_sigma = use_adaptive_sigma;
     
     // Match numeric parameters that exist in SVPFState
-    // Note: Some parameters use internal defaults - not all are exposed in struct
     state->lik_offset = lik_offset;
     state->mim_jump_prob = mim_jump_prob;
     state->mim_jump_scale = mim_jump_scale;
@@ -263,14 +314,12 @@ int main() {
     state->guide_innovation_threshold = guide_innovation_threshold;
     state->guided_alpha_base = guided_alpha_base;
     state->guided_alpha_shock = guided_alpha_shock;
-    state->guided_innovation_threshold = guided_innov_thresh;
+    state->guided_innovation_threshold = guided_innov_thresh_predict;
     state->sigma_boost_threshold = sigma_boost_threshold;
     state->sigma_boost_max = sigma_boost_max;
     state->rejuv_ksd_threshold = rejuv_ksd_threshold;
     state->rejuv_prob = rejuv_prob;
     state->rejuv_blend = rejuv_blend;
-    // Note: step_size, temperature, rmsprop_rho, n_stein_steps, n_anneal_steps
-    // use internal defaults in svpf_step_graph - not exposed in SVPFState
     
     svpf_initialize(state, &params, 12345);
     

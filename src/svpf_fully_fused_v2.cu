@@ -1,6 +1,13 @@
 /**
- * @file svpf_fully_fused_v2.cu
- * @brief Fully Fused Single-Kernel SVPF Step - Complete Feature Set
+ * @file svpf_fully_fused_v2_fixed.cu
+ * @brief Fully Fused Single-Kernel SVPF Step - Complete Feature Set (FIXED)
+ * 
+ * Fixes from original:
+ * - EKF obs_offset: now uses student_t_implied_offset parameter (not hardcoded)
+ * - Hessian computation: no beta scaling (only gradient is annealed)
+ * - Full Newton: uses raw gradients, applies preconditioning at end
+ * - Full Newton repulsion: no Hessian scaling (only regular Newton scales)
+ * - KSD computation: uses raw gradients for both Newton modes
  * 
  * Features included:
  * - EKF guide computation (inside kernel)
@@ -14,13 +21,6 @@
  * - Partial rejuvenation
  * - Adaptive μ update
  * - Adaptive σ scaling
- * - Backward smoothing state update
- * 
- * NOT included (by design):
- * - Asymmetric rho (negligible impact)
- * - Student-t state noise (Gaussian sufficient)
- * - KSD early stopping (fast enough without)
- * - Adaptive beta schedule (fixed works well)
  * 
  * Limitation: N ≤ 1024 (single block execution)
  */
@@ -56,7 +56,7 @@ __device__ __forceinline__ float warp_reduce_max(float val) {
 __device__ float block_reduce_sum_v2(float val, float* smem) {
     int lane = threadIdx.x % 32;
     int wid = threadIdx.x / 32;
-    int num_warps = (blockDim.x + 31) / 32;  // CEIL, not floor
+    int num_warps = (blockDim.x + 31) / 32;
     
     val = warp_reduce_sum(val);
     if (lane == 0) smem[wid] = val;
@@ -71,7 +71,7 @@ __device__ float block_reduce_sum_v2(float val, float* smem) {
 __device__ float block_reduce_max_v2(float val, float* smem) {
     int lane = threadIdx.x % 32;
     int wid = threadIdx.x / 32;
-    int num_warps = (blockDim.x + 31) / 32;  // CEIL, not floor
+    int num_warps = (blockDim.x + 31) / 32;
     
     val = warp_reduce_max(val);
     if (lane == 0) smem[wid] = val;
@@ -84,7 +84,7 @@ __device__ float block_reduce_max_v2(float val, float* smem) {
 }
 
 // =============================================================================
-// FULLY FUSED SVPF STEP KERNEL V2 - Complete Features
+// FULLY FUSED SVPF STEP KERNEL V2 - FIXED VERSION
 // =============================================================================
 
 __global__ void svpf_fully_fused_step_v2_kernel(
@@ -94,7 +94,7 @@ __global__ void svpf_fully_fused_step_v2_kernel(
     float* __restrict__ grad_log_p,
     float* __restrict__ log_weights,
     float* __restrict__ d_grad_v,           // RMSprop velocity
-    float* __restrict__ d_inv_hessian,      // For Newton
+    float* __restrict__ d_inv_hessian,      // For Newton (diagnostic output)
     curandStatePhilox4_32_10_t* __restrict__ rng,
     // Inputs
     float y_t,
@@ -117,6 +117,7 @@ __global__ void svpf_fully_fused_step_v2_kernel(
     float nu,
     float lik_offset,
     float student_t_const,
+    float student_t_implied_offset,         // FIX: Added parameter (was hardcoded)
     float gamma,                            // Leverage effect
     // Local params
     float delta_rho,                        // Per-particle rho variation
@@ -130,7 +131,7 @@ __global__ void svpf_fully_fused_step_v2_kernel(
     float guide_innovation_threshold,
     float guided_alpha_base,                // For guided predict
     float guided_alpha_shock,               // Shock-responsive alpha
-    float guided_innovation_threshold,      // Separate threshold for guided predict
+    float guided_innovation_thresh_predict, // Separate threshold for guided predict
     int use_guide,
     int use_guided_predict,
     int use_guide_preserving,
@@ -163,8 +164,6 @@ __global__ void svpf_fully_fused_step_v2_kernel(
     int timestep
 ) {
     int i = threadIdx.x;
-    // CRITICAL: This kernel MUST be launched with blockDim.x == n
-    // If not, the early return below will cause deadlocks on __syncthreads()
     if (i >= n) return;
     
     // Shared memory layout
@@ -218,22 +217,21 @@ __global__ void svpf_fully_fused_step_v2_kernel(
         sh_effective_sigma = sigma_z * sigma_boost;
         
         // =====================================================================
-        // EKF UPDATE (matches svpf_ekf_update exactly)
+        // EKF UPDATE (FIXED: uses student_t_implied_offset parameter)
         // =====================================================================
         if (use_guide) {
             float eff_mu = sh_effective_mu;
             
-            // Predict step - use previous GUIDE MEAN, not posterior mean!
+            // Predict step - use previous GUIDE MEAN
             float m_pred = eff_mu + rho * (prev_guide_mean - eff_mu);
             float P_pred = rho * rho * sh_guide_var + sigma_z * sigma_z;
             
-            // Observation: log(y²) = h + E[log(ε²)]
+            // Observation model: log(y²) = h + E[log(ε²)]
             // For Student-t: E[log(y²)|h] = h - student_t_implied_offset
-            // student_t_implied_offset ≈ +1.27 for nu=5
-            // So obs_offset = -student_t_implied_offset ≈ -1.27
+            // So obs_offset = -student_t_implied_offset
             float log_y2 = logf(y_t * y_t + 1e-8f);
-            float obs_offset = -1.27f;  // NEGATIVE! (was wrong: +1.27)
-            float obs_var = 4.93f + 2.0f;
+            float obs_offset = -student_t_implied_offset;  // FIX: Use parameter
+            float obs_var = 4.93f + 2.0f;  // Variance of log(chi²) ≈ 4.93, plus slack
             
             float H = 1.0f;
             float R = obs_var;
@@ -246,13 +244,12 @@ __global__ void svpf_fully_fused_step_v2_kernel(
             
             sh_guide_mean = m_pred + K * innovation;
             sh_guide_var = (1.0f - K * H) * P_pred;
-            // NO CLAMP - host doesn't clamp guide_mean
             
             // Write back updated EKF state
             *d_guide_mean = sh_guide_mean;
             *d_guide_var = sh_guide_var;
             
-            // Adaptive guide strength
+            // Adaptive guide strength based on return magnitude
             float vol_est = fmaxf(vol_prev, 1e-4f);
             float return_z = fabsf(y_t) / vol_est;
             
@@ -271,7 +268,7 @@ __global__ void svpf_fully_fused_step_v2_kernel(
     }
     __syncthreads();
     
-    // Load shared values
+    // Load shared values to registers
     float effective_mu = sh_effective_mu;
     float effective_sigma = sh_effective_sigma;
     float guide_mean = sh_guide_mean;
@@ -279,6 +276,7 @@ __global__ void svpf_fully_fused_step_v2_kernel(
     
     float sigma_z_sq = effective_sigma * effective_sigma;
     float inv_sigma_z_sq = 1.0f / sigma_z_sq;
+    float inv_2sigma_sq = 0.5f * inv_sigma_z_sq;
     
     // ==========================================================================
     // PHASE 1: PREDICT
@@ -286,8 +284,7 @@ __global__ void svpf_fully_fused_step_v2_kernel(
     
     float h_old = h[i];  // Current posterior BEFORE predict
     
-    // Compute prior means for mixture gradient using CURRENT h (not h_prev)
-    // Each particle's AR(1) prior mean: μ_i = μ + ρ*(h[i] - μ) + γ*y_prev/vol
+    // Compute prior means for mixture gradient using CURRENT h
     {
         float vol_i = expf(h_old * 0.5f);
         float leverage_i = gamma * y_prev / (vol_i + 1e-8f);
@@ -296,15 +293,25 @@ __global__ void svpf_fully_fused_step_v2_kernel(
     __syncthreads();
     
     // Per-particle parameter variation (local params)
+    // Original uses deviation from ensemble mean for adaptive per-particle params
     float local_rho = rho;
     float local_sigma = effective_sigma;
     if (delta_rho > 0.0f || delta_sigma > 0.0f) {
-        float variation = (2.0f * (i % 16) / 15.0f - 1.0f);
-        local_rho = fminf(fmaxf(rho + delta_rho * variation, 0.8f), 0.999f);
-        local_sigma = effective_sigma * (1.0f + delta_sigma * variation);
+        // Deviation from ensemble mean (h_mean_prev passed as parameter)
+        float dev = h_old - h_mean_prev;
+        float abs_dev = fabsf(dev);
+        float tanh_dev = tanhf(dev);  // Bounded, sign-preserving
+        
+        // Particles far from mean get adjusted rho (mean-reverting pressure)
+        float rho_adjust = delta_rho * tanh_dev;
+        local_rho = fminf(fmaxf(rho + rho_adjust, 0.0f), 0.999f);
+        
+        // Particles far from mean get higher sigma (more uncertainty)
+        float sigma_scale = 1.0f + delta_sigma * abs_dev;
+        local_sigma = effective_sigma * sigma_scale;
     }
     
-    // AR(1) prior mean WITH LEVERAGE EFFECT - use h_old, not h_prev
+    // AR(1) prior mean WITH LEVERAGE EFFECT
     float leverage = 0.0f;
     if (fabsf(gamma) > 1e-6f) {
         float vol_old = expf(h_old * 0.5f);
@@ -321,22 +328,36 @@ __global__ void svpf_fully_fused_step_v2_kernel(
     float is_jump = (curand_uniform(&rng[i]) < mim_jump_prob) ? 1.0f : 0.0f;
     float mim_sigma = local_sigma * (1.0f + is_jump * (mim_jump_scale - 1.0f));
     
-    float h_i;  // Will hold new predicted value
-    if (use_guided_predict && use_guide) {
-        // Guided predict: blend prior with guide based on innovation
-        float vol_est = fmaxf(vol_prev, 1e-4f);
-        float return_z = fabsf(y_t) / vol_est;
+    float h_i;
+    if (use_guided_predict) {
+        // Guided predict: blend prior with OBSERVATION-IMPLIED mean (not EKF guide!)
+        // This pulls particles toward where the observation suggests volatility should be
         
-        float alpha;
-        if (return_z > guided_innovation_threshold) {
-            float severity = fminf((return_z - guided_innovation_threshold) / 3.0f, 1.0f);
-            alpha = guided_alpha_base + (guided_alpha_shock - guided_alpha_base) * severity;
-        } else {
-            alpha = guided_alpha_base;
+        // Compute implied log-volatility from observation
+        // log(y²) ≈ h + E[log(ε²)], so h ≈ log(y²) - E[log(ε²)]
+        // implied_offset = -E[log(ε²)] for Student-t
+        float log_y2 = logf(y_t * y_t + 1e-10f);
+        float mean_implied = fmaxf(log_y2 + student_t_implied_offset, -5.0f);
+        
+        // Innovation: how far is observation-implied from our prior prediction?
+        float innovation = mean_implied - prior_mean;
+        float total_std = 2.5f;  // Approximate total uncertainty
+        float z_score = innovation / total_std;
+        
+        // Activation: tanh ramp when z_score exceeds threshold
+        // Only activate for POSITIVE innovations (vol spike detection)
+        float activation = 0.0f;
+        if (z_score > guided_innovation_thresh_predict) {
+            activation = tanhf(z_score - guided_innovation_thresh_predict);
         }
         
-        float blended_mean = (1.0f - alpha) * prior_mean + alpha * guide_mean;
-        h_i = blended_mean + mim_sigma * z_state;
+        // Blend coefficient: ramps from alpha_base to alpha_shock
+        float guided_alpha = guided_alpha_base + (guided_alpha_shock - guided_alpha_base) * activation;
+        
+        // Proposal mean: blend prior with observation-implied
+        float mean_proposal = (1.0f - guided_alpha) * prior_mean + guided_alpha * mean_implied;
+        
+        h_i = mean_proposal + mim_sigma * z_state;
     } else {
         h_i = prior_mean + mim_sigma * z_state;
     }
@@ -358,7 +379,6 @@ __global__ void svpf_fully_fused_step_v2_kernel(
         
         if (use_guide_preserving) {
             // Guide-preserving: shift mean but keep deviations
-            // h_i = h_i + s * (guide_mean - h_mean_prev)
             h_i = h_i + guide_strength * (guide_mean - h_mean_prev);
         } else {
             // Simple nudge toward guide
@@ -404,10 +424,9 @@ __global__ void svpf_fully_fused_step_v2_kernel(
     float inv_bw_sq = 1.0f / bw_sq;
     
     // ==========================================================================
-    // PHASE 4: STEIN LOOP
+    // PHASE 4: STEIN LOOP (FIXED NEWTON HANDLING)
     // ==========================================================================
     
-    // Validate parameters
     int safe_anneal = (n_anneal_steps < 1) ? 1 : n_anneal_steps;
     int safe_stein = (n_stein_steps < 1) ? 1 : n_stein_steps;
     
@@ -415,8 +434,7 @@ __global__ void svpf_fully_fused_step_v2_kernel(
     int remainder = safe_stein - steps_per_anneal * safe_anneal;
     
     float sign_mult = (stein_sign_mode == 1) ? 1.0f : -1.0f;
-    float hess_prior = -inv_sigma_z_sq;  // Gaussian prior hessian
-    float inv_2sigma_sq = 0.5f * inv_sigma_z_sq;
+    float hess_prior = -inv_sigma_z_sq;  // Gaussian prior hessian (constant)
     
     int global_step = 0;
     float ksd_final = 0.0f;
@@ -429,7 +447,6 @@ __global__ void svpf_fully_fused_step_v2_kernel(
         } else if (ai == safe_anneal - 1) {
             beta = 1.0f;  // Last stage always full likelihood
         } else {
-            // Linear ramp from 0.3 to 0.8 for intermediate stages
             float t = (float)ai / (float)(safe_anneal - 1);
             beta = 0.3f + t * 0.5f;
         }
@@ -441,9 +458,9 @@ __global__ void svpf_fully_fused_step_v2_kernel(
             global_step++;
             bool is_last = (global_step == safe_stein);
             
-            // ----- Mixture Prior Gradient (O(N²), recomputed each iteration) -----
             h_i = h[i];
             
+            // ----- Mixture Prior Gradient (O(N²)) -----
             float log_r_max = -1e10f;
             #pragma unroll 8
             for (int k = 0; k < n; k++) {
@@ -467,7 +484,7 @@ __global__ void svpf_fully_fused_step_v2_kernel(
             
             // ----- Likelihood Gradient -----
             float vol = expf(h_i * 0.5f);
-            float y_sq = y_t * y_t;  // NOT (y_t - lik_offset)²
+            float y_sq = y_t * y_t;
             float scaled_y_sq = y_sq / (vol * vol + 1e-8f);
             float A = scaled_y_sq / nu;
             float one_plus_A = 1.0f + A;
@@ -476,38 +493,49 @@ __global__ void svpf_fully_fused_step_v2_kernel(
             log_weights[i] = student_t_const - 0.5f * h_i 
                            - 0.5f * (nu + 1.0f) * logf(one_plus_A);
             
-            // Likelihood gradient (lik_offset adjusts gradient, not data)
+            // Likelihood gradient
             float raw_grad = -0.5f + 0.5f * (nu + 1.0f) * A / one_plus_A;
             float grad_lik = raw_grad - lik_offset;
             
-            // Combined gradient (pre-computed prior + annealed likelihood)
+            // Combined gradient (annealed likelihood)
             float g = grad_prior_i + beta * grad_lik;
             g = fminf(fmaxf(g, -10.0f), 10.0f);
-            grad_log_p[i] = g;
+            grad_log_p[i] = g;  // Store raw gradient
             
-            // Hessian for Newton - compute curvature and preconditioned gradient
-            float curvature_i = 1.0f;
-            float inv_H_i = 1.0f;
-            float precond_grad_i = g;
+            // ----- Hessian (FIX: NO BETA SCALING) -----
+            float hess_lik = -0.5f * (nu + 1.0f) * A / (one_plus_A * one_plus_A);
+            float curvature_i = -(hess_lik + hess_prior);  // FIX: No beta here
+            curvature_i = fminf(fmaxf(curvature_i, 0.1f), 100.0f);
             
+            float inv_H_i = 1.0f / curvature_i;
+            float precond_grad_i = 0.7f * g * inv_H_i;
+            
+            // Store for diagnostic output
             if (use_newton || use_full_newton) {
-                float hess_lik = -0.5f * (nu + 1.0f) * A / (one_plus_A * one_plus_A);
-                curvature_i = -(beta * hess_lik + hess_prior);
-                curvature_i = fminf(fmaxf(curvature_i, 0.1f), 100.0f);
-                inv_H_i = 1.0f / curvature_i;
-                precond_grad_i = 0.7f * g * inv_H_i;
                 d_inv_hessian[i] = curvature_i;
             }
             
             __syncthreads();
             
-            // Load to shared - use PRECONDITIONED gradient for Newton
+            // ----- Load to shared (FIX: MODE-DEPENDENT) -----
             sh_h[i] = h[i];
-            sh_grad[i] = (use_newton || use_full_newton) ? precond_grad_i : g;
-            sh_hess[i] = inv_H_i;  // Store INVERSE Hessian
+            
+            if (use_full_newton) {
+                // FIX: Full Newton uses RAW gradient, stores curvature
+                sh_grad[i] = g;
+                sh_hess[i] = curvature_i;
+            } else if (use_newton) {
+                // Regular Newton: preconditioned gradient, stores inverse Hessian
+                sh_grad[i] = precond_grad_i;
+                sh_hess[i] = inv_H_i;
+            } else {
+                // Vanilla: raw gradient
+                sh_grad[i] = g;
+                sh_hess[i] = 1.0f;
+            }
             __syncthreads();
             
-            // ----- Stein Transport -----
+            // ----- Stein Transport (FIX: MODE-DEPENDENT REPULSION) -----
             float k_sum = 0.0f;
             float gk_sum = 0.0f;
             float ksd_sum = 0.0f;
@@ -519,7 +547,7 @@ __global__ void svpf_fully_fused_step_v2_kernel(
             #pragma unroll 8
             for (int j = 0; j < n; j++) {
                 float h_j = sh_h[j];
-                float s_j = sh_grad[j];  // preconditioned gradient if Newton
+                float s_j = sh_grad[j];
                 float diff = h_i - h_j;
                 float diff_sq = diff * diff;
                 float dist_sq = diff_sq * inv_bw_sq;
@@ -529,45 +557,59 @@ __global__ void svpf_fully_fused_step_v2_kernel(
                 float K = 1.0f / base;
                 float K_sq = K * K;
                 
-                // Newton: use preconditioned gradients and scale repulsion
+                // Gradient term
                 k_sum += K * s_j;
-                if (use_newton || use_full_newton) {
-                    // Scale repulsion by inv_H[j] (matching original)
+                
+                // FIX: Repulsion scaling depends on mode
+                if (use_newton) {
+                    // Regular Newton: scale repulsion by inverse Hessian
                     gk_sum += sign_mult * 2.0f * diff * inv_bw_sq * K_sq * sh_hess[j];
                 } else {
+                    // FIX: Vanilla AND Full Newton: NO Hessian scaling
                     gk_sum += sign_mult * 2.0f * diff * inv_bw_sq * K_sq;
                 }
                 
-                // Full Newton: kernel-weighted Hessian averaging
+                // Full Newton: accumulate kernel-weighted Hessian
                 if (use_full_newton) {
-                    float curv_j = 1.0f / sh_hess[j];  // Convert back to curvature
-                    H_weighted += curv_j * K;
+                    H_weighted += sh_hess[j] * K;  // sh_hess is curvature for full_newton
                     float Nk = 2.0f * inv_bw_sq * K_sq * fabsf(3.0f * dist_sq - 1.0f);
                     H_weighted += Nk;
                     K_sum_norm += K;
                 }
                 
-                // KSD (last iteration) - use raw gradient for KSD
+                // KSD on last iteration (use RAW gradients for correctness)
                 if (is_last) {
-                    float raw_s_i = grad_log_p[i];
-                    float raw_s_j = (use_newton || use_full_newton) ? 
-                                    s_j / (0.7f * sh_hess[j] + 1e-8f) : s_j;  // Undo precond
+                    // Get raw gradients for KSD
+                    float raw_s_i = g;  // We have raw gradient
+                    float raw_s_j;
+                    if (use_newton) {
+                        // Undo preconditioning: precond = 0.7 * g * inv_H
+                        // So raw = precond / (0.7 * inv_H)
+                        raw_s_j = s_j / (0.7f * sh_hess[j] + 1e-8f);
+                    } else {
+                        // Full Newton and Vanilla already have raw gradients
+                        raw_s_j = s_j;
+                    }
+                    
                     float grad_x_k = -2.0f * diff * inv_bw_sq * K_sq;
                     float grad_y_k = -grad_x_k;
                     float hess_xy_k = 2.0f * inv_bw_sq * K_sq * (4.0f * dist_sq * K - 1.0f);
-                    ksd_sum += K * raw_s_i * raw_s_j + raw_s_i * grad_y_k + raw_s_j * grad_x_k + hess_xy_k;
+                    ksd_sum += K * raw_s_i * raw_s_j + raw_s_i * grad_y_k 
+                             + raw_s_j * grad_x_k + hess_xy_k;
                 }
             }
             
-            // Compute phi_i
+            // Compute phi_i (FIX: mode-dependent)
             float phi_i;
             if (use_full_newton) {
+                // FIX: Full Newton applies preconditioning HERE at the end
                 H_weighted = H_weighted / fmaxf(K_sum_norm, 1e-6f);
                 H_weighted = fminf(fmaxf(H_weighted, 0.1f), 100.0f);
                 float inv_H_avg = 1.0f / H_weighted;
-                phi_i = (k_sum + gk_sum) * inv_n * inv_H_avg;
+                phi_i = (k_sum + gk_sum) * inv_n * inv_H_avg * 0.7f;  // FIX: Apply 0.7 here
             } else {
-                // For Newton and vanilla: gradients already preconditioned, repulsion scaled
+                // Newton: already preconditioned via sh_grad
+                // Vanilla: no preconditioning
                 phi_i = (k_sum + gk_sum) * inv_n;
             }
             
@@ -584,7 +626,7 @@ __global__ void svpf_fully_fused_step_v2_kernel(
             float diffusion = 0.0f;
             if (temperature > 1e-6f) {
                 diffusion = sqrtf(2.0f * effective_step * temperature) * z_diffusion;
-                z_diffusion = curand_normal(&rng[i]);
+                z_diffusion = curand_normal(&rng[i]);  // Refresh for next iteration
             }
             
             h[i] = clamp_logvol(h_i + drift + diffusion);
@@ -598,14 +640,13 @@ __global__ void svpf_fully_fused_step_v2_kernel(
     }
     
     // ==========================================================================
-    // PHASE 5: PARTIAL REJUVENATION (with noise, matches original)
+    // PHASE 5: PARTIAL REJUVENATION
     // ==========================================================================
     
     if (use_rejuvenation && ksd_prev > rejuv_ksd_threshold && timestep > 10) {
         float u = curand_uniform(&rng[i]);
         if (u < rejuv_prob) {
             h_i = h[i];
-            // Original: h_new = (1-blend)*h_old + blend*(guide_mean + guide_std*noise)
             float guide_std = sqrtf(fmaxf(sh_guide_var, 1e-6f));
             float noise = curand_normal(&rng[i]);
             float rejuv_target = guide_mean + guide_std * noise;
@@ -616,7 +657,7 @@ __global__ void svpf_fully_fused_step_v2_kernel(
     __syncthreads();
     
     // ==========================================================================
-    // PHASE 6: OUTPUTS (UNWEIGHTED means to match standard)
+    // PHASE 6: OUTPUTS
     // ==========================================================================
     
     // KSD reduction
@@ -684,17 +725,18 @@ cudaError_t svpf_fully_fused_step_v2(
     float y_t, float y_prev, float h_mean_prev, float vol_prev, float ksd_prev,
     // Scalar outputs
     float* d_h_mean, float* d_vol, float* d_loglik, float* d_bandwidth, float* d_ksd,
-    float* d_guide_mean, float* d_guide_var,  // EKF state (read/write)
+    float* d_guide_mean, float* d_guide_var,
     // Model params
     float rho, float sigma_z, float mu, float nu, float lik_offset, float student_t_const,
-    float gamma,  // Leverage effect
+    float student_t_implied_offset,  // FIX: Added parameter
+    float gamma,
     // Local params
     float delta_rho, float delta_sigma,
     // MIM
     float mim_jump_prob, float mim_jump_scale,
     // Guide params
     float guide_strength_base, float guide_strength_max, float guide_innovation_threshold,
-    float guided_alpha_base, float guided_alpha_shock, float guided_innovation_threshold,
+    float guided_alpha_base, float guided_alpha_shock, float guided_innovation_thresh_predict,
     int use_guide, int use_guided_predict, int use_guide_preserving,
     // Newton
     int use_newton, int use_full_newton,
@@ -714,18 +756,20 @@ cudaError_t svpf_fully_fused_step_v2(
         return cudaErrorInvalidConfiguration;
     }
     
-    // Shared memory: 5 arrays (sh_h, sh_grad, sh_mu, sh_hess, sh_reduce)
+    // Shared memory: 4 arrays + reduction buffer
     int smem_size = (4 * n + 32) * sizeof(float);
     
     svpf_fully_fused_step_v2_kernel<<<1, n, smem_size, stream>>>(
         h, h_prev, grad_log_p, log_weights, d_grad_v, d_inv_hessian, rng,
         y_t, y_prev, h_mean_prev, vol_prev, ksd_prev,
         d_h_mean, d_vol, d_loglik, d_bandwidth, d_ksd, d_guide_mean, d_guide_var,
-        rho, sigma_z, mu, nu, lik_offset, student_t_const, gamma,
+        rho, sigma_z, mu, nu, lik_offset, student_t_const,
+        student_t_implied_offset,  // FIX: Pass parameter
+        gamma,
         delta_rho, delta_sigma,
         mim_jump_prob, mim_jump_scale,
         guide_strength_base, guide_strength_max, guide_innovation_threshold,
-        guided_alpha_base, guided_alpha_shock, guided_innovation_threshold,
+        guided_alpha_base, guided_alpha_shock, guided_innovation_thresh_predict,
         use_guide, use_guided_predict, use_guide_preserving,
         use_newton, use_full_newton,
         use_rejuvenation, rejuv_ksd_threshold, rejuv_prob, rejuv_blend,

@@ -1,6 +1,11 @@
 /**
  * @file svpf_fully_fused_v2.cuh
- * @brief Fully Fused Single-Kernel SVPF Step V2 - Complete Feature Set
+ * @brief Fully Fused Single-Kernel SVPF Step V2 - Complete Feature Set (FIXED)
+ * 
+ * Changes from original:
+ * - Added student_t_implied_offset parameter (was hardcoded, now passed)
+ * - Renamed guided_innovation_threshold to guided_innovation_thresh_predict
+ *   to avoid confusion with guide_innovation_threshold
  */
 
 #ifndef SVPF_FULLY_FUSED_V2_CUH
@@ -65,6 +70,7 @@ cudaError_t svpf_fully_fused_step_v2(
     float nu,
     float lik_offset,
     float student_t_const,
+    float student_t_implied_offset,  // NEW: pass from state->student_t_implied_offset
     float gamma,  // Leverage effect
     // Local params
     float delta_rho,
@@ -75,10 +81,10 @@ cudaError_t svpf_fully_fused_step_v2(
     // Guide parameters
     float guide_strength_base,
     float guide_strength_max,
-    float guide_innovation_threshold,
+    float guide_innovation_threshold,    // For adaptive guide strength
     float guided_alpha_base,
     float guided_alpha_shock,
-    float guided_innovation_threshold,
+    float guided_innovation_thresh_predict,  // For guided predict (separate threshold)
     int use_guide,
     int use_guided_predict,
     int use_guide_preserving,

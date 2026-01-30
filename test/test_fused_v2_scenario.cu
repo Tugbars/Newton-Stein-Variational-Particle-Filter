@@ -2,6 +2,8 @@
  * @file test_fused_v2_scenario.cu
  * @brief Test fully fused v2 kernel on real scenario data
  * 
+ * FIXED: Now passes student_t_implied_offset parameter
+ * 
  * Mirrors run_svpf_on_scenario() but uses svpf_fully_fused_step_v2
  */
 
@@ -19,6 +21,23 @@ __global__ void init_rng_fused_kernel(curandStatePhilox4_32_10_t* states, int n,
     if (idx < n) {
         curand_init(seed, idx, 0, &states[idx]);
     }
+}
+
+// Compute student_t_implied_offset (same formula as svpf_create)
+float compute_student_t_implied_offset(float nu) {
+    float psi_half = -1.9635100260214235f;  // digamma(0.5)
+    float nu_half = nu / 2.0f;
+    float psi_nu_half;
+    
+    if (nu_half >= 1.0f) {
+        // Asymptotic approximation for digamma
+        psi_nu_half = logf(nu_half) - 1.0f/(2.0f*nu_half) - 1.0f/(12.0f*nu_half*nu_half);
+    } else {
+        psi_nu_half = -0.5772156649f - 1.0f/nu_half;
+    }
+    
+    float expected_log_t_sq = logf(nu) + psi_half - psi_nu_half;
+    return -expected_log_t_sq;  // ≈ +1.057 for nu=5
 }
 
 typedef struct {
@@ -88,9 +107,12 @@ void run_fused_v2_on_scenario(
     float nu = 5.0f;
     float gamma = 0.0f;  // No leverage in this DGP
     float lik_offset = 0.345f;
+    
+    // Compute student_t constants
     float student_t_const = lgammaf((nu + 1.0f) / 2.0f) 
                           - lgammaf(nu / 2.0f) 
                           - 0.5f * logf(3.14159265f * nu);
+    float student_t_implied_offset = compute_student_t_implied_offset(nu);
     
     // Local params
     float delta_rho = 0.0f;
@@ -106,7 +128,7 @@ void run_fused_v2_on_scenario(
     float guide_innovation_threshold = 1.0f;
     float guided_alpha_base = 0.0f;
     float guided_alpha_shock = 0.40f;
-    float guided_innov_thresh = 1.5f;
+    float guided_innov_thresh_predict = 1.5f;
     int use_guide = 1;
     int use_guided_predict = 1;
     int use_guide_preserving = 1;
@@ -185,10 +207,12 @@ void run_fused_v2_on_scenario(
             d_h, d_h_prev, d_grad, d_logw, d_grad_v, d_inv_hess, d_rng,
             y_t, y_prev, h_mean_prev, vol_prev, ksd_prev,
             d_h_mean, d_vol, d_loglik, d_bandwidth, d_ksd, d_guide_mean, d_guide_var,
-            rho, sigma_z, mu, nu, lik_offset, student_t_const, gamma,
+            rho, sigma_z, mu, nu, lik_offset, student_t_const,
+            student_t_implied_offset,  // <-- FIXED: Added parameter
+            gamma,
             delta_rho, delta_sigma, mim_jump_prob, mim_jump_scale,
             guide_strength_base, guide_strength_max, guide_innovation_threshold,
-            guided_alpha_base, guided_alpha_shock, guided_innov_thresh,
+            guided_alpha_base, guided_alpha_shock, guided_innov_thresh_predict,
             use_guide, use_guided_predict, use_guide_preserving,
             use_newton, use_full_newton,
             use_rejuvenation, rejuv_ksd_threshold, rejuv_prob, rejuv_blend,
@@ -248,7 +272,7 @@ void run_fused_v2_on_scenario(
 int main(int argc, char** argv) {
     printf("\n");
     printf("╔═══════════════════════════════════════════════════════════════════╗\n");
-    printf("║     Fused V2 vs Standard SVPF - Scenario Comparison               ║\n");
+    printf("║     Fused V2 vs Standard SVPF - Scenario Comparison (FIXED)       ║\n");
     printf("╚═══════════════════════════════════════════════════════════════════╝\n\n");
     
     int n_particles = 512;
@@ -418,6 +442,23 @@ int main(int argc, char** argv) {
     } else {
         printf("  ✗ Accuracy: Fused V2 is %.1f%% worse than standard\n", (ratio - 1.0f) * 100);
     }
+    
+    // =========================================================================
+    // Debug: Print first few values to verify sanity
+    // =========================================================================
+    
+    printf("\n═══════════════════════════════════════════════════════════════════\n");
+    printf(" First 10 timesteps comparison\n");
+    printf("═══════════════════════════════════════════════════════════════════\n\n");
+    
+    printf("  t   | True h  | Fused h | Std h   | Fused err | Std err\n");
+    printf("  ----+---------+---------+---------+-----------+--------\n");
+    for (int t = 0; t < 10; t++) {
+        printf("  %3d | %7.3f | %7.3f | %7.3f | %9.3f | %7.3f\n",
+               t, true_h[t], fused_h[t], std_h[t],
+               fused_h[t] - true_h[t], std_h[t] - true_h[t]);
+    }
+    printf("\n");
     
     // Cleanup
     free(returns);
