@@ -216,6 +216,15 @@ static void configure_mono_adaptive(void* state_ptr) {
     f->use_local_params = 0;
     f->delta_rho = 0.0f;
     f->delta_sigma = 0.0f;
+
+    // Enable smoothing with 1-tick output lag
+    f->use_smoothing = 1;
+    f->smooth_lag = 3;        // Buffer last 3 estimates
+    f->smooth_output_lag = 1; // Output h[t-1] (smoothed by y[t])
+
+    f->use_persistent_kernel = 1;
+
+    f->use_heun = 1;
 }
 
 /*═══════════════════════════════════════════════════════════════════════════

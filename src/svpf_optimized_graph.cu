@@ -33,6 +33,36 @@
 #endif
 
 // =============================================================================
+// HEUN'S METHOD KERNEL DECLARATIONS
+// =============================================================================
+// These kernels are defined in svpf_opt_kernels.cu
+
+__global__ void svpf_stein_operator_kernel(
+    const float* h, const float* grad, float* phi_out,
+    const float* d_bandwidth, int stein_sign_mode, int n);
+
+__global__ void svpf_stein_operator_full_newton_kernel(
+    const float* h, const float* grad, const float* local_hessian,
+    float* phi_out, const float* d_bandwidth, int stein_sign_mode, int n);
+
+__global__ void svpf_heun_predictor_kernel(
+    float* h, const float* h_orig, const float* phi, const float* v_rmsprop,
+    float step_size, float beta_factor, float epsilon, int n);
+
+__global__ void svpf_heun_corrector_kernel(
+    float* h, const float* h_orig, const float* phi_orig, const float* phi_pred,
+    float* v_rmsprop, curandStatePhilox4_32_10_t* rng,
+    float step_size, float beta_factor, float temperature,
+    float rho_rmsprop, float epsilon, int n);
+
+__global__ void svpf_heun_corrector_ksd_kernel(
+    float* h, const float* h_orig, const float* phi_orig, const float* phi_pred,
+    const float* grad, float* v_rmsprop, curandStatePhilox4_32_10_t* rng,
+    const float* d_bandwidth, float* d_ksd_partial,
+    float step_size, float beta_factor, float temperature,
+    float rho_rmsprop, float epsilon, int n);
+
+// =============================================================================
 // BASIC UTILITY KERNELS
 // =============================================================================
 
@@ -215,6 +245,10 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     state->ksd_improvement_threshold = 0.05f; // Stop if relative improvement < 5%
     state->ksd_prev = 1e10f;                 // Initialize high
     state->stein_steps_used = n_stein_steps; // Diagnostic
+    
+    // === Heun's Method (Improved Euler) ===
+    // 0 = Euler (default), 1 = Heun's method (2nd order, 2× gradient evals)
+    state->use_heun = 0;
     
     // === Backward Smoothing (Fan et al. 2021 sliding window, lightweight) ===
     // Applies RTS-style correction to past estimates using recent observations
@@ -420,6 +454,11 @@ static void svpf_optimized_init(SVPFOptimizedState* opt, int n) {
     cudaMalloc(&opt->d_ksd_partial, n * sizeof(float));
     cudaMalloc(&opt->d_ksd, sizeof(float));
     
+    // === Heun's method buffers ===
+    cudaMalloc(&opt->d_phi_orig, n * sizeof(float));
+    cudaMalloc(&opt->d_phi_pred, n * sizeof(float));
+    cudaMalloc(&opt->d_h_orig, n * sizeof(float));
+    
     cudaStreamCreateWithFlags(&opt->graph_stream, cudaStreamNonBlocking);
     opt->graph_captured = false;
     opt->graph_n = 0;
@@ -455,6 +494,11 @@ static void svpf_optimized_cleanup(SVPFOptimizedState* opt) {
     // === KSD buffers ===
     cudaFree(opt->d_ksd_partial);
     cudaFree(opt->d_ksd);
+    
+    // === Heun's method buffers ===
+    cudaFree(opt->d_phi_orig);
+    cudaFree(opt->d_phi_pred);
+    cudaFree(opt->d_h_orig);
     
     if (opt->h_results_pinned) {
         cudaFreeHost(opt->h_results_pinned);
@@ -844,82 +888,176 @@ void svpf_step_graph(SVPFState* state, float y_t, float y_prev, const SVPFParams
             total_steps++;
             bool is_last_iteration = (ai == n_anneal - 1) && (s == si - 1);
             
-            // Gradient computation
-            svpf_fused_gradient_kernel<<<nb, BLOCK_SIZE, grad_smem, cs>>>(
-                state->h, state->h_prev, state->grad_log_p, state->log_weights,
-                state->use_newton ? opt->d_precond_grad : nullptr,
-                state->use_newton ? opt->d_inv_hessian : nullptr,
-                opt->d_y_single, 1, params->rho, effective_sigma_z, effective_mu,
-                beta, state->nu, student_t_const, state->lik_offset,
-                params->gamma, state->use_exact_gradient, state->use_newton,
-                state->use_fan_mode,
-                state->use_student_t_state, state->nu_state,
-                n
-            );
-            
-            // Stein transport (compute KSD only on LAST iteration)
-            if (is_last_iteration) {
-                // Final iteration: compute KSD for next timestep's budget
-                if (state->use_newton) {
-                    if (state->use_full_newton) {
-                        // Full Newton with KSD
-                        svpf_fused_stein_transport_full_newton_ksd_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
-                            state->h, state->grad_log_p, opt->d_inv_hessian,
-                            state->d_grad_v, state->rng_states, opt->d_bandwidth,
-                            opt->d_ksd_partial,
-                            base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps,
-                            state->stein_repulsive_sign, n
-                        );
-                    } else {
-                        // Regular Newton with KSD (uses preconditioned gradient)
-                        svpf_fused_stein_transport_newton_ksd_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
-                            state->h, opt->d_precond_grad, opt->d_inv_hessian,
-                            state->d_grad_v, state->rng_states, opt->d_bandwidth,
-                            opt->d_ksd_partial,
-                            base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps,
-                            state->stein_repulsive_sign, n
-                        );
-                    }
-                } else {
-                    // No Newton with KSD
-                    svpf_fused_stein_transport_ksd_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
-                        state->h, state->grad_log_p, state->d_grad_v,
-                        state->rng_states, opt->d_bandwidth,
-                        opt->d_ksd_partial,
-                        base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps,
+            // =================================================================
+            // HEUN'S METHOD (Improved Euler, 2nd order)
+            // =================================================================
+            if (state->use_heun) {
+                // --- Step 1: Save original h ---
+                svpf_copy_kernel<<<nb, BLOCK_SIZE, 0, cs>>>(state->h, opt->d_h_orig, n);
+                
+                // --- Step 2: Gradient at original h ---
+                svpf_fused_gradient_kernel<<<nb, BLOCK_SIZE, grad_smem, cs>>>(
+                    state->h, state->h_prev, state->grad_log_p, state->log_weights,
+                    state->use_newton ? opt->d_precond_grad : nullptr,
+                    state->use_newton ? opt->d_inv_hessian : nullptr,
+                    opt->d_y_single, 1, params->rho, effective_sigma_z, effective_mu,
+                    beta, state->nu, student_t_const, state->lik_offset,
+                    params->gamma, state->use_exact_gradient, state->use_newton,
+                    state->use_fan_mode,
+                    state->use_student_t_state, state->nu_state,
+                    n
+                );
+                
+                // --- Step 3: Compute φ(h) at original position ---
+                if (state->use_full_newton) {
+                    svpf_stein_operator_full_newton_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
+                        state->h, state->grad_log_p, opt->d_inv_hessian,
+                        opt->d_phi_orig, opt->d_bandwidth,
                         state->stein_repulsive_sign, n
+                    );
+                } else {
+                    svpf_stein_operator_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
+                        state->h, state->grad_log_p, opt->d_phi_orig,
+                        opt->d_bandwidth, state->stein_repulsive_sign, n
                     );
                 }
                 
-                // Reduce KSD (async - will sync later with outputs)
-                svpf_ksd_reduce_kernel<<<1, BLOCK_SIZE, 0, cs>>>(
-                    opt->d_ksd_partial, opt->d_ksd, n
+                // --- Step 4: Predictor (Euler step to h̃, NO noise) ---
+                svpf_heun_predictor_kernel<<<nb, BLOCK_SIZE, 0, cs>>>(
+                    state->h, opt->d_h_orig, opt->d_phi_orig,
+                    state->d_grad_v,  // RMSProp state (read-only here)
+                    base_step, beta_factor, state->rmsprop_eps, n
                 );
-            } else {
-                // Non-final iterations: standard transport (no KSD overhead)
-                if (state->use_newton) {
-                    if (state->use_full_newton) {
-                        svpf_fused_stein_transport_full_newton_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
-                            state->h, state->grad_log_p, opt->d_inv_hessian,
-                            state->d_grad_v, state->rng_states, opt->d_bandwidth,
-                            base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps,
-                            state->stein_repulsive_sign, n
-                        );
+                
+                // --- Step 5: Gradient at predicted h̃ ---
+                svpf_fused_gradient_kernel<<<nb, BLOCK_SIZE, grad_smem, cs>>>(
+                    state->h, state->h_prev, state->grad_log_p, state->log_weights,
+                    state->use_newton ? opt->d_precond_grad : nullptr,
+                    state->use_newton ? opt->d_inv_hessian : nullptr,
+                    opt->d_y_single, 1, params->rho, effective_sigma_z, effective_mu,
+                    beta, state->nu, student_t_const, state->lik_offset,
+                    params->gamma, state->use_exact_gradient, state->use_newton,
+                    state->use_fan_mode,
+                    state->use_student_t_state, state->nu_state,
+                    n
+                );
+                
+                // --- Step 6: Compute φ(h̃) at predicted position ---
+                if (state->use_full_newton) {
+                    svpf_stein_operator_full_newton_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
+                        state->h, state->grad_log_p, opt->d_inv_hessian,
+                        opt->d_phi_pred, opt->d_bandwidth,
+                        state->stein_repulsive_sign, n
+                    );
+                } else {
+                    svpf_stein_operator_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
+                        state->h, state->grad_log_p, opt->d_phi_pred,
+                        opt->d_bandwidth, state->stein_repulsive_sign, n
+                    );
+                }
+                
+                // --- Step 7: Corrector (average φ, apply from h_orig, with noise) ---
+                if (is_last_iteration) {
+                    // Final iteration: compute KSD
+                    svpf_heun_corrector_ksd_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
+                        state->h, opt->d_h_orig, opt->d_phi_orig, opt->d_phi_pred,
+                        state->grad_log_p,  // For KSD
+                        state->d_grad_v, state->rng_states, opt->d_bandwidth,
+                        opt->d_ksd_partial,
+                        base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps, n
+                    );
+                    svpf_ksd_reduce_kernel<<<1, BLOCK_SIZE, 0, cs>>>(
+                        opt->d_ksd_partial, opt->d_ksd, n
+                    );
+                } else {
+                    svpf_heun_corrector_kernel<<<nb, BLOCK_SIZE, 0, cs>>>(
+                        state->h, opt->d_h_orig, opt->d_phi_orig, opt->d_phi_pred,
+                        state->d_grad_v, state->rng_states,
+                        base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps, n
+                    );
+                }
+            }
+            // =================================================================
+            // EULER METHOD (Standard, 1st order)
+            // =================================================================
+            else {
+                // Gradient computation
+                svpf_fused_gradient_kernel<<<nb, BLOCK_SIZE, grad_smem, cs>>>(
+                    state->h, state->h_prev, state->grad_log_p, state->log_weights,
+                    state->use_newton ? opt->d_precond_grad : nullptr,
+                    state->use_newton ? opt->d_inv_hessian : nullptr,
+                    opt->d_y_single, 1, params->rho, effective_sigma_z, effective_mu,
+                    beta, state->nu, student_t_const, state->lik_offset,
+                    params->gamma, state->use_exact_gradient, state->use_newton,
+                    state->use_fan_mode,
+                    state->use_student_t_state, state->nu_state,
+                    n
+                );
+                
+                // Stein transport (compute KSD only on LAST iteration)
+                if (is_last_iteration) {
+                    // Final iteration: compute KSD for next timestep's budget
+                    if (state->use_newton) {
+                        if (state->use_full_newton) {
+                            // Full Newton with KSD
+                            svpf_fused_stein_transport_full_newton_ksd_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
+                                state->h, state->grad_log_p, opt->d_inv_hessian,
+                                state->d_grad_v, state->rng_states, opt->d_bandwidth,
+                                opt->d_ksd_partial,
+                                base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps,
+                                state->stein_repulsive_sign, n
+                            );
+                        } else {
+                            // Regular Newton with KSD (uses preconditioned gradient)
+                            svpf_fused_stein_transport_newton_ksd_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
+                                state->h, opt->d_precond_grad, opt->d_inv_hessian,
+                                state->d_grad_v, state->rng_states, opt->d_bandwidth,
+                                opt->d_ksd_partial,
+                                base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps,
+                                state->stein_repulsive_sign, n
+                            );
+                        }
                     } else {
-                        svpf_fused_stein_transport_newton_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
-                            state->h, opt->d_precond_grad, opt->d_inv_hessian,
-                            state->d_grad_v, state->rng_states, opt->d_bandwidth,
+                        // No Newton with KSD
+                        svpf_fused_stein_transport_ksd_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
+                            state->h, state->grad_log_p, state->d_grad_v,
+                            state->rng_states, opt->d_bandwidth,
+                            opt->d_ksd_partial,
                             base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps,
                             state->stein_repulsive_sign, n
                         );
                     }
-                } else {
-                    svpf_fused_stein_transport_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
-                        state->h, state->grad_log_p, state->d_grad_v,
-                        state->rng_states, opt->d_bandwidth,
-                        base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps,
-                        state->stein_repulsive_sign, n
+                    
+                    // Reduce KSD (async - will sync later with outputs)
+                    svpf_ksd_reduce_kernel<<<1, BLOCK_SIZE, 0, cs>>>(
+                        opt->d_ksd_partial, opt->d_ksd, n
                     );
+                } else {
+                    // Non-final iterations: standard transport (no KSD overhead)
+                    if (state->use_newton) {
+                        if (state->use_full_newton) {
+                            svpf_fused_stein_transport_full_newton_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
+                                state->h, state->grad_log_p, opt->d_inv_hessian,
+                                state->d_grad_v, state->rng_states, opt->d_bandwidth,
+                                base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps,
+                                state->stein_repulsive_sign, n
+                            );
+                        } else {
+                            svpf_fused_stein_transport_newton_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
+                                state->h, opt->d_precond_grad, opt->d_inv_hessian,
+                                state->d_grad_v, state->rng_states, opt->d_bandwidth,
+                                base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps,
+                                state->stein_repulsive_sign, n
+                            );
+                        }
+                    } else {
+                        svpf_fused_stein_transport_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
+                            state->h, state->grad_log_p, state->d_grad_v,
+                            state->rng_states, opt->d_bandwidth,
+                            base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps,
+                            state->stein_repulsive_sign, n
+                        );
+                    }
                 }
             }
         }

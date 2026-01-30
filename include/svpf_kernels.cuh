@@ -430,6 +430,79 @@ __global__ void svpf_partial_rejuvenation_kernel(
 );
 
 // =============================================================================
+// HEUN'S METHOD KERNELS (svpf_opt_kernels.cu)
+// =============================================================================
+// Heun's method (improved Euler) for 2nd order accuracy
+
+// Compute Stein operator φ(h) without transport
+__global__ void svpf_stein_operator_kernel(
+    const float* __restrict__ h,
+    const float* __restrict__ grad,
+    float* __restrict__ phi_out,
+    const float* __restrict__ d_bandwidth,
+    int stein_sign_mode,
+    int n
+);
+
+// Stein operator with Full Newton preconditioning
+__global__ void svpf_stein_operator_full_newton_kernel(
+    const float* __restrict__ h,
+    const float* __restrict__ grad,
+    const float* __restrict__ local_hessian,
+    float* __restrict__ phi_out,
+    const float* __restrict__ d_bandwidth,
+    int stein_sign_mode,
+    int n
+);
+
+// Heun predictor: h̃ = h_orig + ε·φ (no noise)
+__global__ void svpf_heun_predictor_kernel(
+    float* __restrict__ h,
+    const float* __restrict__ h_orig,
+    const float* __restrict__ phi,
+    const float* __restrict__ v_rmsprop,
+    float step_size,
+    float beta_factor,
+    float epsilon,
+    int n
+);
+
+// Heun corrector: h = h_orig + (ε/2)·(φ₁ + φ₂) + noise
+__global__ void svpf_heun_corrector_kernel(
+    float* __restrict__ h,
+    const float* __restrict__ h_orig,
+    const float* __restrict__ phi_orig,
+    const float* __restrict__ phi_pred,
+    float* __restrict__ v_rmsprop,
+    curandStatePhilox4_32_10_t* __restrict__ rng,
+    float step_size,
+    float beta_factor,
+    float temperature,
+    float rho_rmsprop,
+    float epsilon,
+    int n
+);
+
+// Heun corrector with KSD computation
+__global__ void svpf_heun_corrector_ksd_kernel(
+    float* __restrict__ h,
+    const float* __restrict__ h_orig,
+    const float* __restrict__ phi_orig,
+    const float* __restrict__ phi_pred,
+    const float* __restrict__ grad,
+    float* __restrict__ v_rmsprop,
+    curandStatePhilox4_32_10_t* __restrict__ rng,
+    const float* __restrict__ d_bandwidth,
+    float* __restrict__ d_ksd_partial,
+    float step_size,
+    float beta_factor,
+    float temperature,
+    float rho_rmsprop,
+    float epsilon,
+    int n
+);
+
+// =============================================================================
 // Host-side Helper (inline - safe in header)
 // =============================================================================
 

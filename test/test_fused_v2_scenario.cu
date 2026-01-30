@@ -351,7 +351,7 @@ int main(int argc, char** argv) {
     float* std_vol = (float*)malloc(n_ticks * sizeof(float));
     
     // Create standard filter with same settings
-    SVPFState* filter = svpf_create(n_particles, 10, 5.0f, NULL);
+    SVPFState* filter = svpf_create(n_particles, 8, 5.0f, NULL);
     SVPFParams params = {0.97f, 0.15f, -4.5f, 0.0f};
     
     filter->use_guide = 1;

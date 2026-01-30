@@ -224,7 +224,12 @@ typedef struct {
     float *d_ksd_partial; // Partial sums for KSD reduction [n floats]
     float *d_ksd;         // Final KSD value [1 float]
 
-    float* d_beta_schedule;    // [8] Beta schedule for persistent kernel
+    float *d_beta_schedule; // [8] Beta schedule for persistent kernel
+
+    // === Heun's Method Buffers ===
+    float *d_phi_orig; // Stein operator at original h
+    float *d_phi_pred; // Stein operator at predicted h̃
+    float *d_h_orig;   // Original h before predictor step
 } SVPFOptimizedState;
 
 /**
@@ -507,6 +512,7 @@ typedef struct {
     int use_persistent_kernel;       // 0 = standard, 1 = persistent
     int persistent_kernel_supported; // Set at creation
 
+    int use_heun;  // 0 = Euler (default), 1 = Heun's method
 
 
 } SVPFState;

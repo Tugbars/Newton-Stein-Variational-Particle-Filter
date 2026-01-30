@@ -1273,3 +1273,294 @@ __global__ void svpf_partial_rejuvenation_kernel(
         h[i] = clamp_logvol(h_new);
     }
 }
+
+// =============================================================================
+// HEUN'S METHOD KERNELS
+// =============================================================================
+// Heun's method (improved Euler) is a predictor-corrector scheme:
+//   1. Predictor: h̃ = h + ε·φ(h)         [Euler step]
+//   2. Corrector: h = h + (ε/2)·(φ(h) + φ(h̃))
+//
+// Achieves second-order accuracy vs first-order for Euler.
+// Cost: 2× gradient/Stein evaluations per step.
+// Benefit: Can use half iterations for same accuracy, or same for 2× better.
+
+// -----------------------------------------------------------------------------
+// STEIN OPERATOR KERNEL (Compute Only, No Transport)
+// -----------------------------------------------------------------------------
+// Computes φ(h) and stores to output buffer. Does NOT apply transport.
+
+__global__ void svpf_stein_operator_kernel(
+    const float* __restrict__ h,
+    const float* __restrict__ grad,
+    float* __restrict__ phi_out,
+    const float* __restrict__ d_bandwidth,
+    int stein_sign_mode,
+    int n
+) {
+    extern __shared__ float smem[];
+    float* sh_h = smem;
+    float* sh_grad = smem + n;
+    
+    for (int k = threadIdx.x; k < n; k += blockDim.x) {
+        sh_h[k] = h[k];
+        sh_grad[k] = grad[k];
+    }
+    __syncthreads();
+    
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    
+    float h_i = sh_h[i];
+    float global_bw = *d_bandwidth;
+    float bw_sq = global_bw * global_bw;
+    float inv_bw_sq = 1.0f / bw_sq;
+    float inv_n = 1.0f / (float)n;
+    
+    float sign_mult = (stein_sign_mode == 1) ? 1.0f : -1.0f;
+    
+    float k_sum = 0.0f;
+    float gk_sum = 0.0f;
+    
+    #pragma unroll 8
+    for (int j = 0; j < n; j++) {
+        float diff = h_i - sh_h[j];
+        float dist_sq = diff * diff * inv_bw_sq;
+        
+        float base = 1.0f + dist_sq;
+        float K = 1.0f / base;
+        float K_sq = K * K;
+        
+        k_sum += K * sh_grad[j];
+        gk_sum += sign_mult * 2.0f * diff * inv_bw_sq * K_sq;
+    }
+    
+    phi_out[i] = (k_sum + gk_sum) * inv_n;
+}
+
+// -----------------------------------------------------------------------------
+// STEIN OPERATOR KERNEL (Full Newton variant)
+// -----------------------------------------------------------------------------
+
+__global__ void svpf_stein_operator_full_newton_kernel(
+    const float* __restrict__ h,
+    const float* __restrict__ grad,
+    const float* __restrict__ local_hessian,
+    float* __restrict__ phi_out,
+    const float* __restrict__ d_bandwidth,
+    int stein_sign_mode,
+    int n
+) {
+    extern __shared__ float smem[];
+    float* sh_h = smem;
+    float* sh_grad = smem + n;
+    float* sh_hess = smem + 2 * n;
+    
+    for (int k = threadIdx.x; k < n; k += blockDim.x) {
+        sh_h[k] = h[k];
+        sh_grad[k] = grad[k];
+        sh_hess[k] = local_hessian[k];
+    }
+    __syncthreads();
+    
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    
+    float h_i = sh_h[i];
+    float global_bw = *d_bandwidth;
+    float bw_sq = global_bw * global_bw;
+    float inv_bw_sq = 1.0f / bw_sq;
+    float inv_n = 1.0f / (float)n;
+    
+    float sign_mult = (stein_sign_mode == 1) ? 1.0f : -1.0f;
+    
+    float H_weighted = 0.0f;
+    float K_sum_norm = 0.0f;
+    float k_grad_sum = 0.0f;
+    float gk_sum = 0.0f;
+    
+    #pragma unroll 4
+    for (int j = 0; j < n; j++) {
+        float diff = h_i - sh_h[j];
+        float dist_sq = diff * diff * inv_bw_sq;
+        
+        float base = 1.0f + dist_sq;
+        float K = 1.0f / base;
+        float K_sq = K * K;
+        
+        H_weighted += sh_hess[j] * K;
+        float Nk = 2.0f * inv_bw_sq * K_sq * fabsf(3.0f * dist_sq - 1.0f);
+        H_weighted += Nk;
+        K_sum_norm += K;
+        
+        k_grad_sum += K * sh_grad[j];
+        gk_sum += sign_mult * 2.0f * diff * inv_bw_sq * K_sq;
+    }
+    
+    H_weighted = H_weighted / fmaxf(K_sum_norm, 1e-6f);
+    H_weighted = fminf(fmaxf(H_weighted, 0.1f), 100.0f);
+    float inv_H_i = 1.0f / H_weighted;
+    
+    phi_out[i] = (k_grad_sum + gk_sum) * inv_n * inv_H_i * 0.7f;
+}
+
+// -----------------------------------------------------------------------------
+// HEUN PREDICTOR KERNEL (Euler step, no noise)
+// -----------------------------------------------------------------------------
+// Applies h̃ = h + ε·φ with RMSProp preconditioning, NO SVLD noise yet
+
+__global__ void svpf_heun_predictor_kernel(
+    float* __restrict__ h,
+    const float* __restrict__ h_orig,
+    const float* __restrict__ phi,
+    const float* __restrict__ v_rmsprop,  // Read-only for predictor
+    float step_size,
+    float beta_factor,
+    float epsilon,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    
+    float phi_i = phi[i];
+    float v_i = v_rmsprop[i];
+    
+    float effective_step = step_size * beta_factor;
+    float precond = rsqrtf(v_i + epsilon);
+    float drift = effective_step * phi_i * precond;
+    
+    // Predictor: NO noise, just drift
+    h[i] = clamp_logvol(h_orig[i] + drift);
+}
+
+// -----------------------------------------------------------------------------
+// HEUN CORRECTOR KERNEL
+// -----------------------------------------------------------------------------
+// Applies h = h_orig + (ε/2)·(φ₁ + φ₂) with RMSProp update and SVLD noise
+
+__global__ void svpf_heun_corrector_kernel(
+    float* __restrict__ h,
+    const float* __restrict__ h_orig,
+    const float* __restrict__ phi_orig,
+    const float* __restrict__ phi_pred,
+    float* __restrict__ v_rmsprop,
+    curandStatePhilox4_32_10_t* __restrict__ rng,
+    float step_size,
+    float beta_factor,
+    float temperature,
+    float rho_rmsprop,
+    float epsilon,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    
+    // Average the two Stein operators
+    float phi_avg = 0.5f * (phi_orig[i] + phi_pred[i]);
+    
+    // RMSProp update on averaged phi
+    float v_prev = v_rmsprop[i];
+    float v_new = rho_rmsprop * v_prev + (1.0f - rho_rmsprop) * phi_avg * phi_avg;
+    v_rmsprop[i] = v_new;
+    
+    // Transport from ORIGINAL position
+    float effective_step = step_size * beta_factor;
+    float precond = rsqrtf(v_new + epsilon);
+    float drift = effective_step * phi_avg * precond;
+    
+    // SVLD noise (only in corrector)
+    float diffusion = 0.0f;
+    if (temperature > 1e-6f) {
+        float noise = curand_normal(&rng[i]);
+        diffusion = sqrtf(2.0f * effective_step * temperature) * noise;
+    }
+    
+    h[i] = clamp_logvol(h_orig[i] + drift + diffusion);
+}
+
+// -----------------------------------------------------------------------------
+// HEUN CORRECTOR WITH KSD KERNEL
+// -----------------------------------------------------------------------------
+// Same as corrector but also computes KSD for adaptive stepping
+
+__global__ void svpf_heun_corrector_ksd_kernel(
+    float* __restrict__ h,
+    const float* __restrict__ h_orig,
+    const float* __restrict__ phi_orig,
+    const float* __restrict__ phi_pred,
+    const float* __restrict__ grad,  // For KSD computation
+    float* __restrict__ v_rmsprop,
+    curandStatePhilox4_32_10_t* __restrict__ rng,
+    const float* __restrict__ d_bandwidth,
+    float* __restrict__ d_ksd_partial,
+    float step_size,
+    float beta_factor,
+    float temperature,
+    float rho_rmsprop,
+    float epsilon,
+    int n
+) {
+    extern __shared__ float smem[];
+    float* sh_h = smem;
+    float* sh_grad = smem + n;
+    
+    // Load h_orig and grad for KSD computation
+    for (int k = threadIdx.x; k < n; k += blockDim.x) {
+        sh_h[k] = h_orig[k];
+        sh_grad[k] = grad[k];
+    }
+    __syncthreads();
+    
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    
+    // ----- Heun correction -----
+    float phi_avg = 0.5f * (phi_orig[i] + phi_pred[i]);
+    
+    float v_prev = v_rmsprop[i];
+    float v_new = rho_rmsprop * v_prev + (1.0f - rho_rmsprop) * phi_avg * phi_avg;
+    v_rmsprop[i] = v_new;
+    
+    float effective_step = step_size * beta_factor;
+    float precond = rsqrtf(v_new + epsilon);
+    float drift = effective_step * phi_avg * precond;
+    
+    float diffusion = 0.0f;
+    if (temperature > 1e-6f) {
+        float noise = curand_normal(&rng[i]);
+        diffusion = sqrtf(2.0f * effective_step * temperature) * noise;
+    }
+    
+    h[i] = clamp_logvol(h_orig[i] + drift + diffusion);
+    
+    // ----- KSD computation -----
+    float h_i = sh_h[i];
+    float s_i = sh_grad[i];
+    float global_bw = *d_bandwidth;
+    float bw_sq = global_bw * global_bw;
+    float inv_bw_sq = 1.0f / bw_sq;
+    
+    float ksd_sum = 0.0f;
+    
+    #pragma unroll 8
+    for (int j = 0; j < n; j++) {
+        float h_j = sh_h[j];
+        float s_j = sh_grad[j];
+        float diff = h_i - h_j;
+        float diff_sq = diff * diff;
+        float dist_sq = diff_sq * inv_bw_sq;
+        
+        float base = 1.0f + dist_sq;
+        float K = 1.0f / base;
+        float K_sq = K * K;
+        
+        float grad_x_k = -2.0f * diff * inv_bw_sq * K_sq;
+        float grad_y_k = -grad_x_k;
+        float hess_xy_k = 2.0f * inv_bw_sq * K_sq * (4.0f * dist_sq * K - 1.0f);
+        
+        float u_ij = K * s_i * s_j + s_i * grad_y_k + s_j * grad_x_k + hess_xy_k;
+        ksd_sum += u_ij;
+    }
+    
+    d_ksd_partial[i] = ksd_sum;
+}
