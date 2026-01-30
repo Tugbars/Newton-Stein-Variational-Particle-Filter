@@ -153,7 +153,7 @@ static void configure_modified(void* state_ptr) {
     //f->use_local_params = 1;
    // f->delta_sigma = 0.15f;  // State-dependent sigma: wider when far from mu
     // f->delta_rho = 0.04f; // Could also test state-dependent rho
-    f->use_heun = 1;
+    //f->use_heun = 1;
 }
 
 /**

@@ -465,7 +465,7 @@ SVPFTestConfig svpf_test_default_config(void) {
     c.n_steps = 5000;
     c.warmup_steps = 100;
     c.n_particles = 512;
-    c.n_stein_steps = 5;
+    c.n_stein_steps = 8;
     c.coverage_levels[0] = 0.50f;
     c.coverage_levels[1] = 0.90f;
     c.coverage_levels[2] = 0.95f;
@@ -513,7 +513,7 @@ SVPFTestMetrics svpf_test_run_single(
     }
     
     // Create filter
-    SVPFState* state = svpf_create(n_particles, config->n_stein_steps, 7.0f, NULL);
+    SVPFState* state = svpf_create(n_particles, config->n_stein_steps, 50.0f, NULL);
     svpf_initialize(state, filter_params, (unsigned int)seed);
     
     // Timer
