@@ -254,9 +254,26 @@ static void configure_two_factor(SVPFState* f, const TwoFactorDGPParams& dgp) {
     f->rho_slow = dgp.rho_slow;
     f->sigma_slow = dgp.sigma_slow;
     
-    // Disable features that compete with two-factor
-    f->use_adaptive_mu = 0;      // h_slow tracks long-run level
-    f->use_adaptive_sigma = 0;   // We have separate sigma_fast/slow
+    // === TUNING CHANGES ===
+    
+    // 1. Lower bandwidth floor for h_slow (was 0.10, particles too clustered)
+    f->bw_floor_fast = 0.01f;
+    f->bw_floor_slow = 0.05f;  // Lowered from 0.10
+    
+    // 2. Stronger guide (two components need more pull)
+    f->guide_strength = 0.12f;  // Was 0.05
+    
+    // 3. RE-ENABLE adaptive_mu - it helps track long-run level
+    f->use_adaptive_mu = 1;
+    f->mu_process_var = 0.001f;
+    f->mu_obs_var_scale = 11.0f;
+    
+    // 4. Keep adaptive_sigma OFF - we have separate sigma_fast/slow
+    f->use_adaptive_sigma = 0;
+    
+    // 5. More Stein steps for two components
+    f->stein_min_steps = 10;  // Was 8
+    f->stein_max_steps = 20;  // Was 16
 }
 
 // =============================================================================

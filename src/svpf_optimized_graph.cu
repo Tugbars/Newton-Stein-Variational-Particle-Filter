@@ -263,7 +263,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     state->rho_slow = 0.99f;
     state->sigma_slow = 0.05f;
     state->bw_floor_fast = 0.01f;
-    state->bw_floor_slow = 0.10f;
+    state->bw_floor_slow = 0.05f;  // Lowered from 0.10 - allows h_slow transport
     state->guide_mean_fast = 0.0f;
     state->guide_mean_slow = 0.0f;
     state->guide_var_fast = 0.0f;
@@ -879,17 +879,6 @@ static void svpf_step_two_factor(
     cudaMemcpyAsync(&results[1], opt->d_vol_single, sizeof(float), cudaMemcpyDeviceToHost, cs);
     cudaMemcpyAsync(&results[2], opt->d_h_mean_prev, sizeof(float), cudaMemcpyDeviceToHost, cs);
     cudaStreamSynchronize(cs);
-    
-    // DEBUG - remove after fixing
-    if (state->timestep < 5) {
-        float dbg_fast, dbg_slow, dbg_bw_fast, dbg_bw_slow;
-        cudaMemcpy(&dbg_fast, opt->d_h_fast_mean, sizeof(float), cudaMemcpyDeviceToHost);
-        cudaMemcpy(&dbg_slow, opt->d_h_slow_mean, sizeof(float), cudaMemcpyDeviceToHost);
-        cudaMemcpy(&dbg_bw_fast, opt->d_bandwidth_fast, sizeof(float), cudaMemcpyDeviceToHost);
-        cudaMemcpy(&dbg_bw_slow, opt->d_bandwidth_slow, sizeof(float), cudaMemcpyDeviceToHost);
-        printf("2F t=%d: y=%.4f, h_fast=%.3f, h_slow=%.3f, h_total=%.3f (mu=%.2f), vol=%.4f, bw_f=%.3f, bw_s=%.3f\n",
-               state->timestep, y_t, dbg_fast, dbg_slow, results[2], params->mu, results[1], dbg_bw_fast, dbg_bw_slow);
-    }
     
     if (loglik_out) *loglik_out = results[0];
     if (vol_out) *vol_out = results[1];
