@@ -465,7 +465,7 @@ SVPFTestConfig svpf_test_default_config(void) {
     c.n_steps = 5000;
     c.warmup_steps = 100;
     c.n_particles = 512;
-    c.n_stein_steps = 8;
+    c.n_stein_steps = 5;
     c.coverage_levels[0] = 0.50f;
     c.coverage_levels[1] = 0.90f;
     c.coverage_levels[2] = 0.95f;
