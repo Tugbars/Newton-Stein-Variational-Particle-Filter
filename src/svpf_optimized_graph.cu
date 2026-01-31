@@ -35,37 +35,6 @@
 
 // Forward declarations
 static void svpf_optimized_init(SVPFOptimizedState* opt, int n);
-
-// =============================================================================
-// HEUN'S METHOD KERNEL DECLARATIONS
-// =============================================================================
-// These kernels are defined in svpf_opt_kernels.cu
-
-__global__ void svpf_stein_operator_kernel(
-    const float* h, const float* grad, float* phi_out,
-    const float* d_bandwidth, int stein_sign_mode, int n);
-
-__global__ void svpf_stein_operator_full_newton_kernel(
-    const float* h, const float* grad, const float* local_hessian,
-    float* phi_out, const float* d_bandwidth, int stein_sign_mode, int n);
-
-__global__ void svpf_heun_predictor_kernel(
-    float* h, const float* h_orig, const float* phi, const float* v_rmsprop,
-    float step_size, float beta_factor, float epsilon, int n);
-
-__global__ void svpf_heun_corrector_kernel(
-    float* h, const float* h_orig, const float* phi_orig, const float* phi_pred,
-    float* v_rmsprop, curandStatePhilox4_32_10_t* rng,
-    float step_size, float beta_factor, float temperature,
-    float rho_rmsprop, float epsilon, int n);
-
-__global__ void svpf_heun_corrector_ksd_kernel(
-    float* h, const float* h_orig, const float* phi_orig, const float* phi_pred,
-    const float* grad, float* v_rmsprop, curandStatePhilox4_32_10_t* rng,
-    const float* d_bandwidth, float* d_ksd_partial,
-    float step_size, float beta_factor, float temperature,
-    float rho_rmsprop, float epsilon, int n);
-
 // =============================================================================
 // BASIC UTILITY KERNELS
 // =============================================================================
