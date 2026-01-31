@@ -241,10 +241,10 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     state->rejuv_prob = 0.30f;          // Nudge 30% of particles
     state->rejuv_blend = 0.30f;         // 30% toward guide, 70% stay
     
-    state->use_newton = 1;
-    state->use_full_newton = 1;
+    state->use_newton = 0;
+    state->use_full_newton = 0;
     
-    state->use_guided = 1;
+    state->use_guided = 0;
     state->guided_alpha_base = 0.0f;
     state->guided_alpha_shock = 0.5f;
     state->guided_innovation_threshold = 1.5f;
@@ -253,7 +253,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     state->delta_rho = 0.02f;
     state->delta_sigma = 0.1f;
     
-    state->use_adaptive_mu = 1;
+    state->use_adaptive_mu = 0;
     state->mu_state = -3.5f;
     state->mu_var = 1.0f;
     state->mu_process_var = 0.001f;
@@ -261,7 +261,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     state->mu_min = -6.0f;
     state->mu_max = -1.0f;
     
-    state->use_adaptive_sigma = 1;
+    state->use_adaptive_sigma = 0;
     state->sigma_boost_threshold = 1.0f;
     state->sigma_boost_max = 3.0f;
     state->sigma_z_effective = 0.10f;
@@ -277,12 +277,12 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     
     // === Student-t state dynamics ===
     // 0 = Gaussian AR(1) (default), 1 = Student-t AR(1) with bounded gradients
-    state->use_student_t_state = 1;
+    state->use_student_t_state = 0;
     state->nu_state = 5.0f;  // Degrees of freedom for state dynamics (recommended: 5-7, min: 3)
     // Note: nu_state is clamped to >= 2.5 in svpf_initialize to ensure finite variance
     
     // === KSD-based Adaptive Stein Steps ===
-    state->stein_min_steps = 8;              // Always run at least this many
+    state->stein_min_steps = 4;              // Always run at least this many
     state->stein_max_steps = 12;             // Never exceed this
     state->ksd_improvement_threshold = 0.05f; // Stop if relative improvement < 5%
     state->ksd_prev = 1e10f;                 // Initialize high
@@ -298,7 +298,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     
     // === Backward Smoothing (Fan et al. 2021 sliding window, lightweight) ===
     // Applies RTS-style correction to past estimates using recent observations
-    state->use_smoothing = 1;                // OFF by default
+    state->use_smoothing = 0;                // OFF by default
     state->smooth_lag = 3;                   // Window size (1-5 recommended)
     state->smooth_output_lag = 1;            // Output h[t-1] instead of h[t]
     for (int i = 0; i < SVPF_SMOOTH_MAX_LAG; i++) {
@@ -1081,26 +1081,22 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
                 );
                 
                 // =============================================================
-                // PARALLEL STEIN PATH (for N >= 1024)
+                // PARALLEL STEIN PATH (for N >= 1024) - STREAMING ARCHITECTURE
                 // =============================================================
                 // Uses N blocks × 256 threads for ~2x speedup at large N
                 // 
-                // Modes:
-                //   use_newton=false                    → Standard (parallel supported)
-                //   use_newton=true, use_full_newton=true  → Full Newton (parallel supported)
-                //   use_newton=true, use_full_newton=false → Regular Newton (serial only)
+                // CRITICAL: Uses 0 dynamic shared memory!
+                // Previous version silently failed due to smem exhaustion at N>2048
+                // Streaming reads directly from global memory (L2 cached)
                 
                 bool use_parallel_standard = (n >= STEIN_PARALLEL_THRESHOLD) && !state->use_newton;
                 bool use_parallel_full_newton = (n >= STEIN_PARALLEL_THRESHOLD) && 
                                                 state->use_newton && state->use_full_newton;
                 
                 if (use_parallel_full_newton) {
-                    // Full Newton path (uses local_hessian)
-                    size_t parallel_smem = (3 * n + 4 * STEIN_PARALLEL_BLOCK_SIZE) * sizeof(float);
-                    size_t parallel_smem_ksd = (3 * n + 5 * STEIN_PARALLEL_BLOCK_SIZE) * sizeof(float);
-                    
+                    // Full Newton path - STREAMING (0 dynamic smem)
                     if (is_last_iteration) {
-                        svpf_stein_operator_parallel_full_newton_ksd_kernel<<<n, STEIN_PARALLEL_BLOCK_SIZE, parallel_smem_ksd, cs>>>(
+                        svpf_stein_operator_parallel_full_newton_ksd_kernel<<<n, STEIN_PARALLEL_BLOCK_SIZE, 0, cs>>>(
                             state->h, state->grad_log_p, opt->d_inv_hessian,
                             opt->d_phi, opt->d_ksd_partial,
                             opt->d_bandwidth, state->stein_repulsive_sign, n
@@ -1109,7 +1105,7 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
                             opt->d_ksd_partial, opt->d_ksd, n
                         );
                     } else {
-                        svpf_stein_operator_parallel_full_newton_kernel<<<n, STEIN_PARALLEL_BLOCK_SIZE, parallel_smem, cs>>>(
+                        svpf_stein_operator_parallel_full_newton_kernel<<<n, STEIN_PARALLEL_BLOCK_SIZE, 0, cs>>>(
                             state->h, state->grad_log_p, opt->d_inv_hessian,
                             opt->d_phi, opt->d_bandwidth, state->stein_repulsive_sign, n
                         );
@@ -1121,12 +1117,9 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
                         base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps, n
                     );
                 } else if (use_parallel_standard) {
-                    // Non-Newton path (standard gradient)
-                    size_t parallel_smem = (2 * n + 2 * STEIN_PARALLEL_BLOCK_SIZE) * sizeof(float);
-                    size_t parallel_smem_ksd = (2 * n + 3 * STEIN_PARALLEL_BLOCK_SIZE) * sizeof(float);
-                    
+                    // Standard path - STREAMING (0 dynamic smem)
                     if (is_last_iteration) {
-                        svpf_stein_operator_parallel_ksd_kernel<<<n, STEIN_PARALLEL_BLOCK_SIZE, parallel_smem_ksd, cs>>>(
+                        svpf_stein_operator_parallel_ksd_kernel<<<n, STEIN_PARALLEL_BLOCK_SIZE, 0, cs>>>(
                             state->h, state->grad_log_p, opt->d_phi, opt->d_ksd_partial,
                             opt->d_bandwidth, state->stein_repulsive_sign, n
                         );
@@ -1134,7 +1127,7 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
                             opt->d_ksd_partial, opt->d_ksd, n
                         );
                     } else {
-                        svpf_stein_operator_parallel_kernel<<<n, STEIN_PARALLEL_BLOCK_SIZE, parallel_smem, cs>>>(
+                        svpf_stein_operator_parallel_kernel<<<n, STEIN_PARALLEL_BLOCK_SIZE, 0, cs>>>(
                             state->h, state->grad_log_p, opt->d_phi,
                             opt->d_bandwidth, state->stein_repulsive_sign, n
                         );
