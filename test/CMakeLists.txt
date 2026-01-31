@@ -346,6 +346,26 @@ set_target_properties(test_extreme_crypto_stress PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
 )
 
+# Profile Multi Stream
+add_executable(test_stein_parallel test_stein_parallel.cu)
+
+target_include_directories(test_stein_parallel
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CUDAToolkit_INCLUDE_DIRS}
+)
+
+target_link_libraries(test_stein_parallel
+    PRIVATE
+        svpf
+        CUDA::cudart
+        CUDA::curand
+)
+
+set_target_properties(test_stein_parallel PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+)
+
 
 
 
