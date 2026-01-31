@@ -1968,17 +1968,6 @@ __device__ __forceinline__ void warp_reduce_4(float* v1, float* v2, float* v3, f
     }
 }
 
-__device__ __forceinline__ void warp_reduce_5(float* v1, float* v2, float* v3, float* v4, float* v5) {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2) {
-        *v1 += __shfl_down_sync(0xffffffff, *v1, offset);
-        *v2 += __shfl_down_sync(0xffffffff, *v2, offset);
-        *v3 += __shfl_down_sync(0xffffffff, *v3, offset);
-        *v4 += __shfl_down_sync(0xffffffff, *v4, offset);
-        *v5 += __shfl_down_sync(0xffffffff, *v5, offset);
-    }
-}
-
 // -----------------------------------------------------------------------------
 // Parallel Standard Stein Operator (No Newton, No KSD)
 // FIXED: Fused accumulation to match sequential floating-point behavior
@@ -2005,7 +1994,6 @@ __global__ void svpf_stein_operator_parallel_kernel(
     float inv_n = 1.0f / (float)n;
 
     // FUSED: Single accumulator to prevent catastrophic cancellation
-    // Sequential combines (grad_term + repulsive_term) per j immediately
     float combined_sum = 0.0f;
 
     for (int j = tid; j < n; j += blockDim.x) {
@@ -2021,36 +2009,26 @@ __global__ void svpf_stein_operator_parallel_kernel(
         float grad_term = K * grad_j;
         float repulsive_term = sign_mult * 2.0f * diff * inv_bw_sq * K_sq;
         
-        // Combine BEFORE accumulating (mimics sequential)
         combined_sum += (grad_term + repulsive_term);
     }
 
-    // Sync before warp reduction to handle non-multiple of blockDim.x
     __syncthreads();
 
-    // Warp reduction for single value
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2) {
-        combined_sum += __shfl_down_sync(0xffffffff, combined_sum, offset);
-    }
+    // Warp reduction
+    warp_reduce_2(&combined_sum, &combined_sum); // Just reduce same var twice (hack for size 1)
 
-    // Zero-init shared memory to prevent garbage from inactive warps
+    // Explicit Zero-Init for safety
     __shared__ float s_combined[8];
-    if (tid < 8) { s_combined[tid] = 0.0f; }
+    if (tid < 8) s_combined[tid] = 0.0f;
     __syncthreads();
 
     if (lane == 0) { s_combined[wid] = combined_sum; }
     __syncthreads();
 
-    if (tid < 8) { combined_sum = s_combined[tid]; } 
-    else { combined_sum = 0.0f; }
+    if (tid < 8) combined_sum = s_combined[tid];
+    else combined_sum = 0.0f;
 
-    if (wid == 0) {
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset /= 2) {
-            combined_sum += __shfl_down_sync(0xffffffff, combined_sum, offset);
-        }
-    }
+    if (wid == 0) warp_reduce_2(&combined_sum, &combined_sum);
 
     if (tid == 0) {
         phi_out[i] = combined_sum * inv_n;
@@ -2059,7 +2037,7 @@ __global__ void svpf_stein_operator_parallel_kernel(
 
 // -----------------------------------------------------------------------------
 // Parallel Standard Stein Operator + KSD (No Newton)
-// FIXED: Fused phi accumulation to match sequential floating-point behavior
+// FIXED: Fused phi accumulation + KSD
 // -----------------------------------------------------------------------------
 __global__ void svpf_stein_operator_parallel_ksd_kernel(
     const float* __restrict__ h,
@@ -2084,7 +2062,6 @@ __global__ void svpf_stein_operator_parallel_ksd_kernel(
     float sign_mult = (stein_sign_mode == 1) ? 1.0f : -1.0f;
     float inv_n = 1.0f / (float)n;
 
-    // FUSED: Single accumulator for phi terms
     float combined_sum = 0.0f;
     float ksd_sum = 0.0f;
 
@@ -2101,11 +2078,9 @@ __global__ void svpf_stein_operator_parallel_ksd_kernel(
 
         float grad_term = K * grad_j;
         float repulsive_term = sign_mult * 2.0f * diff * inv_bw_sq * K_sq;
-        
-        // Fuse phi terms immediately
         combined_sum += (grad_term + repulsive_term);
 
-        // KSD (separate - not part of phi)
+        // KSD
         float grad_k_i = -2.0f * diff * inv_bw_sq * K_sq;
         float grad_k_j = -grad_k_i;
         float grad2_k = -2.0f * inv_bw_sq * K_sq + 8.0f * dist_sq * inv_bw_sq * K_cube;
@@ -2114,15 +2089,10 @@ __global__ void svpf_stein_operator_parallel_ksd_kernel(
 
     __syncthreads();
 
-    // Reduce combined_sum and ksd_sum
     warp_reduce_2(&combined_sum, &ksd_sum);
 
-    // Zero-init shared memory to prevent garbage from inactive warps
     __shared__ float s_combined[8], s_ksd[8];
-    if (tid < 8) { 
-        s_combined[tid] = 0.0f; 
-        s_ksd[tid] = 0.0f; 
-    }
+    if (tid < 8) { s_combined[tid] = 0.0f; s_ksd[tid] = 0.0f; }
     __syncthreads();
 
     if (lane == 0) { s_combined[wid] = combined_sum; s_ksd[wid] = ksd_sum; }
@@ -2141,7 +2111,7 @@ __global__ void svpf_stein_operator_parallel_ksd_kernel(
 
 // -----------------------------------------------------------------------------
 // Parallel Full Newton Stein Operator (No KSD)
-// FIXED: Fused phi accumulation to prevent catastrophic cancellation
+// FIXED: Fused accumulation and zero-init shared memory
 // -----------------------------------------------------------------------------
 __global__ void svpf_stein_operator_parallel_full_newton_kernel(
     const float* __restrict__ h,
@@ -2165,7 +2135,6 @@ __global__ void svpf_stein_operator_parallel_full_newton_kernel(
     float sign_mult = (stein_sign_mode == 1) ? 1.0f : -1.0f;
     float inv_n = 1.0f / (float)n;
 
-    // FUSED: Single accumulator for phi terms
     float combined_sum = 0.0f;
     float H_weighted = 0.0f;
     float K_sum_norm = 0.0f;
@@ -2181,7 +2150,7 @@ __global__ void svpf_stein_operator_parallel_full_newton_kernel(
         float K = 1.0f / base;
         float K_sq = K * K;
 
-        // Newton weighting (keep separate - needed for step calculation)
+        // Newton weighting
         float Nk = 2.0f * inv_bw_sq * K_sq * fabsf(3.0f * dist_sq - 1.0f);
         H_weighted += hess_j * K + Nk;
         K_sum_norm += K;
@@ -2196,12 +2165,11 @@ __global__ void svpf_stein_operator_parallel_full_newton_kernel(
 
     warp_reduce_3(&combined_sum, &H_weighted, &K_sum_norm);
 
-    // Zero-init shared memory to prevent garbage from inactive warps (N < 256)
     __shared__ float s_combined[8], s_h[8], s_kn[8];
-    if (tid < 8) {
-        s_combined[tid] = 0.0f;
-        s_h[tid] = 0.0f;
-        s_kn[tid] = 0.0f;
+    if (tid < 8) { 
+        s_combined[tid] = 0.0f; 
+        s_h[tid] = 0.0f; 
+        s_kn[tid] = 0.0f; 
     }
     __syncthreads();
 
@@ -2212,27 +2180,31 @@ __global__ void svpf_stein_operator_parallel_full_newton_kernel(
     }
     __syncthreads();
 
-    if (tid < 8) {
-        combined_sum = s_combined[tid];
-        H_weighted = s_h[tid]; 
-        K_sum_norm = s_kn[tid];
-    } else {
-        combined_sum = H_weighted = K_sum_norm = 0.0f;
-    }
-
-    if (wid == 0) warp_reduce_3(&combined_sum, &H_weighted, &K_sum_norm);
-
+    // Deterministic summation in thread 0 (no warp shuffle tree)
+    // Fixes numerical instability from reduction order changes
     if (tid == 0) {
-        float H_val = H_weighted / fmaxf(K_sum_norm, 1e-6f);
+        float sum_c = 0.0f;
+        float sum_h = 0.0f;
+        float sum_k = 0.0f;
+
+        #pragma unroll
+        for (int w = 0; w < (STEIN_PARALLEL_BLOCK_SIZE / 32); ++w) {
+            sum_c += s_combined[w];
+            sum_h += s_h[w];
+            sum_k += s_kn[w];
+        }
+
+        float H_val = sum_h / fmaxf(sum_k, 1e-6f);
         H_val = fminf(fmaxf(H_val, 0.1f), 100.0f);
         float inv_H = 1.0f / H_val;
-        phi_out[i] = combined_sum * inv_n * inv_H * 0.7f;
+
+        phi_out[i] = sum_c * (1.0f / (float)n) * inv_H * 0.7f;
     }
 }
 
 // -----------------------------------------------------------------------------
 // Parallel Full Newton Stein Operator + KSD
-// FIXED: Fused phi accumulation to prevent catastrophic cancellation
+// FIXED: Zero-init shared memory and correct reduction
 // -----------------------------------------------------------------------------
 __global__ void svpf_stein_operator_parallel_full_newton_ksd_kernel(
     const float* __restrict__ h,
@@ -2258,7 +2230,6 @@ __global__ void svpf_stein_operator_parallel_full_newton_ksd_kernel(
     float sign_mult = (stein_sign_mode == 1) ? 1.0f : -1.0f;
     float inv_n = 1.0f / (float)n;
 
-    // FUSED: Single accumulator for phi terms
     float combined_sum = 0.0f;
     float H_weighted = 0.0f;
     float K_sum_norm = 0.0f;
@@ -2275,7 +2246,7 @@ __global__ void svpf_stein_operator_parallel_full_newton_ksd_kernel(
         float K = 1.0f / base;
         float K_sq = K * K;
 
-        // Newton weighting (keep separate)
+        // Newton weighting
         float Nk = 2.0f * inv_bw_sq * K_sq * fabsf(3.0f * dist_sq - 1.0f);
         H_weighted += hess_j * K + Nk;
         K_sum_norm += K;
@@ -2285,7 +2256,7 @@ __global__ void svpf_stein_operator_parallel_full_newton_ksd_kernel(
         float repulsive_term = sign_mult * 2.0f * diff * inv_bw_sq * K_sq;
         combined_sum += (grad_term + repulsive_term);
 
-        // KSD (separate)
+        // KSD
         float K_cube = K_sq * K;
         float grad_k_i = -2.0f * diff * inv_bw_sq * K_sq;
         float grad_k_j = -grad_k_i;
@@ -2297,7 +2268,6 @@ __global__ void svpf_stein_operator_parallel_full_newton_ksd_kernel(
 
     warp_reduce_4(&combined_sum, &H_weighted, &K_sum_norm, &ksd_sum);
 
-    // Zero-init shared memory to prevent garbage from inactive warps (N < 256)
     __shared__ float s_combined[8], s_h[8], s_kn[8], s_ksd[8];
     if (tid < 8) {
         s_combined[tid] = 0.0f;
@@ -2315,23 +2285,27 @@ __global__ void svpf_stein_operator_parallel_full_newton_ksd_kernel(
     }
     __syncthreads();
 
-    if (tid < 8) {
-        combined_sum = s_combined[tid];
-        H_weighted = s_h[tid]; 
-        K_sum_norm = s_kn[tid]; 
-        ksd_sum = s_ksd[tid];
-    } else {
-        combined_sum = H_weighted = K_sum_norm = ksd_sum = 0.0f;
-    }
-
-    if (wid == 0) warp_reduce_4(&combined_sum, &H_weighted, &K_sum_norm, &ksd_sum);
-
+    // Deterministic summation in thread 0 (no warp shuffle tree)
     if (tid == 0) {
-        float H_val = H_weighted / fmaxf(K_sum_norm, 1e-6f);
+        float sum_c = 0.0f;
+        float sum_h = 0.0f;
+        float sum_k = 0.0f;
+        float sum_ksd = 0.0f;
+
+        #pragma unroll
+        for (int w = 0; w < (STEIN_PARALLEL_BLOCK_SIZE / 32); ++w) {
+            sum_c += s_combined[w];
+            sum_h += s_h[w];
+            sum_k += s_kn[w];
+            sum_ksd += s_ksd[w];
+        }
+
+        float H_val = sum_h / fmaxf(sum_k, 1e-6f);
         H_val = fminf(fmaxf(H_val, 0.1f), 100.0f);
         float inv_H = 1.0f / H_val;
-        phi_out[i] = combined_sum * inv_n * inv_H * 0.7f;
-        ksd_partial[i] = ksd_sum;
+
+        phi_out[i] = sum_c * (1.0f / (float)n) * inv_H * 0.7f;
+        ksd_partial[i] = sum_ksd;
     }
 }
 
