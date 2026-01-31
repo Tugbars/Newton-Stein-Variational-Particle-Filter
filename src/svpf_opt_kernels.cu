@@ -1933,22 +1933,14 @@ __global__ void svpf_fused_gradient_stein_transport_kernel(
 }
 
 // =============================================================================
-// PARALLEL STEIN KERNELS - STREAMING + WARP SHUFFLE REDUCTION
+// PARALLEL STEIN KERNELS - STREAMING + WARP REDUCTION
 // =============================================================================
-// Optimized for N >= 1024. Uses Warp Shuffles for reduction (minimal shared mem).
-//
-// Why warp shuffle?
-// - Eliminates shared memory race conditions
-// - Faster than shared memory reduction
-// - Uses only 8 floats of shared mem per accumulator (for cross-warp reduce)
-//
-// Launch config: <<<N, 256, 0>>>
+// Optimized for N >= 1024. Uses Warp Shuffles for reduction.
+// CRITICAL FIX: Inverts Hessian (1/H) to match Sequential behavior.
 
 #define STEIN_PARALLEL_BLOCK_SIZE 256
 
-// -----------------------------------------------------------------------------
-// Warp Reduction Helpers (Using __shfl_down_sync)
-// -----------------------------------------------------------------------------
+// Warp Reduction Helpers
 __device__ __forceinline__ void warp_reduce_2(float* v1, float* v2) {
     #pragma unroll
     for (int offset = 16; offset > 0; offset /= 2) {
@@ -2014,7 +2006,6 @@ __global__ void svpf_stein_operator_parallel_kernel(
     float k_sum = 0.0f;
     float gk_sum = 0.0f;
 
-    // Streaming loop
     for (int j = tid; j < n; j += blockDim.x) {
         float h_j = h[j];
         float grad_j = grad[j];
@@ -2029,30 +2020,17 @@ __global__ void svpf_stein_operator_parallel_kernel(
         gk_sum += sign_mult * 2.0f * diff * inv_bw_sq * K_sq;
     }
 
-    // 1. Warp reduction
     warp_reduce_2(&k_sum, &gk_sum);
 
-    // 2. Cross-warp reduction via shared memory (only 8 warps worth)
     __shared__ float s_k[8], s_gk[8];
-    if (lane == 0) { 
-        s_k[wid] = k_sum; 
-        s_gk[wid] = gk_sum; 
-    }
+    if (lane == 0) { s_k[wid] = k_sum; s_gk[wid] = gk_sum; }
     __syncthreads();
 
-    // 3. Final reduction by first warp
-    if (tid < 8) { 
-        k_sum = s_k[tid]; 
-        gk_sum = s_gk[tid]; 
-    } else { 
-        k_sum = gk_sum = 0.0f; 
-    }
+    if (tid < 8) { k_sum = s_k[tid]; gk_sum = s_gk[tid]; } 
+    else { k_sum = gk_sum = 0.0f; }
 
-    if (wid == 0) {
-        warp_reduce_2(&k_sum, &gk_sum);
-    }
+    if (wid == 0) warp_reduce_2(&k_sum, &gk_sum);
 
-    // 4. Write result
     if (tid == 0) {
         phi_out[i] = (k_sum + gk_sum) * inv_n;
     }
@@ -2109,29 +2087,16 @@ __global__ void svpf_stein_operator_parallel_ksd_kernel(
         ksd_sum += K * grad_i * grad_j + grad_i * grad_k_j + grad_j * grad_k_i + grad2_k;
     }
 
-    // 1. Warp reduction
     warp_reduce_3(&k_sum, &gk_sum, &ksd_sum);
 
-    // 2. Cross-warp reduction
     __shared__ float s_k[8], s_gk[8], s_ksd[8];
-    if (lane == 0) { 
-        s_k[wid] = k_sum; 
-        s_gk[wid] = gk_sum; 
-        s_ksd[wid] = ksd_sum; 
-    }
+    if (lane == 0) { s_k[wid] = k_sum; s_gk[wid] = gk_sum; s_ksd[wid] = ksd_sum; }
     __syncthreads();
 
-    if (tid < 8) { 
-        k_sum = s_k[tid]; 
-        gk_sum = s_gk[tid]; 
-        ksd_sum = s_ksd[tid]; 
-    } else { 
-        k_sum = gk_sum = ksd_sum = 0.0f; 
-    }
+    if (tid < 8) { k_sum = s_k[tid]; gk_sum = s_gk[tid]; ksd_sum = s_ksd[tid]; }
+    else { k_sum = gk_sum = ksd_sum = 0.0f; }
 
-    if (wid == 0) {
-        warp_reduce_3(&k_sum, &gk_sum, &ksd_sum);
-    }
+    if (wid == 0) warp_reduce_3(&k_sum, &gk_sum, &ksd_sum);
 
     if (tid == 0) {
         phi_out[i] = (k_sum + gk_sum) * inv_n;
@@ -2140,7 +2105,7 @@ __global__ void svpf_stein_operator_parallel_ksd_kernel(
 }
 
 // -----------------------------------------------------------------------------
-// Parallel Full Newton Stein Operator (No KSD)
+// Parallel Full Newton Stein Operator (No KSD) - HESSIAN INVERSION FIX
 // -----------------------------------------------------------------------------
 __global__ void svpf_stein_operator_parallel_full_newton_kernel(
     const float* __restrict__ h,
@@ -2172,6 +2137,9 @@ __global__ void svpf_stein_operator_parallel_full_newton_kernel(
     for (int j = tid; j < n; j += blockDim.x) {
         float h_j = h[j];
         float grad_j = grad[j];
+        
+        // Use raw Hessian (curvature H), invert AFTER averaging
+        // Sequential: H_weighted += sh_hess[j] * K, then inv_H = 1/H_weighted
         float hess_j = local_hessian[j];
 
         float diff = h_i - h_j;
@@ -2180,6 +2148,7 @@ __global__ void svpf_stein_operator_parallel_full_newton_kernel(
         float K = 1.0f / base;
         float K_sq = K * K;
 
+        // Newton weighting: accumulate raw H, invert at end
         float Nk = 2.0f * inv_bw_sq * K_sq * fabsf(3.0f * dist_sq - 1.0f);
         H_weighted += hess_j * K + Nk;
         K_sum_norm += K;
@@ -2188,31 +2157,23 @@ __global__ void svpf_stein_operator_parallel_full_newton_kernel(
         gk_sum += sign_mult * 2.0f * diff * inv_bw_sq * K_sq;
     }
 
-    // 1. Warp reduction
     warp_reduce_4(&k_grad_sum, &gk_sum, &H_weighted, &K_sum_norm);
 
-    // 2. Cross-warp reduction
     __shared__ float s_k[8], s_gk[8], s_h[8], s_kn[8];
     if (lane == 0) {
-        s_k[wid] = k_grad_sum; 
-        s_gk[wid] = gk_sum; 
-        s_h[wid] = H_weighted; 
-        s_kn[wid] = K_sum_norm;
+        s_k[wid] = k_grad_sum; s_gk[wid] = gk_sum; 
+        s_h[wid] = H_weighted; s_kn[wid] = K_sum_norm;
     }
     __syncthreads();
 
     if (tid < 8) {
-        k_grad_sum = s_k[tid]; 
-        gk_sum = s_gk[tid];
-        H_weighted = s_h[tid]; 
-        K_sum_norm = s_kn[tid];
+        k_grad_sum = s_k[tid]; gk_sum = s_gk[tid];
+        H_weighted = s_h[tid]; K_sum_norm = s_kn[tid];
     } else {
         k_grad_sum = gk_sum = H_weighted = K_sum_norm = 0.0f;
     }
 
-    if (wid == 0) {
-        warp_reduce_4(&k_grad_sum, &gk_sum, &H_weighted, &K_sum_norm);
-    }
+    if (wid == 0) warp_reduce_4(&k_grad_sum, &gk_sum, &H_weighted, &K_sum_norm);
 
     if (tid == 0) {
         float H_val = H_weighted / fmaxf(K_sum_norm, 1e-6f);
@@ -2223,7 +2184,7 @@ __global__ void svpf_stein_operator_parallel_full_newton_kernel(
 }
 
 // -----------------------------------------------------------------------------
-// Parallel Full Newton Stein Operator + KSD
+// Parallel Full Newton Stein Operator + KSD - HESSIAN INVERSION FIX
 // -----------------------------------------------------------------------------
 __global__ void svpf_stein_operator_parallel_full_newton_ksd_kernel(
     const float* __restrict__ h,
@@ -2258,6 +2219,8 @@ __global__ void svpf_stein_operator_parallel_full_newton_ksd_kernel(
     for (int j = tid; j < n; j += blockDim.x) {
         float h_j = h[j];
         float grad_j = grad[j];
+        
+        // Use raw Hessian (curvature H), invert AFTER averaging
         float hess_j = local_hessian[j];
 
         float diff = h_i - h_j;
@@ -2266,12 +2229,12 @@ __global__ void svpf_stein_operator_parallel_full_newton_ksd_kernel(
         float K = 1.0f / base;
         float K_sq = K * K;
 
-        // Newton
+        // Newton weighting: accumulate raw H, invert at end
         float Nk = 2.0f * inv_bw_sq * K_sq * fabsf(3.0f * dist_sq - 1.0f);
         H_weighted += hess_j * K + Nk;
         K_sum_norm += K;
 
-        // Stein
+        // Stein force
         k_grad_sum += K * grad_j;
         gk_sum += sign_mult * 2.0f * diff * inv_bw_sq * K_sq;
 
@@ -2283,41 +2246,28 @@ __global__ void svpf_stein_operator_parallel_full_newton_ksd_kernel(
         ksd_sum += K * grad_i * grad_j + grad_i * grad_k_j + grad_j * grad_k_i + grad2_k;
     }
 
-    // 1. Warp reduction
     warp_reduce_5(&k_grad_sum, &gk_sum, &H_weighted, &K_sum_norm, &ksd_sum);
 
-    // 2. Cross-warp reduction (256 threads / 32 = 8 warps)
     __shared__ float s_k[8], s_gk[8], s_h[8], s_kn[8], s_ksd[8];
     if (lane == 0) {
-        s_k[wid] = k_grad_sum;
-        s_gk[wid] = gk_sum;
-        s_h[wid] = H_weighted;
-        s_kn[wid] = K_sum_norm;
-        s_ksd[wid] = ksd_sum;
+        s_k[wid] = k_grad_sum; s_gk[wid] = gk_sum; 
+        s_h[wid] = H_weighted; s_kn[wid] = K_sum_norm; s_ksd[wid] = ksd_sum;
     }
     __syncthreads();
 
-    // 3. Final reduction by first warp
     if (tid < 8) {
-        k_grad_sum = s_k[tid];
-        gk_sum = s_gk[tid];
-        H_weighted = s_h[tid];
-        K_sum_norm = s_kn[tid];
-        ksd_sum = s_ksd[tid];
+        k_grad_sum = s_k[tid]; gk_sum = s_gk[tid];
+        H_weighted = s_h[tid]; K_sum_norm = s_kn[tid]; ksd_sum = s_ksd[tid];
     } else {
         k_grad_sum = gk_sum = H_weighted = K_sum_norm = ksd_sum = 0.0f;
     }
 
-    if (wid == 0) {
-        warp_reduce_5(&k_grad_sum, &gk_sum, &H_weighted, &K_sum_norm, &ksd_sum);
-    }
+    if (wid == 0) warp_reduce_5(&k_grad_sum, &gk_sum, &H_weighted, &K_sum_norm, &ksd_sum);
 
-    // 4. Write result
     if (tid == 0) {
         float H_val = H_weighted / fmaxf(K_sum_norm, 1e-6f);
         H_val = fminf(fmaxf(H_val, 0.1f), 100.0f);
         float inv_H = 1.0f / H_val;
-
         phi_out[i] = (k_grad_sum + gk_sum) * inv_n * inv_H * 0.7f;
         ksd_partial[i] = ksd_sum;
     }
