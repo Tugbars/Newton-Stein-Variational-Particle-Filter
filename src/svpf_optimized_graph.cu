@@ -928,10 +928,8 @@ void svpf_step_graph(SVPFState* state, float y_t, float y_prev, const SVPFParams
             // HEUN'S METHOD (Improved Euler, 2nd order)
             // =================================================================
             if (state->use_heun) {
-                // --- Step 1: Save original h ---
-                svpf_copy_kernel<<<nb, BLOCK_SIZE, 0, cs>>>(state->h, opt->d_h_orig, n);
-                
                 // --- Step 2: Gradient at original h ---
+                // (state->h currently holds original particle positions)
                 svpf_fused_gradient_kernel<<<nb, BLOCK_SIZE, grad_smem, cs>>>(
                     state->h, state->h_prev, state->grad_log_p, state->log_weights,
                     state->use_newton ? opt->d_precond_grad : nullptr,
@@ -958,7 +956,16 @@ void svpf_step_graph(SVPFState* state, float y_t, float y_prev, const SVPFParams
                     );
                 }
                 
+                // --- Pointer swap (replaces O(N) copy kernel) ---
+                // After this: h_orig holds original, h is scratch buffer
+                {
+                    float* tmp = state->h;
+                    state->h = opt->d_h_orig;
+                    opt->d_h_orig = tmp;
+                }
+                
                 // --- Step 4: Predictor (Euler step to h̃, NO noise) ---
+                // Reads from h_orig (original), writes to h (scratch → h̃)
                 svpf_heun_predictor_kernel<<<nb, BLOCK_SIZE, 0, cs>>>(
                     state->h, opt->d_h_orig, opt->d_phi_orig,
                     state->d_grad_v,  // RMSProp state (read-only here)
