@@ -332,4 +332,4 @@ The core SVPF engine is complete and optimized. The roadmap is about:
 3. Better parameters (CPMMH calibration)
 4. Scale (multi-instrument)
 
-Each phase builds on the last. Start with data collection and spread integration.
+Each phase builds on thte last. Start with data collection and spread integration.
