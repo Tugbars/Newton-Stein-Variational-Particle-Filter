@@ -37,6 +37,36 @@
 static void svpf_optimized_init(SVPFOptimizedState* opt, int n);
 
 // =============================================================================
+// HEUN'S METHOD KERNEL DECLARATIONS
+// =============================================================================
+// These kernels are defined in svpf_opt_kernels.cu
+
+__global__ void svpf_stein_operator_kernel(
+    const float* h, const float* grad, float* phi_out,
+    const float* d_bandwidth, int stein_sign_mode, int n);
+
+__global__ void svpf_stein_operator_full_newton_kernel(
+    const float* h, const float* grad, const float* local_hessian,
+    float* phi_out, const float* d_bandwidth, int stein_sign_mode, int n);
+
+__global__ void svpf_heun_predictor_kernel(
+    float* h, const float* h_orig, const float* phi, const float* v_rmsprop,
+    float step_size, float beta_factor, float epsilon, int n);
+
+__global__ void svpf_heun_corrector_kernel(
+    float* h, const float* h_orig, const float* phi_orig, const float* phi_pred,
+    float* v_rmsprop, curandStatePhilox4_32_10_t* rng,
+    float step_size, float beta_factor, float temperature,
+    float rho_rmsprop, float epsilon, int n);
+
+__global__ void svpf_heun_corrector_ksd_kernel(
+    float* h, const float* h_orig, const float* phi_orig, const float* phi_pred,
+    const float* grad, float* v_rmsprop, curandStatePhilox4_32_10_t* rng,
+    const float* d_bandwidth, float* d_ksd_partial,
+    float step_size, float beta_factor, float temperature,
+    float rho_rmsprop, float epsilon, int n);
+
+// =============================================================================
 // BASIC UTILITY KERNELS
 // =============================================================================
 
@@ -732,31 +762,18 @@ static void svpf_step_two_factor(
     // =========================================================================
     // PREDICT (Two-Factor)
     // =========================================================================
-    if (state->use_guided) {
-        svpf_predict_two_factor_guided_kernel<<<nb, BLOCK_SIZE, 0, cs>>>(
-            opt->d_h_fast, opt->d_h_slow,
-            opt->d_h_fast_prev, opt->d_h_slow_prev,
-            state->rng_states, opt->d_y_single,
-            params->mu,
-            state->rho_fast, state->sigma_fast,
-            state->rho_slow, state->sigma_slow,
-            state->use_mim, state->mim_jump_prob, state->mim_jump_scale,
-            state->guided_alpha_base, state->guided_alpha_shock,
-            state->guided_innovation_threshold,
-            state->student_t_implied_offset,
-            n
-        );
-    } else {
-        svpf_predict_two_factor_kernel<<<nb, BLOCK_SIZE, 0, cs>>>(
-            opt->d_h_fast, opt->d_h_slow,
-            opt->d_h_fast_prev, opt->d_h_slow_prev,
-            state->rng_states,
-            state->rho_fast, state->sigma_fast,
-            state->rho_slow, state->sigma_slow,
-            state->use_mim, state->mim_jump_prob, state->mim_jump_scale,
-            n
-        );
-    }
+    // NOTE: Don't use guided predict for two-factor - it puts all surprise
+    // into h_fast which is wrong. The EKF guide with innovation split handles
+    // the guidance properly.
+    svpf_predict_two_factor_kernel<<<nb, BLOCK_SIZE, 0, cs>>>(
+        opt->d_h_fast, opt->d_h_slow,
+        opt->d_h_fast_prev, opt->d_h_slow_prev,
+        state->rng_states,
+        state->rho_fast, state->sigma_fast,
+        state->rho_slow, state->sigma_slow,
+        state->use_mim, state->mim_jump_prob, state->mim_jump_scale,
+        n
+    );
     
     // =========================================================================
     // EKF GUIDE (Innovation Split)
@@ -862,6 +879,17 @@ static void svpf_step_two_factor(
     cudaMemcpyAsync(&results[1], opt->d_vol_single, sizeof(float), cudaMemcpyDeviceToHost, cs);
     cudaMemcpyAsync(&results[2], opt->d_h_mean_prev, sizeof(float), cudaMemcpyDeviceToHost, cs);
     cudaStreamSynchronize(cs);
+    
+    // DEBUG - remove after fixing
+    if (state->timestep < 5) {
+        float dbg_fast, dbg_slow, dbg_bw_fast, dbg_bw_slow;
+        cudaMemcpy(&dbg_fast, opt->d_h_fast_mean, sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&dbg_slow, opt->d_h_slow_mean, sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&dbg_bw_fast, opt->d_bandwidth_fast, sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&dbg_bw_slow, opt->d_bandwidth_slow, sizeof(float), cudaMemcpyDeviceToHost);
+        printf("2F t=%d: y=%.4f, h_fast=%.3f, h_slow=%.3f, h_total=%.3f (mu=%.2f), vol=%.4f, bw_f=%.3f, bw_s=%.3f\n",
+               state->timestep, y_t, dbg_fast, dbg_slow, results[2], params->mu, results[1], dbg_bw_fast, dbg_bw_slow);
+    }
     
     if (loglik_out) *loglik_out = results[0];
     if (vol_out) *vol_out = results[1];
