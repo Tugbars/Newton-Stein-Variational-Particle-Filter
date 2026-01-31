@@ -11,7 +11,6 @@
  */
 
 #include "svpf_kernels.cuh"
-#include <cuda_pipeline.h>
 #include <stdio.h>
 
 // =============================================================================
@@ -665,31 +664,21 @@ __global__ void svpf_fused_stein_transport_kernel(
     float* sh_h = smem;
     float* sh_grad = smem + n;
     
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    
-    // Issue async loads to shared memory
     for (int k = threadIdx.x; k < n; k += blockDim.x) {
-        __pipeline_memcpy_async(&sh_h[k], &h[k], sizeof(float));
-        __pipeline_memcpy_async(&sh_grad[k], &grad[k], sizeof(float));
+        sh_h[k] = h[k];
+        sh_grad[k] = grad[k];
     }
-    __pipeline_commit();
+    __syncthreads();
     
-    // Independent work while loads are in flight
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    
+    float h_i = sh_h[i];
     float global_bw = *d_bandwidth;
     float bw_sq = global_bw * global_bw;
     float inv_bw_sq = 1.0f / bw_sq;
     float inv_n = 1.0f / (float)n;
     float sign_mult = (stein_sign_mode == 1) ? 1.0f : -1.0f;
-    float effective_step = step_size * beta_factor;
-    float v_prev = (i < n) ? v_rmsprop[i] : 0.0f;
-    
-    // Wait for shared memory loads
-    __pipeline_wait_prior(0);
-    __syncthreads();
-    
-    if (i >= n) return;
-    
-    float h_i = sh_h[i];
     
     // ===== STEIN OPERATOR with IMQ Kernel =====
     float k_sum = 0.0f;
@@ -711,10 +700,12 @@ __global__ void svpf_fused_stein_transport_kernel(
     float phi_i = (k_sum + gk_sum) * inv_n;
     
     // ===== RMSPROP =====
+    float v_prev = v_rmsprop[i];
     float v_new = rho_rmsprop * v_prev + (1.0f - rho_rmsprop) * phi_i * phi_i;
     v_rmsprop[i] = v_new;
     
     // ===== TRANSPORT =====
+    float effective_step = step_size * beta_factor;
     float precond = rsqrtf(v_new + epsilon);
     float drift = effective_step * phi_i * precond;
     
@@ -763,32 +754,22 @@ __global__ void svpf_fused_stein_transport_ksd_kernel(
     float* sh_h = smem;
     float* sh_grad = smem + n;
     
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    
-    // Issue async loads to shared memory
     for (int k = threadIdx.x; k < n; k += blockDim.x) {
-        __pipeline_memcpy_async(&sh_h[k], &h[k], sizeof(float));
-        __pipeline_memcpy_async(&sh_grad[k], &grad[k], sizeof(float));
+        sh_h[k] = h[k];
+        sh_grad[k] = grad[k];
     }
-    __pipeline_commit();
+    __syncthreads();
     
-    // Independent work while loads are in flight
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    
+    float h_i = sh_h[i];
+    float s_i = sh_grad[i];
     float global_bw = *d_bandwidth;
     float bw_sq = global_bw * global_bw;
     float inv_bw_sq = 1.0f / bw_sq;
     float inv_n = 1.0f / (float)n;
     float sign_mult = (stein_sign_mode == 1) ? 1.0f : -1.0f;
-    float effective_step = step_size * beta_factor;
-    float v_prev = (i < n) ? v_rmsprop[i] : 0.0f;
-    
-    // Wait for shared memory loads
-    __pipeline_wait_prior(0);
-    __syncthreads();
-    
-    if (i >= n) return;
-    
-    float h_i = sh_h[i];
-    float s_i = sh_grad[i];
     
     // ===== FUSED: Stein operator + KSD =====
     float k_sum = 0.0f;
@@ -822,10 +803,12 @@ __global__ void svpf_fused_stein_transport_ksd_kernel(
     d_ksd_partial[i] = ksd_sum;
     
     // ===== RMSPROP =====
+    float v_prev = v_rmsprop[i];
     float v_new = rho_rmsprop * v_prev + (1.0f - rho_rmsprop) * phi_i * phi_i;
     v_rmsprop[i] = v_new;
     
     // ===== TRANSPORT =====
+    float effective_step = step_size * beta_factor;
     float precond = rsqrtf(v_new + epsilon);
     float drift = effective_step * phi_i * precond;
     
@@ -881,7 +864,7 @@ __global__ void svpf_fused_stein_transport_newton_kernel(
     float temperature,
     float rho_rmsprop,
     float epsilon,
-    int stein_sign_mode,  // 0=legacy(subtract), 1=paper(add)
+    int stein_sign_mode,
     int n
 ) {
     extern __shared__ float smem[];
@@ -960,7 +943,7 @@ __global__ void svpf_fused_stein_transport_newton_ksd_kernel(
     float temperature,
     float rho_rmsprop,
     float epsilon,
-    int stein_sign_mode,  // 0=legacy(subtract), 1=paper(add)
+    int stein_sign_mode,
     int n
 ) {
     extern __shared__ float smem[];
@@ -1051,7 +1034,7 @@ __global__ void svpf_fused_stein_transport_full_newton_kernel(
     float temperature,
     float rho_rmsprop,
     float epsilon,
-    int stein_sign_mode,  // 0=legacy(subtract), 1=paper(add)
+    int stein_sign_mode,
     int n
 ) {
     extern __shared__ float smem[];
@@ -1142,7 +1125,7 @@ __global__ void svpf_fused_stein_transport_full_newton_ksd_kernel(
     float temperature,
     float rho_rmsprop,
     float epsilon,
-    int stein_sign_mode,  // 0=legacy(subtract), 1=paper(add)
+    int stein_sign_mode,
     int n
 ) {
     extern __shared__ float smem[];
@@ -1947,4 +1930,246 @@ __global__ void svpf_fused_gradient_stein_transport_kernel(
     }
     
     h[j] = clamp_logvol(h_i + drift + diffusion);
+}
+
+// =============================================================================
+// PARALLEL STEIN KERNELS (for N >= 1024)
+// =============================================================================
+// 
+// These kernels use N blocks × 256 threads instead of N threads × N serial loop.
+// Provides ~2x speedup at N=2048 which is critical for crypto crisis mode.
+//
+// Launch config: <<<N, 256, shared_mem>>>
+// Shared mem: (2*N + 2*256) * sizeof(float) without KSD
+//             (2*N + 3*256) * sizeof(float) with KSD
+
+#define STEIN_PARALLEL_BLOCK_SIZE 256
+
+// -----------------------------------------------------------------------------
+// Parallel Stein Operator (no KSD)
+// -----------------------------------------------------------------------------
+__global__ void svpf_stein_operator_parallel_kernel(
+    const float* __restrict__ h,
+    const float* __restrict__ grad,
+    float* __restrict__ phi_out,
+    const float* __restrict__ d_bandwidth,
+    int stein_sign_mode,
+    int n
+) {
+    extern __shared__ float smem[];
+    float* sh_h = smem;
+    float* sh_grad = &smem[n];
+    float* sh_k_sum = &smem[2*n];
+    float* sh_gk_sum = &smem[2*n + STEIN_PARALLEL_BLOCK_SIZE];
+    
+    int i = blockIdx.x;        // Each BLOCK handles particle i
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+    
+    // Cooperative load
+    for (int k = tid; k < n; k += stride) {
+        sh_h[k] = h[k];
+        sh_grad[k] = grad[k];
+    }
+    __syncthreads();
+    
+    float h_i = sh_h[i];
+    float sign_mult = (stein_sign_mode == 1) ? 1.0f : -1.0f;
+    
+    // Read bandwidth from device pointer
+    float bw = *d_bandwidth;
+    float inv_bw_sq = 1.0f / (bw * bw);
+    float inv_n = 1.0f / (float)n;
+    
+    // Each thread computes partial sum
+    float my_k_sum = 0.0f;
+    float my_gk_sum = 0.0f;
+    
+    for (int j = tid; j < n; j += stride) {
+        float diff = h_i - sh_h[j];
+        float dist_sq = diff * diff * inv_bw_sq;
+        
+        float base = 1.0f + dist_sq;
+        float K = 1.0f / base;
+        float K_sq = K * K;
+        
+        my_k_sum += K * sh_grad[j];
+        my_gk_sum += sign_mult * 2.0f * diff * inv_bw_sq * K_sq;
+    }
+    
+    sh_k_sum[tid] = my_k_sum;
+    sh_gk_sum[tid] = my_gk_sum;
+    __syncthreads();
+    
+    // Parallel reduction
+    for (int s = stride / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sh_k_sum[tid] += sh_k_sum[tid + s];
+            sh_gk_sum[tid] += sh_gk_sum[tid + s];
+        }
+        __syncthreads();
+    }
+    
+    if (tid == 0) {
+        phi_out[i] = (sh_k_sum[0] + sh_gk_sum[0]) * inv_n;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Parallel Stein Operator with KSD
+// -----------------------------------------------------------------------------
+__global__ void svpf_stein_operator_parallel_ksd_kernel(
+    const float* __restrict__ h,
+    const float* __restrict__ grad,
+    float* __restrict__ phi_out,
+    float* __restrict__ ksd_partial,
+    const float* __restrict__ d_bandwidth,
+    int stein_sign_mode,
+    int n
+) {
+    extern __shared__ float smem[];
+    float* sh_h = smem;
+    float* sh_grad = &smem[n];
+    float* sh_k_sum = &smem[2*n];
+    float* sh_gk_sum = &smem[2*n + STEIN_PARALLEL_BLOCK_SIZE];
+    float* sh_ksd = &smem[2*n + 2*STEIN_PARALLEL_BLOCK_SIZE];
+    
+    int i = blockIdx.x;
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+    
+    // Cooperative load
+    for (int k = tid; k < n; k += stride) {
+        sh_h[k] = h[k];
+        sh_grad[k] = grad[k];
+    }
+    __syncthreads();
+    
+    float h_i = sh_h[i];
+    float grad_i = sh_grad[i];
+    float sign_mult = (stein_sign_mode == 1) ? 1.0f : -1.0f;
+    
+    // Read bandwidth from device pointer
+    float bw = *d_bandwidth;
+    float inv_bw_sq = 1.0f / (bw * bw);
+    float inv_n = 1.0f / (float)n;
+    
+    float my_k_sum = 0.0f;
+    float my_gk_sum = 0.0f;
+    float my_ksd = 0.0f;
+    
+    for (int j = tid; j < n; j += stride) {
+        float h_j = sh_h[j];
+        float grad_j = sh_grad[j];
+        float diff = h_i - h_j;
+        float dist_sq = diff * diff * inv_bw_sq;
+        
+        float base = 1.0f + dist_sq;
+        float K = 1.0f / base;
+        float K_sq = K * K;
+        float K_cube = K_sq * K;
+        
+        my_k_sum += K * grad_j;
+        my_gk_sum += sign_mult * 2.0f * diff * inv_bw_sq * K_sq;
+        
+        // KSD components
+        float grad_k_i = -2.0f * diff * inv_bw_sq * K_sq;
+        float grad_k_j = -grad_k_i;
+        float grad2_k = -2.0f * inv_bw_sq * K_sq + 8.0f * dist_sq * inv_bw_sq * inv_bw_sq * K_cube;
+        float u_p = K * grad_i * grad_j + grad_i * grad_k_j + grad_j * grad_k_i + grad2_k;
+        my_ksd += u_p;
+    }
+    
+    sh_k_sum[tid] = my_k_sum;
+    sh_gk_sum[tid] = my_gk_sum;
+    sh_ksd[tid] = my_ksd;
+    __syncthreads();
+    
+    // Parallel reduction
+    for (int s = stride / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sh_k_sum[tid] += sh_k_sum[tid + s];
+            sh_gk_sum[tid] += sh_gk_sum[tid + s];
+            sh_ksd[tid] += sh_ksd[tid + s];
+        }
+        __syncthreads();
+    }
+    
+    if (tid == 0) {
+        phi_out[i] = (sh_k_sum[0] + sh_gk_sum[0]) * inv_n;
+        ksd_partial[i] = sh_ksd[0];
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Separate Transport Kernel (for use with parallel Stein)
+// -----------------------------------------------------------------------------
+__global__ void svpf_transport_separate_kernel(
+    float* __restrict__ h,
+    const float* __restrict__ phi,
+    float* __restrict__ v_rmsprop,
+    curandStatePhilox4_32_10_t* __restrict__ rng,
+    float step_size,
+    float beta_factor,
+    float temperature,
+    float rho_rmsprop,
+    float epsilon,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    
+    float h_i = h[i];
+    float phi_i = phi[i];
+    
+    // RMSProp
+    float v_prev = v_rmsprop[i];
+    float v_new = rho_rmsprop * v_prev + (1.0f - rho_rmsprop) * phi_i * phi_i;
+    v_rmsprop[i] = v_new;
+    
+    // Transport
+    float effective_step = step_size * beta_factor;
+    float precond = rsqrtf(v_new + epsilon);
+    float drift = effective_step * phi_i * precond;
+    
+    float diffusion = 0.0f;
+    if (temperature > 1e-6f) {
+        float noise = curand_normal(&rng[i]);
+        diffusion = sqrtf(2.0f * effective_step * temperature) * noise;
+    }
+    
+    h[i] = clamp_logvol(h_i + drift + diffusion);
+}
+
+// -----------------------------------------------------------------------------
+// KSD Final Reduction
+// -----------------------------------------------------------------------------
+__global__ void svpf_ksd_reduce_parallel_kernel(
+    const float* __restrict__ ksd_partial,
+    float* __restrict__ ksd_out,
+    int n
+) {
+    __shared__ float sdata[256];
+    
+    int tid = threadIdx.x;
+    float sum = 0.0f;
+    
+    for (int i = tid; i < n; i += blockDim.x) {
+        sum += ksd_partial[i];
+    }
+    
+    sdata[tid] = sum;
+    __syncthreads();
+    
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+    
+    if (tid == 0) {
+        float inv_n_sq = 1.0f / ((float)n * (float)n);
+        *ksd_out = sqrtf(fabsf(sdata[0] * inv_n_sq));
+    }
 }
