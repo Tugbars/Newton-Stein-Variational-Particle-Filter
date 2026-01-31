@@ -143,23 +143,17 @@ static void configure_baseline(void* state_ptr) {
  * 
  * Same as baseline, but with the feature under test enabled.
  */
-static void configure_modified(void *state_ptr) {
-  configure_baseline(state_ptr);
-  SVPFState *f = (SVPFState *)state_ptr;
-
-  // =========================================================================
-  // FEATURE UNDER TEST - ON in modified
-  // =========================================================================
-  // f->use_local_params = 1;
-  // f->delta_sigma = 0.15f;  // State-dependent sigma: wider when far from mu
-  // f->delta_rho = 0.04f; // Could also test state-dependent rho
-  // f->use_heun = 1;
-
-  f->use_two_factor = 1;
-  f->rho_fast = 0.90f;
-  f->sigma_fast = 0.15f;
-  f->rho_slow = 0.99f;
-  f->sigma_slow = 0.05f;
+static void configure_modified(void* state_ptr) {
+    configure_baseline(state_ptr);
+    SVPFState* f = (SVPFState*)state_ptr;
+    
+    // =========================================================================
+    // FEATURE UNDER TEST - ON in modified
+    // =========================================================================
+    //f->use_local_params = 1;
+   // f->delta_sigma = 0.15f;  // State-dependent sigma: wider when far from mu
+    // f->delta_rho = 0.04f; // Could also test state-dependent rho
+    f->use_heun = 1;
 }
 
 /**
