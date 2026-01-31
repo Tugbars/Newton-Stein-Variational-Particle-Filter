@@ -1,0 +1,647 @@
+// =============================================================================
+// SVPF Extreme Scenario Stress Test
+// =============================================================================
+// Tests filter behavior under crypto-like extreme conditions (10σ - 50σ spikes)
+// Goal: Find where the filter breaks, fails to recover, or produces NaN/Inf
+// Outputs CSV files for Jupyter notebook visualization
+
+#include "svpf.cuh"
+#include <cuda_runtime.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cmath>
+#include <vector>
+#include <string>
+#include <algorithm>
+
+// =============================================================================
+// CSV Output
+// =============================================================================
+
+struct TimeseriesPoint {
+    int t;
+    float y_t;           // Return
+    float h_mean;        // Estimated log-vol
+    float vol;           // Estimated vol (exp(h/2))
+    float ess;           // Effective sample size
+    float loglik;        // Log-likelihood
+};
+
+static void write_csv(const std::string& filename, 
+                      const std::string& scenario,
+                      float sigma,
+                      const std::vector<TimeseriesPoint>& data) {
+    FILE* f = fopen(filename.c_str(), "w");
+    if (!f) {
+        printf("  Warning: Could not write %s\n", filename.c_str());
+        return;
+    }
+    
+    // Header
+    fprintf(f, "t,y_t,h_mean,vol,ess,loglik,scenario,sigma\n");
+    
+    // Data
+    for (const auto& p : data) {
+        fprintf(f, "%d,%.8f,%.6f,%.8f,%.2f,%.4f,%s,%.1f\n",
+                p.t, p.y_t, p.h_mean, p.vol, p.ess, p.loglik,
+                scenario.c_str(), sigma);
+    }
+    
+    fclose(f);
+}
+
+// Write summary CSV (one row per scenario/sigma combo)
+static FILE* g_summary_file = nullptr;
+
+static void init_summary_csv(const std::string& filename) {
+    g_summary_file = fopen(filename.c_str(), "w");
+    if (g_summary_file) {
+        fprintf(g_summary_file, "scenario,sigma,had_nan,had_inf,min_ess,min_ess_t,"
+                "max_h,max_vol,max_vol_t,recovery_time,failed_recovery,"
+                "particle_collapse_count,final_vol,final_h\n");
+    }
+}
+
+static void close_summary_csv() {
+    if (g_summary_file) {
+        fclose(g_summary_file);
+        g_summary_file = nullptr;
+    }
+}
+
+// =============================================================================
+// Data Generation
+// =============================================================================
+
+// Simple PRNG (cross-platform, better than rand())
+static inline float randf(unsigned int* seed) {
+    *seed = *seed * 1103515245 + 12345;
+    return (float)((*seed >> 16) & 0x7FFF) / 32768.0f;
+}
+
+static inline float randn(unsigned int* seed) {
+    // Box-Muller transform
+    float u1 = randf(seed) + 1e-10f;
+    float u2 = randf(seed);
+    return sqrtf(-2.0f * logf(u1)) * cosf(2.0f * 3.14159265f * u2);
+}
+
+// Generate calm period returns (normal vol)
+static void generate_calm(std::vector<float>& returns, int n, float base_vol, unsigned int* seed) {
+    for (int i = 0; i < n; i++) {
+        float z = randn(seed);
+        returns.push_back(base_vol * z);
+    }
+}
+
+// Generate a single extreme spike
+static void generate_spike(std::vector<float>& returns, float base_vol, float sigma_multiple, unsigned int* seed) {
+    // Spike magnitude = sigma_multiple * base_vol
+    float spike = sigma_multiple * base_vol;
+    // Random sign
+    if (randf(seed) > 0.5f) spike = -spike;
+    returns.push_back(spike);
+}
+
+// Generate recovery period (elevated vol decaying back to normal)
+static void generate_recovery(std::vector<float>& returns, int n, float peak_vol, float base_vol, unsigned int* seed) {
+    for (int i = 0; i < n; i++) {
+        float t = (float)i / n;
+        float vol = peak_vol * (1.0f - t) + base_vol * t;  // Linear decay
+        float z = randn(seed);
+        returns.push_back(vol * z);
+    }
+}
+
+// Generate sustained chaos (multiple large moves)
+static void generate_chaos(std::vector<float>& returns, int n, float base_vol, 
+                           float min_sigma, float max_sigma, unsigned int* seed) {
+    for (int i = 0; i < n; i++) {
+        float sigma = min_sigma + (max_sigma - min_sigma) * randf(seed);
+        float z = randn(seed);
+        returns.push_back(sigma * base_vol * z);
+    }
+}
+
+// =============================================================================
+// Test Result Tracking
+// =============================================================================
+
+struct StressTestResult {
+    std::string scenario;
+    float spike_sigma;
+    
+    // Health metrics
+    bool had_nan;
+    bool had_inf;
+    int nan_timestep;
+    
+    // Particle health
+    float min_ess;
+    int min_ess_timestep;
+    int particle_collapse_count;  // ESS < 10
+    
+    // Vol tracking
+    float max_vol;
+    float max_h;
+    int max_vol_timestep;
+    
+    // Recovery metrics
+    int recovery_time;           // Steps to return within 2x base vol
+    bool failed_to_recover;
+    
+    // Final state
+    float final_vol;
+    float final_h_mean;
+    
+    // Timeseries data for CSV output
+    std::vector<TimeseriesPoint> timeseries;
+};
+
+static void write_summary_row(const StressTestResult& r) {
+    if (!g_summary_file) return;
+    fprintf(g_summary_file, "%s,%.1f,%d,%d,%.2f,%d,%.4f,%.6f,%d,%d,%d,%d,%.6f,%.4f\n",
+            r.scenario.c_str(), r.spike_sigma,
+            r.had_nan ? 1 : 0, r.had_inf ? 1 : 0,
+            r.min_ess, r.min_ess_timestep,
+            r.max_h, r.max_vol, r.max_vol_timestep,
+            r.recovery_time, r.failed_to_recover ? 1 : 0,
+            r.particle_collapse_count,
+            r.final_vol, r.final_h_mean);
+}
+
+static void print_result(const StressTestResult& r) {
+    printf("\n  %-25s | %5.0fσ | ", r.scenario.c_str(), r.spike_sigma);
+    
+    if (r.had_nan) {
+        printf("❌ NaN at t=%d\n", r.nan_timestep);
+        return;
+    }
+    if (r.had_inf) {
+        printf("❌ Inf at t=%d\n", r.nan_timestep);
+        return;
+    }
+    
+    // Status icon: healthy = recovered + ESS stayed above 50
+    bool healthy = !r.failed_to_recover && r.min_ess > 50.0f;
+    printf("%s | ", healthy ? "✓" : "⚠");
+    
+    printf("ESS_min=%5.1f (t=%3d) | h_max=%5.2f | vol_max=%6.2f%% | ", 
+           r.min_ess, r.min_ess_timestep, r.max_h, r.max_vol * 100.0f);
+    
+    if (r.failed_to_recover) {
+        printf("NO RECOVERY\n");
+    } else {
+        printf("recover=%3d steps\n", r.recovery_time);
+    }
+}
+
+// =============================================================================
+// Run Single Scenario
+// =============================================================================
+
+static StressTestResult run_scenario(
+    const std::string& name,
+    const std::vector<float>& returns,
+    float spike_sigma,
+    int spike_timestep,
+    float base_vol,
+    const SVPFParams& params,
+    int n_particles
+) {
+    StressTestResult result;
+    result.scenario = name;
+    result.spike_sigma = spike_sigma;
+    result.had_nan = false;
+    result.had_inf = false;
+    result.nan_timestep = -1;
+    result.min_ess = 1e9f;
+    result.min_ess_timestep = 0;
+    result.particle_collapse_count = 0;
+    result.max_vol = 0.0f;
+    result.max_h = -1e9f;
+    result.max_vol_timestep = 0;
+    result.recovery_time = -1;
+    result.failed_to_recover = true;
+    
+    // Create filter
+    SVPFState* state = svpf_create(n_particles, 8, 50.0f, nullptr);
+    svpf_initialize(state, &params, 12345);
+    
+    // =========================================================================
+    // PRODUCTION CONFIGURATION (matches quant bot settings)
+    // =========================================================================
+    
+    // Core SVGD settings
+    state->use_svld = 1;
+    state->use_annealing = 1;
+    state->n_anneal_steps = 5;
+    state->temperature = 0.45f;
+    state->rmsprop_rho = 0.9f;
+    state->rmsprop_eps = 1e-6f;
+    
+    // MIM (Mixture of Invariant Measures) for mode exploration
+    state->use_mim = 1;
+    state->mim_jump_prob = 0.25f;
+    state->mim_jump_scale = 12.0f;
+    state->use_adaptive_beta = 1;
+    
+    // Rejuvenation (particle diversity recovery)
+    state->use_rejuvenation = 1;
+    state->rejuv_ksd_threshold = 0.05f;
+    state->rejuv_prob = 0.30f;
+    state->rejuv_blend = 0.30f;
+    
+    // Newton-Stein (Hessian preconditioning)
+    state->use_newton = 1;
+    state->use_full_newton = 1;  // Detommaso 2018 full Newton
+    
+    // Guided Prediction with INNOVATION GATING
+    state->use_guided = 1;
+    state->guided_alpha_base = 0.0f;
+    state->guided_alpha_shock = 0.40f;
+    state->guided_innovation_threshold = 1.5f;
+    
+    // EKF Guide density
+    state->use_guide = 1;
+    state->use_guide_preserving = 1;
+    state->guide_strength = 0.05f;
+    
+    // Adaptive mu (Kalman filter on long-run mean)
+    state->use_adaptive_mu = 1;
+    state->mu_process_var = 0.001f;
+    state->mu_obs_var_scale = 11.0f;
+    state->mu_min = -4.0f;
+    state->mu_max = -1.0f;
+    
+    // Adaptive guide strength
+    state->use_adaptive_guide = 1;
+    state->guide_strength_base = 0.05f;
+    state->guide_strength_max = 0.30f;
+    state->guide_innovation_threshold = 1.0f;
+    
+    // Adaptive sigma (crisis boost)
+    state->use_adaptive_sigma = 1;
+    state->sigma_boost_threshold = 0.95f;
+    state->sigma_boost_max = 3.2f;
+    
+    // Exact gradient (Student-t consistent)
+    state->use_exact_gradient = 1;
+    state->lik_offset = 0.345f;
+    
+    // KSD-based Adaptive Stein Steps
+    state->stein_min_steps = 8;
+    state->stein_max_steps = 8;
+    state->ksd_improvement_threshold = 0.05f;
+    
+    // Student-t state dynamics (fat tails)
+    state->use_student_t_state = 1;
+    state->nu_state = 3.0f;
+    
+    // Smoothing (1-tick lag for cleaner output)
+    state->use_smoothing = 1;
+    state->smooth_lag = 3;
+    state->smooth_output_lag = 1;
+    
+    // Persistent kernel (launch optimization)
+    state->use_persistent_kernel = 1;
+
+    state->use_heun = 1;
+    
+    // =========================================================================
+    
+    float y_prev = 0.0f;
+    bool in_recovery = false;
+    int recovery_start = -1;
+    
+    for (int t = 0; t < (int)returns.size(); t++) {
+        float y_t = returns[t];
+        
+        float loglik, vol, h_mean;
+        svpf_step_graph(state, y_t, y_prev, &params, &loglik, &vol, &h_mean);
+        
+        // Check for NaN/Inf
+        if (std::isnan(vol) || std::isnan(h_mean) || std::isnan(loglik)) {
+            result.had_nan = true;
+            result.nan_timestep = t;
+            break;
+        }
+        if (std::isinf(vol) || std::isinf(h_mean) || std::isinf(loglik)) {
+            result.had_inf = true;
+            result.nan_timestep = t;
+            break;
+        }
+        
+        // Get ESS
+        float ess = svpf_get_ess(state);
+        if (ess < result.min_ess) {
+            result.min_ess = ess;
+            result.min_ess_timestep = t;
+        }
+        if (ess < 10.0f) {
+            result.particle_collapse_count++;
+        }
+        
+        // Collect timeseries data
+        TimeseriesPoint pt;
+        pt.t = t;
+        pt.y_t = y_t;
+        pt.h_mean = h_mean;
+        pt.vol = vol;
+        pt.ess = ess;
+        pt.loglik = loglik;
+        result.timeseries.push_back(pt);
+        
+        // Track max vol
+        if (vol > result.max_vol) {
+            result.max_vol = vol;
+            result.max_vol_timestep = t;
+        }
+        if (h_mean > result.max_h) {
+            result.max_h = h_mean;
+        }
+        
+        // Track recovery (after spike)
+        // Recovery = h_mean returns within 0.5 of long-run mean (mu)
+        // Since h goes UP during spikes (less negative), recovery means h < mu + 0.5
+        if (t > spike_timestep && !in_recovery) {
+            in_recovery = true;
+            recovery_start = t;
+        }
+        if (in_recovery && h_mean < params.mu + 0.5f) {
+            result.recovery_time = t - recovery_start;
+            result.failed_to_recover = false;
+            in_recovery = false;  // Don't count again
+        }
+        
+        result.final_vol = vol;
+        result.final_h_mean = h_mean;
+        y_prev = y_t;
+    }
+    
+    // If still in recovery at end, mark as failed
+    if (in_recovery) {
+        result.failed_to_recover = true;
+        result.recovery_time = returns.size() - recovery_start;
+    }
+    
+    svpf_destroy(state);
+    return result;
+}
+
+// =============================================================================
+// Scenario Generators
+// =============================================================================
+
+// Scenario 1: Single spike of varying magnitude
+static StressTestResult test_single_spike(float sigma, const SVPFParams& params, int n_particles) {
+    std::vector<float> returns;
+    unsigned int seed = 42;
+    float base_vol = 0.01f;  // 1% base volatility
+    
+    // 100 ticks calm
+    generate_calm(returns, 100, base_vol, &seed);
+    int spike_t = returns.size();
+    
+    // Single spike
+    generate_spike(returns, base_vol, sigma, &seed);
+    
+    // 200 ticks recovery
+    float peak_vol = sigma * base_vol * 0.5f;  // Spike induces elevated vol
+    generate_recovery(returns, 200, peak_vol, base_vol, &seed);
+    
+    return run_scenario("Single Spike", returns, sigma, spike_t, base_vol, params, n_particles);
+}
+
+// Scenario 2: Double spike (test if filter recovers then handles second spike)
+static StressTestResult test_double_spike(float sigma, const SVPFParams& params, int n_particles) {
+    std::vector<float> returns;
+    unsigned int seed = 43;
+    float base_vol = 0.01f;
+    
+    // Calm
+    generate_calm(returns, 50, base_vol, &seed);
+    
+    // First spike
+    int spike_t = returns.size();
+    generate_spike(returns, base_vol, sigma, &seed);
+    
+    // Partial recovery
+    generate_recovery(returns, 50, sigma * base_vol * 0.3f, base_vol * 2.0f, &seed);
+    
+    // Second spike (same magnitude)
+    generate_spike(returns, base_vol, sigma, &seed);
+    
+    // Full recovery
+    generate_recovery(returns, 150, sigma * base_vol * 0.3f, base_vol, &seed);
+    
+    return run_scenario("Double Spike", returns, sigma, spike_t, base_vol, params, n_particles);
+}
+
+// Scenario 3: Flash crash pattern (rapid sequence: down, up, down)
+static StressTestResult test_flash_crash(float base_sigma, const SVPFParams& params, int n_particles) {
+    std::vector<float> returns;
+    unsigned int seed = 44;
+    float base_vol = 0.01f;
+    
+    // Calm
+    generate_calm(returns, 50, base_vol, &seed);
+    int spike_t = returns.size();
+    
+    // Flash crash sequence (3 ticks)
+    returns.push_back(-base_sigma * base_vol);        // Down
+    returns.push_back(base_sigma * 0.8f * base_vol);  // Bounce up
+    returns.push_back(-base_sigma * 0.3f * base_vol); // Down again
+    
+    // Chaotic aftermath
+    generate_chaos(returns, 20, base_vol, 2.0f, 5.0f, &seed);
+    
+    // Recovery
+    generate_recovery(returns, 150, base_vol * 5.0f, base_vol, &seed);
+    
+    return run_scenario("Flash Crash", returns, base_sigma, spike_t, base_vol, params, n_particles);
+}
+
+// Scenario 4: Sustained chaos (crypto meltdown)
+static StressTestResult test_sustained_chaos(float avg_sigma, const SVPFParams& params, int n_particles) {
+    std::vector<float> returns;
+    unsigned int seed = 45;
+    float base_vol = 0.01f;
+    
+    // Calm
+    generate_calm(returns, 50, base_vol, &seed);
+    int spike_t = returns.size();
+    
+    // 50 ticks of chaos
+    generate_chaos(returns, 50, base_vol, avg_sigma * 0.5f, avg_sigma * 1.5f, &seed);
+    
+    // Recovery
+    generate_recovery(returns, 200, base_vol * avg_sigma * 0.3f, base_vol, &seed);
+    
+    return run_scenario("Sustained Chaos", returns, avg_sigma, spike_t, base_vol, params, n_particles);
+}
+
+// Scenario 5: Gradual build to extreme (like a squeeze)
+static StressTestResult test_gradual_extreme(float peak_sigma, const SVPFParams& params, int n_particles) {
+    std::vector<float> returns;
+    unsigned int seed = 46;
+    float base_vol = 0.01f;
+    
+    // Calm
+    generate_calm(returns, 50, base_vol, &seed);
+    int spike_t = returns.size();
+    
+    // Gradual increase over 20 ticks to peak
+    for (int i = 0; i < 20; i++) {
+        float t = (float)i / 20.0f;
+        float sigma = 2.0f + t * (peak_sigma - 2.0f);
+        float z = randn(&seed);
+        returns.push_back(sigma * base_vol * z);
+    }
+    
+    // Peak spike
+    generate_spike(returns, base_vol, peak_sigma, &seed);
+    
+    // Recovery
+    generate_recovery(returns, 200, base_vol * peak_sigma * 0.2f, base_vol, &seed);
+    
+    return run_scenario("Gradual Build", returns, peak_sigma, spike_t, base_vol, params, n_particles);
+}
+
+// =============================================================================
+// Main
+// =============================================================================
+
+// Helper to sanitize filename
+static std::string make_filename(const std::string& scenario, float sigma) {
+    std::string s = scenario;
+    // Replace spaces with underscores
+    for (char& c : s) {
+        if (c == ' ') c = '_';
+    }
+    char buf[256];
+    snprintf(buf, sizeof(buf), "svpf_stress_%s_%.0fsigma.csv", s.c_str(), sigma);
+    return std::string(buf);
+}
+
+int main(int argc, char** argv) {
+    printf("\n");
+    printf("═══════════════════════════════════════════════════════════════════════════════\n");
+    printf(" SVPF Extreme Scenario Stress Test\n");
+    printf("═══════════════════════════════════════════════════════════════════════════════\n");
+    printf("\n Testing with Student-t likelihood (nu=5) for fat-tailed returns\n");
+    printf(" Base volatility: 1%% (0.01)\n");
+    printf(" Looking for: NaN/Inf, particle collapse (ESS<10), recovery failure\n");
+    
+    SVPFParams params = {0.98f, 0.15f, -4.5f, 0.0f};  // Standard SV params
+    int n_particles = 512;
+    bool write_csv_files = true;
+    
+    if (argc > 1) n_particles = atoi(argv[1]);
+    if (argc > 2) write_csv_files = (atoi(argv[2]) != 0);
+    
+    printf(" Particles: %d\n", n_particles);
+    printf(" CSV output: %s\n", write_csv_files ? "ENABLED" : "disabled");
+    
+    // Initialize summary CSV
+    if (write_csv_files) {
+        init_summary_csv("svpf_stress_summary.csv");
+        printf(" Output files: svpf_stress_summary.csv + per-scenario CSVs\n");
+    }
+    
+    // Test magnitudes
+    float sigmas[] = {5.0f, 10.0f, 15.0f, 20.0f, 25.0f, 30.0f, 40.0f, 50.0f};
+    int n_sigmas = sizeof(sigmas) / sizeof(sigmas[0]);
+    
+    // =========================================================================
+    printf("\n───────────────────────────────────────────────────────────────────────────────\n");
+    printf(" Scenario 1: Single Spike (calm → spike → recovery)\n");
+    printf("───────────────────────────────────────────────────────────────────────────────\n");
+    for (int i = 0; i < n_sigmas; i++) {
+        StressTestResult r = test_single_spike(sigmas[i], params, n_particles);
+        print_result(r);
+        if (write_csv_files) {
+            write_csv(make_filename("Single_Spike", sigmas[i]), r.scenario, sigmas[i], r.timeseries);
+            write_summary_row(r);
+        }
+    }
+    
+    // =========================================================================
+    printf("\n───────────────────────────────────────────────────────────────────────────────\n");
+    printf(" Scenario 2: Double Spike (spike → partial recovery → spike again)\n");
+    printf("───────────────────────────────────────────────────────────────────────────────\n");
+    for (int i = 0; i < n_sigmas; i++) {
+        StressTestResult r = test_double_spike(sigmas[i], params, n_particles);
+        print_result(r);
+        if (write_csv_files) {
+            write_csv(make_filename("Double_Spike", sigmas[i]), r.scenario, sigmas[i], r.timeseries);
+            write_summary_row(r);
+        }
+    }
+    
+    // =========================================================================
+    printf("\n───────────────────────────────────────────────────────────────────────────────\n");
+    printf(" Scenario 3: Flash Crash (down → bounce → down, 3 ticks)\n");
+    printf("───────────────────────────────────────────────────────────────────────────────\n");
+    for (int i = 0; i < n_sigmas; i++) {
+        StressTestResult r = test_flash_crash(sigmas[i], params, n_particles);
+        print_result(r);
+        if (write_csv_files) {
+            write_csv(make_filename("Flash_Crash", sigmas[i]), r.scenario, sigmas[i], r.timeseries);
+            write_summary_row(r);
+        }
+    }
+    
+    // =========================================================================
+    printf("\n───────────────────────────────────────────────────────────────────────────────\n");
+    printf(" Scenario 4: Sustained Chaos (50 ticks of extreme moves)\n");
+    printf("───────────────────────────────────────────────────────────────────────────────\n");
+    float chaos_sigmas[] = {5.0f, 7.0f, 10.0f, 12.0f, 15.0f};
+    for (int i = 0; i < 5; i++) {
+        StressTestResult r = test_sustained_chaos(chaos_sigmas[i], params, n_particles);
+        print_result(r);
+        if (write_csv_files) {
+            write_csv(make_filename("Sustained_Chaos", chaos_sigmas[i]), r.scenario, chaos_sigmas[i], r.timeseries);
+            write_summary_row(r);
+        }
+    }
+    
+    // =========================================================================
+    printf("\n───────────────────────────────────────────────────────────────────────────────\n");
+    printf(" Scenario 5: Gradual Build to Extreme (squeeze pattern)\n");
+    printf("───────────────────────────────────────────────────────────────────────────────\n");
+    for (int i = 0; i < n_sigmas; i++) {
+        StressTestResult r = test_gradual_extreme(sigmas[i], params, n_particles);
+        print_result(r);
+        if (write_csv_files) {
+            write_csv(make_filename("Gradual_Build", sigmas[i]), r.scenario, sigmas[i], r.timeseries);
+            write_summary_row(r);
+        }
+    }
+    
+    // =========================================================================
+    if (write_csv_files) {
+        close_summary_csv();
+    }
+    
+    printf("\n═══════════════════════════════════════════════════════════════════════════════\n");
+    printf(" Legend:\n");
+    printf("   ✓  = Healthy (recovered, no collapse, h bounded)\n");
+    printf("   ⚠  = Warning (slow recovery, low ESS, or high h)\n");
+    printf("   ❌ = Failed (NaN/Inf)\n");
+    printf("   ESS_min = Minimum Effective Sample Size (< 10 = particle collapse)\n");
+    printf("   h_max = Maximum log-volatility (> mu+2 = concerning)\n");
+    printf("   recover = Steps for h_mean to return within 0.5 of mu (%.1f)\n", params.mu);
+    printf("═══════════════════════════════════════════════════════════════════════════════\n");
+    
+    if (write_csv_files) {
+        printf("\n CSV files written. Load in Jupyter:\n");
+        printf("   import pandas as pd\n");
+        printf("   summary = pd.read_csv('svpf_stress_summary.csv')\n");
+        printf("   ts = pd.read_csv('svpf_stress_Single_Spike_20sigma.csv')\n");
+        printf("   ts.plot(x='t', y=['vol', 'ess'], secondary_y=['ess'])\n");
+        printf("\n");
+    }
+    
+    return 0;
+}

@@ -326,6 +326,26 @@ set_target_properties(tet_profile_multi_stream PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
 )
 
+# Profile Multi Stream
+add_executable(test_extreme_crypto_stress test_svpf_extreme.cu)
+
+target_include_directories(test_extreme_crypto_stress
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CUDAToolkit_INCLUDE_DIRS}
+)
+
+target_link_libraries(test_extreme_crypto_stress
+    PRIVATE
+        svpf
+        CUDA::cudart
+        CUDA::curand
+)
+
+set_target_properties(test_extreme_crypto_stress PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+)
+
 
 
 
