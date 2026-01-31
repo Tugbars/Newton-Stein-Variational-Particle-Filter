@@ -209,13 +209,17 @@ static void configure_mono_adaptive(void* state_ptr) {
     f->stein_max_steps = 16;
     f->ksd_improvement_threshold = 0.05f;
     
-    f->use_asymmetric_rho = 1;
-    f->rho_up = 0.98f;
-    f->rho_down = 0.93f;
+    //f->use_asymmetric_rho = 1;
+    //f->rho_up = 0.98f;
+    //f->rho_down = 0.93f;
     
     f->use_local_params = 0;
     f->delta_rho = 0.0f;
     f->delta_sigma = 0.0f;
+
+        // Enable Student-t state dynamics
+    f->use_student_t_state = 1;
+    f->nu_state = 7.0f; // 5-7 recommended, lower = fatter tails
 
     // Enable smoothing with 1-tick output lag
     f->use_smoothing = 1;
@@ -224,7 +228,7 @@ static void configure_mono_adaptive(void* state_ptr) {
 
     f->use_persistent_kernel = 1;
 
-    f->use_heun = 1;
+    f->use_heun = 0;
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
