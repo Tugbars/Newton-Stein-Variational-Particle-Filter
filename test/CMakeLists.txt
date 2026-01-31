@@ -306,5 +306,26 @@ set_target_properties(test_fused_v2_scenario PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
 )
 
+# Two factor
+add_executable(test_two_factor test_two_factor.cu)
+
+target_include_directories(test_two_factor
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CUDAToolkit_INCLUDE_DIRS}
+)
+
+target_link_libraries(test_two_factor
+    PRIVATE
+        svpf
+        CUDA::cudart
+        CUDA::curand
+)
+
+set_target_properties(test_two_factor PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+)
+
+
 
 
