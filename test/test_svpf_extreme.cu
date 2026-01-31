@@ -296,7 +296,7 @@ static StressTestResult run_scenario(
     
     // Student-t state dynamics (fat tails)
     state->use_student_t_state = 1;
-    state->nu_state = 3.0f;
+    state->nu_state = 2.0f;
     
     // Smoothing (1-tick lag for cleaner output)
     state->use_smoothing = 1;
