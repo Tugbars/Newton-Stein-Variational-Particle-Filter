@@ -230,6 +230,20 @@ typedef struct {
     float *d_phi_orig; // Stein operator at original h
     float *d_phi_pred; // Stein operator at predicted h̃
     float *d_h_orig;   // Original h before predictor step
+
+    // === Two-Factor Buffers ===
+    float *d_h_fast;
+    float *d_h_slow;
+    float *d_h_fast_prev;
+    float *d_h_slow_prev;
+    float *d_grad_fast;
+    float *d_grad_slow;
+    float *d_grad_v_fast;
+    float *d_grad_v_slow;
+    float *d_bandwidth_fast;
+    float *d_bandwidth_slow;
+    float *d_h_fast_mean;
+    float *d_h_slow_mean;
 } SVPFOptimizedState;
 
 /**
@@ -513,6 +527,21 @@ typedef struct {
     int persistent_kernel_supported; // Set at creation
 
     int use_heun;  // 0 = Euler (default), 1 = Heun's method
+
+
+    // === Two-Factor Volatility ===
+int use_two_factor;
+float rho_fast;
+float sigma_fast;
+float rho_slow;
+float sigma_slow;
+float bw_floor_fast;
+float bw_floor_slow;
+float guide_mean_fast;
+float guide_mean_slow;
+float guide_var_fast;
+float guide_var_slow;
+int guide_2f_initialized;
 
 
 } SVPFState;

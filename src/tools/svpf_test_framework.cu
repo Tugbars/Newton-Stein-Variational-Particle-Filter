@@ -513,7 +513,7 @@ SVPFTestMetrics svpf_test_run_single(
     }
     
     // Create filter
-    SVPFState* state = svpf_create(n_particles, config->n_stein_steps, 50.0f, NULL);
+    SVPFState* state = svpf_create(n_particles, config->n_stein_steps, 7.0f, NULL);
     svpf_initialize(state, filter_params, (unsigned int)seed);
     
     // Timer

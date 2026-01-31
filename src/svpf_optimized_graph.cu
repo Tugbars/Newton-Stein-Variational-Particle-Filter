@@ -15,6 +15,7 @@
  */
 
 #include "svpf_kernels.cuh"
+#include "svpf_two_factor.cuh"
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
 #include <cub/cub.cuh>
@@ -32,35 +33,8 @@
 #define SVPF_SMOOTH_MAX_LAG 8
 #endif
 
-// =============================================================================
-// HEUN'S METHOD KERNEL DECLARATIONS
-// =============================================================================
-// These kernels are defined in svpf_opt_kernels.cu
-
-__global__ void svpf_stein_operator_kernel(
-    const float* h, const float* grad, float* phi_out,
-    const float* d_bandwidth, int stein_sign_mode, int n);
-
-__global__ void svpf_stein_operator_full_newton_kernel(
-    const float* h, const float* grad, const float* local_hessian,
-    float* phi_out, const float* d_bandwidth, int stein_sign_mode, int n);
-
-__global__ void svpf_heun_predictor_kernel(
-    float* h, const float* h_orig, const float* phi, const float* v_rmsprop,
-    float step_size, float beta_factor, float epsilon, int n);
-
-__global__ void svpf_heun_corrector_kernel(
-    float* h, const float* h_orig, const float* phi_orig, const float* phi_pred,
-    float* v_rmsprop, curandStatePhilox4_32_10_t* rng,
-    float step_size, float beta_factor, float temperature,
-    float rho_rmsprop, float epsilon, int n);
-
-__global__ void svpf_heun_corrector_ksd_kernel(
-    float* h, const float* h_orig, const float* phi_orig, const float* phi_pred,
-    const float* grad, float* v_rmsprop, curandStatePhilox4_32_10_t* rng,
-    const float* d_bandwidth, float* d_ksd_partial,
-    float step_size, float beta_factor, float temperature,
-    float rho_rmsprop, float epsilon, int n);
+// Forward declarations
+static void svpf_optimized_init(SVPFOptimizedState* opt, int n);
 
 // =============================================================================
 // BASIC UTILITY KERNELS
@@ -250,6 +224,22 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     // 0 = Euler (default), 1 = Heun's method (2nd order, 2× gradient evals)
     state->use_heun = 0;
     
+    // === Two-Factor Volatility ===
+    // h_t = μ + h_fast,t + h_slow,t
+    // Fast captures spikes (ρ≈0.90), slow captures regimes (ρ≈0.99)
+    state->use_two_factor = 0;  // Off by default
+    state->rho_fast = 0.90f;
+    state->sigma_fast = 0.15f;
+    state->rho_slow = 0.99f;
+    state->sigma_slow = 0.05f;
+    state->bw_floor_fast = 0.01f;
+    state->bw_floor_slow = 0.10f;
+    state->guide_mean_fast = 0.0f;
+    state->guide_mean_slow = 0.0f;
+    state->guide_var_fast = 0.0f;
+    state->guide_var_slow = 0.0f;
+    state->guide_2f_initialized = 0;
+    
     // === Backward Smoothing (Fan et al. 2021 sliding window, lightweight) ===
     // Applies RTS-style correction to past estimates using recent observations
     state->use_smoothing = 0;                // OFF by default
@@ -390,6 +380,42 @@ void svpf_initialize(SVPFState* state, const SVPFParams* params, unsigned long l
     
     cudaMemset(state->d_grad_v, 0, n * sizeof(float));
     
+    // === Two-factor initialization ===
+    if (state->use_two_factor) {
+        SVPFOptimizedState* opt = &state->opt_backend;
+        
+        // Ensure buffers are allocated
+        svpf_optimized_init(opt, n);
+        
+        // Initialize particles from stationary distribution
+        svpf_init_two_factor_kernel<<<grid, SVPF_BLOCK_SIZE, 0, state->stream>>>(
+            opt->d_h_fast, opt->d_h_slow, state->rng_states,
+            state->rho_fast, state->sigma_fast,
+            state->rho_slow, state->sigma_slow,
+            n
+        );
+        
+        // Copy to prev
+        cudaMemcpyAsync(opt->d_h_fast_prev, opt->d_h_fast, n * sizeof(float),
+                        cudaMemcpyDeviceToDevice, state->stream);
+        cudaMemcpyAsync(opt->d_h_slow_prev, opt->d_h_slow, n * sizeof(float),
+                        cudaMemcpyDeviceToDevice, state->stream);
+        
+        // Initialize RMSProp states
+        float one = 1.0f;
+        cudaMemsetAsync(opt->d_grad_v_fast, 0, n * sizeof(float), state->stream);
+        cudaMemsetAsync(opt->d_grad_v_slow, 0, n * sizeof(float), state->stream);
+        
+        // Reset 2F EKF guide
+        state->guide_2f_initialized = 0;
+        state->guide_mean_fast = 0.0f;
+        state->guide_mean_slow = 0.0f;
+        state->guide_var_fast = (state->sigma_fast * state->sigma_fast) / 
+                                (1.0f - state->rho_fast * state->rho_fast + 1e-6f);
+        state->guide_var_slow = (state->sigma_slow * state->sigma_slow) / 
+                                (1.0f - state->rho_slow * state->rho_slow + 1e-6f);
+    }
+    
     svpf_graph_invalidate(state);
     cudaStreamSynchronize(state->stream);
 }
@@ -459,6 +485,20 @@ static void svpf_optimized_init(SVPFOptimizedState* opt, int n) {
     cudaMalloc(&opt->d_phi_pred, n * sizeof(float));
     cudaMalloc(&opt->d_h_orig, n * sizeof(float));
     
+    // === Two-factor buffers ===
+    cudaMalloc(&opt->d_h_fast, n * sizeof(float));
+    cudaMalloc(&opt->d_h_slow, n * sizeof(float));
+    cudaMalloc(&opt->d_h_fast_prev, n * sizeof(float));
+    cudaMalloc(&opt->d_h_slow_prev, n * sizeof(float));
+    cudaMalloc(&opt->d_grad_fast, n * sizeof(float));
+    cudaMalloc(&opt->d_grad_slow, n * sizeof(float));
+    cudaMalloc(&opt->d_grad_v_fast, n * sizeof(float));
+    cudaMalloc(&opt->d_grad_v_slow, n * sizeof(float));
+    cudaMalloc(&opt->d_bandwidth_fast, sizeof(float));
+    cudaMalloc(&opt->d_bandwidth_slow, sizeof(float));
+    cudaMalloc(&opt->d_h_fast_mean, sizeof(float));
+    cudaMalloc(&opt->d_h_slow_mean, sizeof(float));
+    
     cudaStreamCreateWithFlags(&opt->graph_stream, cudaStreamNonBlocking);
     opt->graph_captured = false;
     opt->graph_n = 0;
@@ -499,6 +539,20 @@ static void svpf_optimized_cleanup(SVPFOptimizedState* opt) {
     cudaFree(opt->d_phi_orig);
     cudaFree(opt->d_phi_pred);
     cudaFree(opt->d_h_orig);
+    
+    // === Two-factor buffers ===
+    cudaFree(opt->d_h_fast);
+    cudaFree(opt->d_h_slow);
+    cudaFree(opt->d_h_fast_prev);
+    cudaFree(opt->d_h_slow_prev);
+    cudaFree(opt->d_grad_fast);
+    cudaFree(opt->d_grad_slow);
+    cudaFree(opt->d_grad_v_fast);
+    cudaFree(opt->d_grad_v_slow);
+    cudaFree(opt->d_bandwidth_fast);
+    cudaFree(opt->d_bandwidth_slow);
+    cudaFree(opt->d_h_fast_mean);
+    cudaFree(opt->d_h_slow_mean);
     
     if (opt->h_results_pinned) {
         cudaFreeHost(opt->h_results_pinned);
@@ -653,6 +707,171 @@ static float svpf_get_smoothed_output(SVPFState* state, float h_mean_raw) {
 }
 
 // =============================================================================
+// TWO-FACTOR STEP FUNCTION
+// =============================================================================
+// Coordinate-wise SVGD: reuses existing 1D Stein transport kernel twice
+
+static void svpf_step_two_factor(
+    SVPFState* state,
+    SVPFOptimizedState* opt,
+    float y_t,
+    float y_prev,
+    const SVPFParams* params,
+    float* loglik_out,
+    float* vol_out,
+    float* h_mean_out
+) {
+    int n = state->n_particles;
+    int nb = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    cudaStream_t cs = state->stream;
+    
+    // Upload y
+    float y_arr[2] = {y_prev, y_t};
+    cudaMemcpyAsync(opt->d_y_single, y_arr, 2 * sizeof(float), cudaMemcpyHostToDevice, cs);
+    
+    // =========================================================================
+    // PREDICT (Two-Factor)
+    // =========================================================================
+    if (state->use_guided) {
+        svpf_predict_two_factor_guided_kernel<<<nb, BLOCK_SIZE, 0, cs>>>(
+            opt->d_h_fast, opt->d_h_slow,
+            opt->d_h_fast_prev, opt->d_h_slow_prev,
+            state->rng_states, opt->d_y_single,
+            params->mu,
+            state->rho_fast, state->sigma_fast,
+            state->rho_slow, state->sigma_slow,
+            state->use_mim, state->mim_jump_prob, state->mim_jump_scale,
+            state->guided_alpha_base, state->guided_alpha_shock,
+            state->guided_innovation_threshold,
+            state->student_t_implied_offset,
+            n
+        );
+    } else {
+        svpf_predict_two_factor_kernel<<<nb, BLOCK_SIZE, 0, cs>>>(
+            opt->d_h_fast, opt->d_h_slow,
+            opt->d_h_fast_prev, opt->d_h_slow_prev,
+            state->rng_states,
+            state->rho_fast, state->sigma_fast,
+            state->rho_slow, state->sigma_slow,
+            state->use_mim, state->mim_jump_prob, state->mim_jump_scale,
+            n
+        );
+    }
+    
+    // =========================================================================
+    // EKF GUIDE (Innovation Split)
+    // =========================================================================
+    if (state->use_guide) {
+        svpf_ekf_two_factor_update(
+            &state->guide_mean_fast, &state->guide_mean_slow,
+            &state->guide_var_fast, &state->guide_var_slow,
+            y_t, params->mu,
+            state->rho_fast, state->sigma_fast,
+            state->rho_slow, state->sigma_slow,
+            4.93f + 2.0f,  // obs_var
+            state->student_t_implied_offset,
+            &state->guide_2f_initialized
+        );
+        
+        svpf_apply_guide_two_factor_kernel<<<nb, BLOCK_SIZE, 0, cs>>>(
+            opt->d_h_fast, opt->d_h_slow,
+            state->guide_mean_fast, state->guide_mean_slow,
+            state->guide_strength,
+            n
+        );
+    }
+    
+    // =========================================================================
+    // BANDWIDTH (separate for each component)
+    // =========================================================================
+    svpf_bandwidth_two_factor_kernel<<<1, BLOCK_SIZE, 0, cs>>>(
+        opt->d_h_fast, opt->d_h_slow,
+        opt->d_bandwidth_fast, opt->d_bandwidth_slow,
+        state->bw_floor_fast, state->bw_floor_slow,
+        n
+    );
+    
+    // =========================================================================
+    // STEIN ITERATIONS (Coordinate-wise)
+    // =========================================================================
+    int n_anneal = state->use_annealing ? state->n_anneal_steps : 1;
+    float base_step = 0.5f / (float)state->n_stein_steps;
+    size_t stein_smem = 2 * n * sizeof(float);
+    
+    float student_t_const = lgammaf((state->nu + 1.0f) / 2.0f)
+                          - lgammaf(state->nu / 2.0f)
+                          - 0.5f * logf((float)M_PI * state->nu);
+    
+    for (int a = 0; a < n_anneal; a++) {
+        float beta = (float)(a + 1) / (float)n_anneal;
+        float temp = state->use_svld ? state->temperature : 0.0f;
+        
+        for (int s = 0; s < state->n_stein_steps; s++) {
+            // -----------------------------------------------------------------
+            // Compute gradients (shared likelihood, separate priors)
+            // -----------------------------------------------------------------
+            svpf_gradient_two_factor_kernel<<<nb, BLOCK_SIZE, 0, cs>>>(
+                opt->d_h_fast, opt->d_h_slow,
+                opt->d_h_fast_prev, opt->d_h_slow_prev,
+                opt->d_grad_fast, opt->d_grad_slow,
+                state->log_weights,
+                y_t, params->mu,
+                state->rho_fast, state->sigma_fast,
+                state->rho_slow, state->sigma_slow,
+                beta, state->nu, student_t_const,
+                state->use_exact_gradient,
+                n
+            );
+            
+            // -----------------------------------------------------------------
+            // Stein transport: h_fast (reuse existing 1D kernel)
+            // -----------------------------------------------------------------
+            svpf_fused_stein_transport_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
+                opt->d_h_fast, opt->d_grad_fast, opt->d_grad_v_fast,
+                state->rng_states, opt->d_bandwidth_fast,
+                base_step, beta, temp, state->rmsprop_rho, state->rmsprop_eps,
+                state->stein_repulsive_sign, n
+            );
+            
+            // -----------------------------------------------------------------
+            // Stein transport: h_slow (same kernel, different buffers)
+            // -----------------------------------------------------------------
+            svpf_fused_stein_transport_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
+                opt->d_h_slow, opt->d_grad_slow, opt->d_grad_v_slow,
+                state->rng_states, opt->d_bandwidth_slow,
+                base_step, beta, temp, state->rmsprop_rho, state->rmsprop_eps,
+                state->stein_repulsive_sign, n
+            );
+        }
+    }
+    
+    // =========================================================================
+    // OUTPUTS
+    // =========================================================================
+    svpf_outputs_two_factor_kernel<<<1, BLOCK_SIZE, 0, cs>>>(
+        opt->d_h_fast, opt->d_h_slow, state->log_weights,
+        params->mu,
+        opt->d_loglik_single, opt->d_vol_single, opt->d_h_mean_prev,
+        opt->d_h_fast_mean, opt->d_h_slow_mean,
+        n
+    );
+    
+    // Read results
+    float results[3];
+    cudaMemcpyAsync(&results[0], opt->d_loglik_single, sizeof(float), cudaMemcpyDeviceToHost, cs);
+    cudaMemcpyAsync(&results[1], opt->d_vol_single, sizeof(float), cudaMemcpyDeviceToHost, cs);
+    cudaMemcpyAsync(&results[2], opt->d_h_mean_prev, sizeof(float), cudaMemcpyDeviceToHost, cs);
+    cudaStreamSynchronize(cs);
+    
+    if (loglik_out) *loglik_out = results[0];
+    if (vol_out) *vol_out = results[1];
+    if (h_mean_out) *h_mean_out = results[2];
+    
+    state->vol_prev = results[1];
+    state->timestep++;
+}
+
+// =============================================================================
 // PUBLIC API: svpf_step_graph
 // =============================================================================
 // 
@@ -675,6 +894,15 @@ void svpf_step_graph(SVPFState* state, float y_t, float y_prev, const SVPFParams
     cudaStream_t cs = state->stream;
     
     svpf_optimized_init(opt, n);
+    
+    // === Two-factor branch ===
+    if (state->use_two_factor) {
+        svpf_step_two_factor(state, opt, y_t, y_prev, params,
+                             h_loglik_out, h_vol_out, h_mean_out);
+        return;
+    }
+    
+    // === Single-factor code continues below ===
     
     // Determine effective parameters
     float effective_mu = state->use_adaptive_mu ? state->mu_state : params->mu;
