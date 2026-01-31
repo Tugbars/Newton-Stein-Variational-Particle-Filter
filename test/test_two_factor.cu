@@ -274,6 +274,9 @@ static void configure_two_factor(SVPFState* f, const TwoFactorDGPParams& dgp) {
     // 5. More Stein steps for two components
     f->stein_min_steps = 10;  // Was 8
     f->stein_max_steps = 20;  // Was 16
+    
+    // 6. Guide-preserving to maintain particle diversity
+    f->use_guide_preserving = 1;
 }
 
 // =============================================================================
@@ -347,14 +350,15 @@ static ComparisonResult run_comparison(
     SVPFParams params_1f;
     params_1f.mu = dgp.mu;
     params_1f.gamma = 0.0f;
-    // Approximate combined dynamics: use average persistence, combined vol
+    // Stationary variances of each component
     float var_fast = dgp.sigma_fast * dgp.sigma_fast / (1.0f - dgp.rho_fast * dgp.rho_fast);
     float var_slow = dgp.sigma_slow * dgp.sigma_slow / (1.0f - dgp.rho_slow * dgp.rho_slow);
     float var_total = var_fast + var_slow;
-    // Weighted average rho
+    // Weighted average rho (by stationary variance)
     params_1f.rho = (dgp.rho_fast * var_fast + dgp.rho_slow * var_slow) / var_total;
-    // Combined sigma (approximate)
-    params_1f.sigma_z = sqrtf(dgp.sigma_fast * dgp.sigma_fast + dgp.sigma_slow * dgp.sigma_slow);
+    // Variance-consistent sigma: σ² = var_total × (1 - ρ²)
+    // This ensures the 1F model has the same stationary variance as the 2F DGP
+    params_1f.sigma_z = sqrtf(var_total * (1.0f - params_1f.rho * params_1f.rho));
     
     SVPFParams params_2f;
     params_2f.mu = dgp.mu;

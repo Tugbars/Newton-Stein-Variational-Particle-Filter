@@ -231,11 +231,22 @@ __global__ void svpf_gradient_two_factor_kernel(
     float prior_grad_slow = -(hs - rho_slow * hs_prev) / sigma_slow_sq;
     
     // =========================================================================
-    // COMBINED GRADIENTS
+    // VARIANCE-WEIGHTED LIKELIHOOD SPLIT (for identifiability)
     // =========================================================================
-    // Each component gets: own prior gradient + shared likelihood gradient
-    grad_fast[i] = prior_grad_fast + beta * lik_grad;
-    grad_slow[i] = prior_grad_slow + beta * lik_grad;
+    // Use STATIONARY variances (not innovation variances) for balanced split.
+    // Stationary var = σ² / (1 - ρ²)
+    // This accounts for persistence: slow component has high stationary var
+    // even though its innovation var is small.
+    float one_minus_rho_fast_sq = 1.0f - rho_fast * rho_fast + 1e-6f;
+    float one_minus_rho_slow_sq = 1.0f - rho_slow * rho_slow + 1e-6f;
+    float var_fast_stat = sigma_fast_sq / one_minus_rho_fast_sq;
+    float var_slow_stat = sigma_slow_sq / one_minus_rho_slow_sq;
+    
+    float w_fast = var_fast_stat / (var_fast_stat + var_slow_stat);
+    float w_slow = 1.0f - w_fast;
+    
+    grad_fast[i] = prior_grad_fast + beta * w_fast * lik_grad;
+    grad_slow[i] = prior_grad_slow + beta * w_slow * lik_grad;
 }
 
 // =============================================================================
@@ -303,24 +314,46 @@ __global__ void svpf_bandwidth_two_factor_kernel(
 }
 
 // =============================================================================
-// APPLY GUIDE KERNEL (Two-Factor)
+// APPLY GUIDE KERNEL (Two-Factor) - PRESERVING VERSION
 // =============================================================================
-// Nudge particles toward EKF estimates
+// Shifts mean toward guide while preserving deviations (particle diversity)
 
 __global__ void svpf_apply_guide_two_factor_kernel(
     float* __restrict__ h_fast,
     float* __restrict__ h_slow,
     float guide_mean_fast, float guide_mean_slow,
+    float current_mean_fast, float current_mean_slow,  // Current particle means
     float guide_strength,
+    int use_preserving,  // If 1, preserve deviations; if 0, simple blend
     int n
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     
     float gs = guide_strength;
+    float hf = h_fast[i];
+    float hs = h_slow[i];
     
-    h_fast[i] = (1.0f - gs) * h_fast[i] + gs * guide_mean_fast;
-    h_slow[i] = (1.0f - gs) * h_slow[i] + gs * guide_mean_slow;
+    float hf_new, hs_new;
+    
+    if (use_preserving) {
+        // Preserving: shift mean while keeping deviations
+        float dev_fast = hf - current_mean_fast;
+        float dev_slow = hs - current_mean_slow;
+        
+        float new_mean_fast = (1.0f - gs) * current_mean_fast + gs * guide_mean_fast;
+        float new_mean_slow = (1.0f - gs) * current_mean_slow + gs * guide_mean_slow;
+        
+        hf_new = new_mean_fast + dev_fast;
+        hs_new = new_mean_slow + dev_slow;
+    } else {
+        // Simple blend (collapses diversity)
+        hf_new = (1.0f - gs) * hf + gs * guide_mean_fast;
+        hs_new = (1.0f - gs) * hs + gs * guide_mean_slow;
+    }
+    
+    h_fast[i] = clamp_h_2f(hf_new);
+    h_slow[i] = clamp_h_2f(hs_new);
 }
 
 // =============================================================================
@@ -351,10 +384,9 @@ __device__ float block_reduce_max_2f(float val) {
 }
 
 // =============================================================================
-// OUTPUT KERNEL (Two-Factor) - FIXED
+// OUTPUT KERNEL (Two-Factor) - FIXED Jensen bias
 // =============================================================================
-// Computes h_mean = μ + mean(h_fast) + mean(h_slow)
-// Uses safe block reduction for max (not atomicMax on floats!)
+// Computes vol = mean(exp(h/2)) NOT exp(mean(h)/2) to avoid Jensen bias
 
 __global__ void svpf_outputs_two_factor_kernel(
     const float* __restrict__ h_fast,
@@ -370,12 +402,14 @@ __global__ void svpf_outputs_two_factor_kernel(
 ) {
     __shared__ float s_sum_fast;
     __shared__ float s_sum_slow;
+    __shared__ float s_sum_vol;  // Jensen-correct vol accumulator
     __shared__ float s_max_w;
     __shared__ float s_sum_exp;
     
     if (threadIdx.x == 0) {
         s_sum_fast = 0.0f;
         s_sum_slow = 0.0f;
+        s_sum_vol = 0.0f;
         s_sum_exp = 0.0f;
     }
     __syncthreads();
@@ -383,16 +417,23 @@ __global__ void svpf_outputs_two_factor_kernel(
     // Pass 1: Sums and find max log-weight
     float local_sum_fast = 0.0f;
     float local_sum_slow = 0.0f;
+    float local_sum_vol = 0.0f;
     float local_max = -1e30f;
     
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
-        local_sum_fast += h_fast[i];
-        local_sum_slow += h_slow[i];
+        float hf = h_fast[i];
+        float hs = h_slow[i];
+        float h_total = mu + hf + hs;
+        
+        local_sum_fast += hf;
+        local_sum_slow += hs;
+        local_sum_vol += expf(0.5f * h_total);  // Jensen-correct: mean(exp(h/2))
         local_max = fmaxf(local_max, log_w[i]);
     }
     
     atomicAdd(&s_sum_fast, local_sum_fast);
     atomicAdd(&s_sum_slow, local_sum_slow);
+    atomicAdd(&s_sum_vol, local_sum_vol);
     
     // Safe block reduce max (NO atomicMax on floats!)
     float block_max = block_reduce_max_2f(local_max);
@@ -419,7 +460,7 @@ __global__ void svpf_outputs_two_factor_kernel(
         float h_mean = mu + h_fast_mean + h_slow_mean;
         
         *d_h_mean = h_mean;
-        *d_vol = expf(h_mean * 0.5f);
+        *d_vol = s_sum_vol * inv_n;  // Jensen-correct: mean(exp(h/2))
         *d_loglik = max_w + logf(fmaxf(s_sum_exp * inv_n, 1e-10f));
         
         if (d_h_fast_mean) *d_h_fast_mean = h_fast_mean;

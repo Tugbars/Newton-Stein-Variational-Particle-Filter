@@ -790,10 +790,18 @@ static void svpf_step_two_factor(
             &state->guide_2f_initialized
         );
         
+        // Get current particle means (from previous step as approximation)
+        float current_mean_fast = 0.0f, current_mean_slow = 0.0f;
+        cudaMemcpyAsync(&current_mean_fast, opt->d_h_fast_mean, sizeof(float), cudaMemcpyDeviceToHost, cs);
+        cudaMemcpyAsync(&current_mean_slow, opt->d_h_slow_mean, sizeof(float), cudaMemcpyDeviceToHost, cs);
+        cudaStreamSynchronize(cs);
+        
         svpf_apply_guide_two_factor_kernel<<<nb, BLOCK_SIZE, 0, cs>>>(
             opt->d_h_fast, opt->d_h_slow,
             state->guide_mean_fast, state->guide_mean_slow,
+            current_mean_fast, current_mean_slow,
             state->guide_strength,
+            state->use_guide_preserving,  // Use preserving mode
             n
         );
     }

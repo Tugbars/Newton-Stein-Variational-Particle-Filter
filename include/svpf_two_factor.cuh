@@ -185,15 +185,17 @@ __global__ void svpf_ekf_two_factor_kernel(
 );
 
 /**
- * @brief Apply EKF guide to two-factor particles
+ * @brief Apply EKF guide to two-factor particles - PRESERVING VERSION
  * 
- * Nudges particles toward EKF estimate with variance-weighted split.
+ * Shifts mean toward EKF estimate while preserving particle deviations.
  */
 __global__ void svpf_apply_guide_two_factor_kernel(
     float* __restrict__ h_fast,
     float* __restrict__ h_slow,
     float guide_mean_fast, float guide_mean_slow,
+    float current_mean_fast, float current_mean_slow,
     float guide_strength,
+    int use_preserving,
     int n
 );
 
