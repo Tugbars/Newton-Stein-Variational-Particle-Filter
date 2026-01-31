@@ -2173,3 +2173,365 @@ __global__ void svpf_ksd_reduce_parallel_kernel(
         *ksd_out = sqrtf(fabsf(sdata[0] * inv_n_sq));
     }
 }
+
+// =============================================================================
+// PARALLEL FULL NEWTON STEIN KERNELS (for N >= 1024)
+// =============================================================================
+// Same parallelization strategy but includes Hessian weighting
+
+// -----------------------------------------------------------------------------
+// Parallel Full Newton Stein Operator (no KSD)
+// -----------------------------------------------------------------------------
+__global__ void svpf_stein_operator_parallel_full_newton_kernel(
+    const float* __restrict__ h,
+    const float* __restrict__ grad,
+    const float* __restrict__ local_hessian,
+    float* __restrict__ phi_out,
+    const float* __restrict__ d_bandwidth,
+    int stein_sign_mode,
+    int n
+) {
+    extern __shared__ float smem[];
+    float* sh_h = smem;
+    float* sh_grad = &smem[n];
+    float* sh_hess = &smem[2*n];
+    float* sh_k_grad_sum = &smem[3*n];
+    float* sh_gk_sum = &smem[3*n + STEIN_PARALLEL_BLOCK_SIZE];
+    float* sh_H_weighted = &smem[3*n + 2*STEIN_PARALLEL_BLOCK_SIZE];
+    float* sh_K_sum_norm = &smem[3*n + 3*STEIN_PARALLEL_BLOCK_SIZE];
+    
+    int i = blockIdx.x;        // Each BLOCK handles particle i
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+    
+    // Cooperative load
+    for (int k = tid; k < n; k += stride) {
+        sh_h[k] = h[k];
+        sh_grad[k] = grad[k];
+        sh_hess[k] = local_hessian[k];
+    }
+    __syncthreads();
+    
+    float h_i = sh_h[i];
+    float sign_mult = (stein_sign_mode == 1) ? 1.0f : -1.0f;
+    
+    // Read bandwidth from device pointer
+    float bw = *d_bandwidth;
+    float inv_bw_sq = 1.0f / (bw * bw);
+    float inv_n = 1.0f / (float)n;
+    
+    // Each thread computes partial sums
+    float my_H_weighted = 0.0f;
+    float my_K_sum_norm = 0.0f;
+    float my_k_grad_sum = 0.0f;
+    float my_gk_sum = 0.0f;
+    
+    for (int j = tid; j < n; j += stride) {
+        float diff = h_i - sh_h[j];
+        float dist_sq = diff * diff * inv_bw_sq;
+        
+        float base = 1.0f + dist_sq;
+        float K = 1.0f / base;
+        float K_sq = K * K;
+        
+        my_H_weighted += sh_hess[j] * K;
+        float Nk = 2.0f * inv_bw_sq * K_sq * fabsf(3.0f * dist_sq - 1.0f);
+        my_H_weighted += Nk;
+        my_K_sum_norm += K;
+        
+        my_k_grad_sum += K * sh_grad[j];
+        my_gk_sum += sign_mult * 2.0f * diff * inv_bw_sq * K_sq;
+    }
+    
+    sh_k_grad_sum[tid] = my_k_grad_sum;
+    sh_gk_sum[tid] = my_gk_sum;
+    sh_H_weighted[tid] = my_H_weighted;
+    sh_K_sum_norm[tid] = my_K_sum_norm;
+    __syncthreads();
+    
+    // Parallel reduction
+    for (int s = stride / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sh_k_grad_sum[tid] += sh_k_grad_sum[tid + s];
+            sh_gk_sum[tid] += sh_gk_sum[tid + s];
+            sh_H_weighted[tid] += sh_H_weighted[tid + s];
+            sh_K_sum_norm[tid] += sh_K_sum_norm[tid + s];
+        }
+        __syncthreads();
+    }
+    
+    if (tid == 0) {
+        float H_weighted = sh_H_weighted[0] / fmaxf(sh_K_sum_norm[0], 1e-6f);
+        H_weighted = fminf(fmaxf(H_weighted, 0.1f), 100.0f);
+        float inv_H_i = 1.0f / H_weighted;
+        
+        phi_out[i] = (sh_k_grad_sum[0] + sh_gk_sum[0]) * inv_n * inv_H_i * 0.7f;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Parallel Full Newton Stein Operator with KSD
+// -----------------------------------------------------------------------------
+__global__ void svpf_stein_operator_parallel_full_newton_ksd_kernel(
+    const float* __restrict__ h,
+    const float* __restrict__ grad,
+    const float* __restrict__ local_hessian,
+    float* __restrict__ phi_out,
+    float* __restrict__ ksd_partial,
+    const float* __restrict__ d_bandwidth,
+    int stein_sign_mode,
+    int n
+) {
+    extern __shared__ float smem[];
+    float* sh_h = smem;
+    float* sh_grad = &smem[n];
+    float* sh_hess = &smem[2*n];
+    float* sh_k_grad_sum = &smem[3*n];
+    float* sh_gk_sum = &smem[3*n + STEIN_PARALLEL_BLOCK_SIZE];
+    float* sh_H_weighted = &smem[3*n + 2*STEIN_PARALLEL_BLOCK_SIZE];
+    float* sh_K_sum_norm = &smem[3*n + 3*STEIN_PARALLEL_BLOCK_SIZE];
+    float* sh_ksd = &smem[3*n + 4*STEIN_PARALLEL_BLOCK_SIZE];
+    
+    int i = blockIdx.x;
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+    
+    // Cooperative load
+    for (int k = tid; k < n; k += stride) {
+        sh_h[k] = h[k];
+        sh_grad[k] = grad[k];
+        sh_hess[k] = local_hessian[k];
+    }
+    __syncthreads();
+    
+    float h_i = sh_h[i];
+    float grad_i = sh_grad[i];
+    float sign_mult = (stein_sign_mode == 1) ? 1.0f : -1.0f;
+    
+    float bw = *d_bandwidth;
+    float inv_bw_sq = 1.0f / (bw * bw);
+    float inv_n = 1.0f / (float)n;
+    
+    float my_H_weighted = 0.0f;
+    float my_K_sum_norm = 0.0f;
+    float my_k_grad_sum = 0.0f;
+    float my_gk_sum = 0.0f;
+    float my_ksd = 0.0f;
+    
+    for (int j = tid; j < n; j += stride) {
+        float h_j = sh_h[j];
+        float grad_j = sh_grad[j];
+        float diff = h_i - h_j;
+        float dist_sq = diff * diff * inv_bw_sq;
+        
+        float base = 1.0f + dist_sq;
+        float K = 1.0f / base;
+        float K_sq = K * K;
+        float K_cube = K_sq * K;
+        
+        my_H_weighted += sh_hess[j] * K;
+        float Nk = 2.0f * inv_bw_sq * K_sq * fabsf(3.0f * dist_sq - 1.0f);
+        my_H_weighted += Nk;
+        my_K_sum_norm += K;
+        
+        my_k_grad_sum += K * grad_j;
+        my_gk_sum += sign_mult * 2.0f * diff * inv_bw_sq * K_sq;
+        
+        // KSD components
+        float grad_k_i = -2.0f * diff * inv_bw_sq * K_sq;
+        float grad_k_j = -grad_k_i;
+        float grad2_k = -2.0f * inv_bw_sq * K_sq + 8.0f * dist_sq * inv_bw_sq * inv_bw_sq * K_cube;
+        float u_p = K * grad_i * grad_j + grad_i * grad_k_j + grad_j * grad_k_i + grad2_k;
+        my_ksd += u_p;
+    }
+    
+    sh_k_grad_sum[tid] = my_k_grad_sum;
+    sh_gk_sum[tid] = my_gk_sum;
+    sh_H_weighted[tid] = my_H_weighted;
+    sh_K_sum_norm[tid] = my_K_sum_norm;
+    sh_ksd[tid] = my_ksd;
+    __syncthreads();
+    
+    // Parallel reduction
+    for (int s = stride / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sh_k_grad_sum[tid] += sh_k_grad_sum[tid + s];
+            sh_gk_sum[tid] += sh_gk_sum[tid + s];
+            sh_H_weighted[tid] += sh_H_weighted[tid + s];
+            sh_K_sum_norm[tid] += sh_K_sum_norm[tid + s];
+            sh_ksd[tid] += sh_ksd[tid + s];
+        }
+        __syncthreads();
+    }
+    
+    if (tid == 0) {
+        float H_weighted = sh_H_weighted[0] / fmaxf(sh_K_sum_norm[0], 1e-6f);
+        H_weighted = fminf(fmaxf(H_weighted, 0.1f), 100.0f);
+        float inv_H_i = 1.0f / H_weighted;
+        
+        phi_out[i] = (sh_k_grad_sum[0] + sh_gk_sum[0]) * inv_n * inv_H_i * 0.7f;
+        ksd_partial[i] = sh_ksd[0];
+    }
+}
+
+// =============================================================================
+// PARALLEL NEWTON STEIN KERNELS
+// =============================================================================
+// Newton variant uses preconditioned gradient and inv_hessian scaling
+
+// -----------------------------------------------------------------------------
+// Parallel Newton Stein Operator (no KSD)
+// -----------------------------------------------------------------------------
+__global__ void svpf_stein_operator_parallel_newton_kernel(
+    const float* __restrict__ h,
+    const float* __restrict__ precond_grad,
+    const float* __restrict__ inv_hessian,
+    float* __restrict__ phi_out,
+    const float* __restrict__ d_bandwidth,
+    int stein_sign_mode,
+    int n
+) {
+    extern __shared__ float smem[];
+    float* sh_h = smem;
+    float* sh_precond_grad = &smem[n];
+    float* sh_inv_hess = &smem[2*n];
+    float* sh_k_sum = &smem[3*n];
+    float* sh_gk_sum = &smem[3*n + STEIN_PARALLEL_BLOCK_SIZE];
+    
+    int i = blockIdx.x;
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+    
+    // Cooperative load
+    for (int k = tid; k < n; k += stride) {
+        sh_h[k] = h[k];
+        sh_precond_grad[k] = precond_grad[k];
+        sh_inv_hess[k] = 1.0f / inv_hessian[k];
+    }
+    __syncthreads();
+    
+    float h_i = sh_h[i];
+    float sign_mult = (stein_sign_mode == 1) ? 1.0f : -1.0f;
+    
+    float bw = *d_bandwidth;
+    float inv_bw_sq = 1.0f / (bw * bw);
+    float inv_n = 1.0f / (float)n;
+    
+    float my_k_sum = 0.0f;
+    float my_gk_sum = 0.0f;
+    
+    for (int j = tid; j < n; j += stride) {
+        float diff = h_i - sh_h[j];
+        float dist_sq = diff * diff * inv_bw_sq;
+        
+        float base = 1.0f + dist_sq;
+        float K = 1.0f / base;
+        float K_sq = K * K;
+        
+        my_k_sum += K * sh_precond_grad[j];
+        my_gk_sum += sign_mult * 2.0f * diff * inv_bw_sq * K_sq * sh_inv_hess[j];
+    }
+    
+    sh_k_sum[tid] = my_k_sum;
+    sh_gk_sum[tid] = my_gk_sum;
+    __syncthreads();
+    
+    for (int s = stride / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sh_k_sum[tid] += sh_k_sum[tid + s];
+            sh_gk_sum[tid] += sh_gk_sum[tid + s];
+        }
+        __syncthreads();
+    }
+    
+    if (tid == 0) {
+        phi_out[i] = (sh_k_sum[0] + sh_gk_sum[0]) * inv_n;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Parallel Newton Stein Operator with KSD
+// -----------------------------------------------------------------------------
+__global__ void svpf_stein_operator_parallel_newton_ksd_kernel(
+    const float* __restrict__ h,
+    const float* __restrict__ precond_grad,
+    const float* __restrict__ inv_hessian,
+    float* __restrict__ phi_out,
+    float* __restrict__ ksd_partial,
+    const float* __restrict__ d_bandwidth,
+    int stein_sign_mode,
+    int n
+) {
+    extern __shared__ float smem[];
+    float* sh_h = smem;
+    float* sh_precond_grad = &smem[n];
+    float* sh_inv_hess = &smem[2*n];
+    float* sh_k_sum = &smem[3*n];
+    float* sh_gk_sum = &smem[3*n + STEIN_PARALLEL_BLOCK_SIZE];
+    float* sh_ksd = &smem[3*n + 2*STEIN_PARALLEL_BLOCK_SIZE];
+    
+    int i = blockIdx.x;
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+    
+    // Cooperative load
+    for (int k = tid; k < n; k += stride) {
+        sh_h[k] = h[k];
+        sh_precond_grad[k] = precond_grad[k];
+        sh_inv_hess[k] = 1.0f / inv_hessian[k];
+    }
+    __syncthreads();
+    
+    float h_i = sh_h[i];
+    float grad_i = sh_precond_grad[i];
+    float sign_mult = (stein_sign_mode == 1) ? 1.0f : -1.0f;
+    
+    float bw = *d_bandwidth;
+    float inv_bw_sq = 1.0f / (bw * bw);
+    float inv_n = 1.0f / (float)n;
+    
+    float my_k_sum = 0.0f;
+    float my_gk_sum = 0.0f;
+    float my_ksd = 0.0f;
+    
+    for (int j = tid; j < n; j += stride) {
+        float h_j = sh_h[j];
+        float grad_j = sh_precond_grad[j];
+        float diff = h_i - h_j;
+        float dist_sq = diff * diff * inv_bw_sq;
+        
+        float base = 1.0f + dist_sq;
+        float K = 1.0f / base;
+        float K_sq = K * K;
+        float K_cube = K_sq * K;
+        
+        my_k_sum += K * grad_j;
+        my_gk_sum += sign_mult * 2.0f * diff * inv_bw_sq * K_sq * sh_inv_hess[j];
+        
+        // KSD (using preconditioned gradients)
+        float grad_k_i = -2.0f * diff * inv_bw_sq * K_sq;
+        float grad_k_j = -grad_k_i;
+        float grad2_k = -2.0f * inv_bw_sq * K_sq + 8.0f * dist_sq * inv_bw_sq * inv_bw_sq * K_cube;
+        float u_p = K * grad_i * grad_j + grad_i * grad_k_j + grad_j * grad_k_i + grad2_k;
+        my_ksd += u_p;
+    }
+    
+    sh_k_sum[tid] = my_k_sum;
+    sh_gk_sum[tid] = my_gk_sum;
+    sh_ksd[tid] = my_ksd;
+    __syncthreads();
+    
+    for (int s = stride / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sh_k_sum[tid] += sh_k_sum[tid + s];
+            sh_gk_sum[tid] += sh_gk_sum[tid + s];
+            sh_ksd[tid] += sh_ksd[tid + s];
+        }
+        __syncthreads();
+    }
+    
+    if (tid == 0) {
+        phi_out[i] = (sh_k_sum[0] + sh_gk_sum[0]) * inv_n;
+        ksd_partial[i] = sh_ksd[0];
+    }
+}
