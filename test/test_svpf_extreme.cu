@@ -21,8 +21,10 @@
 struct TimeseriesPoint {
     int t;
     float y_t;           // Return
+    float true_h;        // TRUE log-vol from DGP
     float h_mean;        // Estimated log-vol
     float vol;           // Estimated vol (exp(h/2))
+    float true_vol;      // TRUE vol (exp(true_h/2))
     float ess;           // Effective sample size
     float loglik;        // Log-likelihood
 };
@@ -38,12 +40,12 @@ static void write_csv(const std::string& filename,
     }
     
     // Header
-    fprintf(f, "t,y_t,h_mean,vol,ess,loglik,scenario,sigma\n");
+    fprintf(f, "t,y_t,true_h,h_mean,true_vol,vol,ess,loglik,scenario,sigma\n");
     
     // Data
     for (const auto& p : data) {
-        fprintf(f, "%d,%.8f,%.6f,%.8f,%.2f,%.4f,%s,%.1f\n",
-                p.t, p.y_t, p.h_mean, p.vol, p.ess, p.loglik,
+        fprintf(f, "%d,%.8f,%.6f,%.6f,%.8f,%.8f,%.2f,%.4f,%s,%.1f\n",
+                p.t, p.y_t, p.true_h, p.h_mean, p.true_vol, p.vol, p.ess, p.loglik,
                 scenario.c_str(), sigma);
     }
     
@@ -70,7 +72,7 @@ static void close_summary_csv() {
 }
 
 // =============================================================================
-// Data Generation
+// Data Generation - Now tracks TRUE latent volatility
 // =============================================================================
 
 // Simple PRNG (cross-platform, better than rand())
@@ -86,40 +88,81 @@ static inline float randn(unsigned int* seed) {
     return sqrtf(-2.0f * logf(u1)) * cosf(2.0f * 3.14159265f * u2);
 }
 
-// Generate calm period returns (normal vol)
-static void generate_calm(std::vector<float>& returns, int n, float base_vol, unsigned int* seed) {
+// SV model parameters for DGP
+struct SVDGPParams {
+    float mu;      // Long-run mean
+    float rho;     // Persistence
+    float sigma;   // Vol of vol
+};
+
+// Generate calm period - true SV process
+static void generate_calm_sv(std::vector<float>& returns, std::vector<float>& true_h,
+                              int n, const SVDGPParams& dgp, float& h_state, unsigned int* seed) {
     for (int i = 0; i < n; i++) {
-        float z = randn(seed);
-        returns.push_back(base_vol * z);
+        // Evolve true latent state: h_t = mu + rho*(h_{t-1} - mu) + sigma*eps
+        float eps = randn(seed);
+        h_state = dgp.mu + dgp.rho * (h_state - dgp.mu) + dgp.sigma * eps;
+        true_h.push_back(h_state);
+        
+        // Generate observation: y_t = exp(h_t/2) * eta
+        float eta = randn(seed);
+        float vol = expf(h_state * 0.5f);
+        returns.push_back(vol * eta);
     }
 }
 
-// Generate a single extreme spike
-static void generate_spike(std::vector<float>& returns, float base_vol, float sigma_multiple, unsigned int* seed) {
-    // Spike magnitude = sigma_multiple * base_vol
-    float spike = sigma_multiple * base_vol;
-    // Random sign
-    if (randf(seed) > 0.5f) spike = -spike;
-    returns.push_back(spike);
+// Generate a spike - set h to elevated level (relative to mu, not cumulative)
+static void generate_spike_sv(std::vector<float>& returns, std::vector<float>& true_h,
+                               float h_jump, float& h_state, float mu, unsigned int* seed) {
+    // Set h to elevated level above mu (not cumulative)
+    // This prevents double spikes from exploding
+    float elevated = mu + h_jump;
+    if (h_state < elevated) {
+        h_state = elevated;  // Only jump up, don't pull down
+    } else {
+        h_state += h_jump * 0.3f;  // Small additional boost if already elevated
+    }
+    true_h.push_back(h_state);
+    
+    // Generate extreme observation
+    float eta = randn(seed);
+    float vol = expf(h_state * 0.5f);
+    returns.push_back(vol * eta);
 }
 
-// Generate recovery period (elevated vol decaying back to normal)
-static void generate_recovery(std::vector<float>& returns, int n, float peak_vol, float base_vol, unsigned int* seed) {
+// Generate recovery - h decays back toward mu
+static void generate_recovery_sv(std::vector<float>& returns, std::vector<float>& true_h,
+                                  int n, const SVDGPParams& dgp, float& h_state, unsigned int* seed) {
     for (int i = 0; i < n; i++) {
-        float t = (float)i / n;
-        float vol = peak_vol * (1.0f - t) + base_vol * t;  // Linear decay
-        float z = randn(seed);
-        returns.push_back(vol * z);
+        // Higher persistence during recovery (slower decay)
+        float eps = randn(seed);
+        h_state = dgp.mu + dgp.rho * (h_state - dgp.mu) + dgp.sigma * eps;
+        true_h.push_back(h_state);
+        
+        float eta = randn(seed);
+        float vol = expf(h_state * 0.5f);
+        returns.push_back(vol * eta);
     }
 }
 
-// Generate sustained chaos (multiple large moves)
-static void generate_chaos(std::vector<float>& returns, int n, float base_vol, 
-                           float min_sigma, float max_sigma, unsigned int* seed) {
+// Generate chaos - h jumps randomly each tick
+static void generate_chaos_sv(std::vector<float>& returns, std::vector<float>& true_h,
+                               int n, const SVDGPParams& dgp, float min_h_jump, float max_h_jump,
+                               float& h_state, unsigned int* seed) {
     for (int i = 0; i < n; i++) {
-        float sigma = min_sigma + (max_sigma - min_sigma) * randf(seed);
-        float z = randn(seed);
-        returns.push_back(sigma * base_vol * z);
+        // Random jump in h
+        float jump_mag = min_h_jump + (max_h_jump - min_h_jump) * randf(seed);
+        float jump_sign = (randf(seed) > 0.5f) ? 1.0f : -1.0f;
+        h_state += jump_sign * jump_mag * 0.3f;  // Damped jumps
+        
+        // Also do normal SV evolution
+        float eps = randn(seed);
+        h_state = dgp.mu + 0.5f * (h_state - dgp.mu) + dgp.sigma * 2.0f * eps;
+        true_h.push_back(h_state);
+        
+        float eta = randn(seed);
+        float vol = expf(h_state * 0.5f);
+        returns.push_back(vol * eta);
     }
 }
 
@@ -203,9 +246,9 @@ static void print_result(const StressTestResult& r) {
 static StressTestResult run_scenario(
     const std::string& name,
     const std::vector<float>& returns,
+    const std::vector<float>& true_h,  // TRUE latent state from DGP
     float spike_sigma,
     int spike_timestep,
-    float base_vol,
     const SVPFParams& params,
     int n_particles
 ) {
@@ -290,13 +333,13 @@ static StressTestResult run_scenario(
     state->lik_offset = 0.345f;
     
     // KSD-based Adaptive Stein Steps
-    state->stein_min_steps = 8;
-    state->stein_max_steps = 8;
+    state->stein_min_steps = 16;
+    state->stein_max_steps = 16;
     state->ksd_improvement_threshold = 0.05f;
     
     // Student-t state dynamics (fat tails)
     state->use_student_t_state = 1;
-    state->nu_state = 2.0f;
+    state->nu_state = 3.0f;
     
     // Smoothing (1-tick lag for cleaner output)
     state->use_smoothing = 1;
@@ -346,7 +389,9 @@ static StressTestResult run_scenario(
         TimeseriesPoint pt;
         pt.t = t;
         pt.y_t = y_t;
+        pt.true_h = true_h[t];
         pt.h_mean = h_mean;
+        pt.true_vol = expf(true_h[t] * 0.5f);
         pt.vol = vol;
         pt.ess = ess;
         pt.loglik = loglik;
@@ -390,122 +435,156 @@ static StressTestResult run_scenario(
 }
 
 // =============================================================================
-// Scenario Generators
+// Scenario Generators (using proper SV DGP with true h tracking)
 // =============================================================================
+
+// Convert sigma (extreme event magnitude) to h_jump (log-vol space)
+// We want:
+//   10σ → h_jump ≈ 1.0 (vol goes from 10% to ~16%)
+//   50σ → h_jump ≈ 2.5 (vol goes from 10% to ~37%)
+// This keeps h in reasonable range [-4.5, -1.5] even with double spikes
+static float sigma_to_h_jump(float sigma) {
+    // Conservative linear mapping
+    return sigma * 0.05f;
+}
 
 // Scenario 1: Single spike of varying magnitude
 static StressTestResult test_single_spike(float sigma, const SVPFParams& params, int n_particles) {
     std::vector<float> returns;
+    std::vector<float> true_h;
     unsigned int seed = 42;
-    float base_vol = 0.01f;  // 1% base volatility
+    
+    // DGP parameters matching filter params
+    SVDGPParams dgp = {params.mu, params.rho, params.sigma_z};
+    float h_state = params.mu;  // Start at long-run mean
     
     // 100 ticks calm
-    generate_calm(returns, 100, base_vol, &seed);
+    generate_calm_sv(returns, true_h, 100, dgp, h_state, &seed);
     int spike_t = returns.size();
     
-    // Single spike
-    generate_spike(returns, base_vol, sigma, &seed);
+    // Single spike - jump h up
+    float h_jump = sigma_to_h_jump(sigma);
+    generate_spike_sv(returns, true_h, h_jump, h_state, dgp.mu, &seed);
     
     // 200 ticks recovery
-    float peak_vol = sigma * base_vol * 0.5f;  // Spike induces elevated vol
-    generate_recovery(returns, 200, peak_vol, base_vol, &seed);
+    generate_recovery_sv(returns, true_h, 200, dgp, h_state, &seed);
     
-    return run_scenario("Single Spike", returns, sigma, spike_t, base_vol, params, n_particles);
+    return run_scenario("Single Spike", returns, true_h, sigma, spike_t, params, n_particles);
 }
 
 // Scenario 2: Double spike (test if filter recovers then handles second spike)
 static StressTestResult test_double_spike(float sigma, const SVPFParams& params, int n_particles) {
     std::vector<float> returns;
+    std::vector<float> true_h;
     unsigned int seed = 43;
-    float base_vol = 0.01f;
+    
+    SVDGPParams dgp = {params.mu, params.rho, params.sigma_z};
+    float h_state = params.mu;
     
     // Calm
-    generate_calm(returns, 50, base_vol, &seed);
+    generate_calm_sv(returns, true_h, 50, dgp, h_state, &seed);
+    int spike_t = returns.size();
     
     // First spike
-    int spike_t = returns.size();
-    generate_spike(returns, base_vol, sigma, &seed);
+    float h_jump = sigma_to_h_jump(sigma);
+    generate_spike_sv(returns, true_h, h_jump, h_state, dgp.mu, &seed);
     
-    // Partial recovery
-    generate_recovery(returns, 50, sigma * base_vol * 0.3f, base_vol * 2.0f, &seed);
+    // Partial recovery (50 ticks)
+    generate_recovery_sv(returns, true_h, 50, dgp, h_state, &seed);
     
-    // Second spike (same magnitude)
-    generate_spike(returns, base_vol, sigma, &seed);
+    // Second spike
+    generate_spike_sv(returns, true_h, h_jump, h_state, dgp.mu, &seed);
     
     // Full recovery
-    generate_recovery(returns, 150, sigma * base_vol * 0.3f, base_vol, &seed);
+    generate_recovery_sv(returns, true_h, 150, dgp, h_state, &seed);
     
-    return run_scenario("Double Spike", returns, sigma, spike_t, base_vol, params, n_particles);
+    return run_scenario("Double Spike", returns, true_h, sigma, spike_t, params, n_particles);
 }
 
 // Scenario 3: Flash crash pattern (rapid sequence: down, up, down)
 static StressTestResult test_flash_crash(float base_sigma, const SVPFParams& params, int n_particles) {
     std::vector<float> returns;
+    std::vector<float> true_h;
     unsigned int seed = 44;
-    float base_vol = 0.01f;
+    
+    SVDGPParams dgp = {params.mu, params.rho, params.sigma_z};
+    float h_state = params.mu;
     
     // Calm
-    generate_calm(returns, 50, base_vol, &seed);
+    generate_calm_sv(returns, true_h, 50, dgp, h_state, &seed);
     int spike_t = returns.size();
     
-    // Flash crash sequence (3 ticks)
-    returns.push_back(-base_sigma * base_vol);        // Down
-    returns.push_back(base_sigma * 0.8f * base_vol);  // Bounce up
-    returns.push_back(-base_sigma * 0.3f * base_vol); // Down again
+    // Flash crash: 3 rapid h jumps
+    float h_jump = sigma_to_h_jump(base_sigma);
     
-    // Chaotic aftermath
-    generate_chaos(returns, 20, base_vol, 2.0f, 5.0f, &seed);
+    // Jump 1: big spike up
+    generate_spike_sv(returns, true_h, h_jump, h_state, dgp.mu, &seed);
+    // Jump 2: stays elevated
+    generate_spike_sv(returns, true_h, h_jump * 0.3f, h_state, dgp.mu, &seed);
+    // Jump 3: another spike
+    generate_spike_sv(returns, true_h, h_jump * 0.2f, h_state, dgp.mu, &seed);
+    
+    // Chaotic aftermath (20 ticks)
+    generate_chaos_sv(returns, true_h, 20, dgp, 0.5f, 2.0f, h_state, &seed);
     
     // Recovery
-    generate_recovery(returns, 150, base_vol * 5.0f, base_vol, &seed);
+    generate_recovery_sv(returns, true_h, 150, dgp, h_state, &seed);
     
-    return run_scenario("Flash Crash", returns, base_sigma, spike_t, base_vol, params, n_particles);
+    return run_scenario("Flash Crash", returns, true_h, base_sigma, spike_t, params, n_particles);
 }
 
 // Scenario 4: Sustained chaos (crypto meltdown)
 static StressTestResult test_sustained_chaos(float avg_sigma, const SVPFParams& params, int n_particles) {
     std::vector<float> returns;
+    std::vector<float> true_h;
     unsigned int seed = 45;
-    float base_vol = 0.01f;
+    
+    SVDGPParams dgp = {params.mu, params.rho, params.sigma_z};
+    float h_state = params.mu;
     
     // Calm
-    generate_calm(returns, 50, base_vol, &seed);
+    generate_calm_sv(returns, true_h, 50, dgp, h_state, &seed);
     int spike_t = returns.size();
     
     // 50 ticks of chaos
-    generate_chaos(returns, 50, base_vol, avg_sigma * 0.5f, avg_sigma * 1.5f, &seed);
+    float h_jump_min = sigma_to_h_jump(avg_sigma * 0.5f);
+    float h_jump_max = sigma_to_h_jump(avg_sigma * 1.5f);
+    generate_chaos_sv(returns, true_h, 50, dgp, h_jump_min, h_jump_max, h_state, &seed);
     
     // Recovery
-    generate_recovery(returns, 200, base_vol * avg_sigma * 0.3f, base_vol, &seed);
+    generate_recovery_sv(returns, true_h, 200, dgp, h_state, &seed);
     
-    return run_scenario("Sustained Chaos", returns, avg_sigma, spike_t, base_vol, params, n_particles);
+    return run_scenario("Sustained Chaos", returns, true_h, avg_sigma, spike_t, params, n_particles);
 }
 
 // Scenario 5: Gradual build to extreme (like a squeeze)
 static StressTestResult test_gradual_extreme(float peak_sigma, const SVPFParams& params, int n_particles) {
     std::vector<float> returns;
+    std::vector<float> true_h;
     unsigned int seed = 46;
-    float base_vol = 0.01f;
+    
+    SVDGPParams dgp = {params.mu, params.rho, params.sigma_z};
+    float h_state = params.mu;
     
     // Calm
-    generate_calm(returns, 50, base_vol, &seed);
+    generate_calm_sv(returns, true_h, 50, dgp, h_state, &seed);
     int spike_t = returns.size();
     
-    // Gradual increase over 20 ticks to peak
+    // Gradual increase over 20 ticks
+    float h_jump_final = sigma_to_h_jump(peak_sigma);
     for (int i = 0; i < 20; i++) {
-        float t = (float)i / 20.0f;
-        float sigma = 2.0f + t * (peak_sigma - 2.0f);
-        float z = randn(&seed);
-        returns.push_back(sigma * base_vol * z);
+        float frac = (float)i / 20.0f;
+        float small_jump = h_jump_final * frac * 0.1f;  // Gradual increase
+        generate_spike_sv(returns, true_h, small_jump, h_state, dgp.mu, &seed);
     }
     
     // Peak spike
-    generate_spike(returns, base_vol, peak_sigma, &seed);
+    generate_spike_sv(returns, true_h, h_jump_final * 0.3f, h_state, dgp.mu, &seed);
     
     // Recovery
-    generate_recovery(returns, 200, base_vol * peak_sigma * 0.2f, base_vol, &seed);
+    generate_recovery_sv(returns, true_h, 200, dgp, h_state, &seed);
     
-    return run_scenario("Gradual Build", returns, peak_sigma, spike_t, base_vol, params, n_particles);
+    return run_scenario("Gradual Build", returns, true_h, peak_sigma, spike_t, params, n_particles);
 }
 
 // =============================================================================
@@ -534,7 +613,7 @@ int main(int argc, char** argv) {
     printf(" Looking for: NaN/Inf, particle collapse (ESS<10), recovery failure\n");
     
     SVPFParams params = {0.98f, 0.15f, -4.5f, 0.0f};  // Standard SV params
-    int n_particles = 512;
+    int n_particles = 1024;
     bool write_csv_files = true;
     
     if (argc > 1) n_particles = atoi(argv[1]);

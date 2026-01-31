@@ -63,11 +63,11 @@ plt.show()
 # =====================================================================
 
 def plot_scenario(filename, title=None):
-    """Plot a single stress test scenario timeseries"""
+    """Plot a single stress test scenario timeseries with TRUE vs ESTIMATED comparison"""
     filepath = os.path.join(DATA_DIR, filename) if not os.path.isabs(filename) else filename
     df = pd.read_csv(filepath)
     
-    fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
+    fig, axes = plt.subplots(4, 1, figsize=(14, 12), sharex=True)
     
     if title is None:
         title = f"{df['scenario'].iloc[0]} - {df['sigma'].iloc[0]:.0f}σ"
@@ -85,22 +85,30 @@ def plot_scenario(filename, title=None):
                        color='red', s=50, zorder=5, label='Extreme (>5%)')
         axes[0].legend()
     
-    # Panel 2: Estimated volatility
-    axes[1].plot(df['t'], df['vol'] * 100, 'g-', linewidth=1.5, label='Estimated Vol (%)')
-    axes[1].axhline(1.0, color='gray', linestyle='--', alpha=0.5, label='Base Vol (1%)')
-    axes[1].set_ylabel('Volatility (%)')
+    # Panel 2: TRUE vs ESTIMATED log-volatility (h)
+    axes[1].plot(df['t'], df['true_h'], 'k-', linewidth=2, label='True h', alpha=0.8)
+    axes[1].plot(df['t'], df['h_mean'], 'r--', linewidth=1.5, label='Estimated h', alpha=0.8)
+    axes[1].axhline(-4.5, color='gray', linestyle=':', alpha=0.5, label='μ = -4.5')
+    axes[1].set_ylabel('Log-volatility (h)')
     axes[1].legend(loc='upper right')
-    axes[1].set_ylim(bottom=0)
+    axes[1].fill_between(df['t'], df['true_h'], df['h_mean'], alpha=0.2, color='red')
     
-    # Panel 3: ESS
-    axes[2].fill_between(df['t'], df['ess'], alpha=0.3, color='purple')
-    axes[2].plot(df['t'], df['ess'], 'purple', linewidth=1)
-    axes[2].axhline(10, color='red', linestyle='--', alpha=0.7, label='Collapse threshold (ESS=10)')
-    axes[2].axhline(512, color='green', linestyle='--', alpha=0.7, label='Max (N=512)')
-    axes[2].set_ylabel('ESS')
-    axes[2].set_xlabel('Timestep')
+    # Panel 3: TRUE vs ESTIMATED volatility (%)
+    axes[2].plot(df['t'], df['true_vol'] * 100, 'k-', linewidth=2, label='True Vol (%)', alpha=0.8)
+    axes[2].plot(df['t'], df['vol'] * 100, 'g--', linewidth=1.5, label='Estimated Vol (%)', alpha=0.8)
+    axes[2].set_ylabel('Volatility (%)')
     axes[2].legend(loc='upper right')
-    axes[2].set_ylim(0, 550)
+    axes[2].set_ylim(bottom=0)
+    
+    # Panel 4: ESS
+    axes[3].fill_between(df['t'], df['ess'], alpha=0.3, color='purple')
+    axes[3].plot(df['t'], df['ess'], 'purple', linewidth=1)
+    axes[3].axhline(10, color='red', linestyle='--', alpha=0.7, label='Collapse threshold (ESS=10)')
+    axes[3].axhline(512, color='green', linestyle='--', alpha=0.7, label='Max (N=512)')
+    axes[3].set_ylabel('ESS')
+    axes[3].set_xlabel('Timestep')
+    axes[3].legend(loc='upper right')
+    axes[3].set_ylim(0, 550)
     
     plt.tight_layout()
     return fig
@@ -118,8 +126,8 @@ except FileNotFoundError:
 # =====================================================================
 
 def plot_sigma_comparison(scenario_prefix, sigmas=[10, 20, 30, 40, 50]):
-    """Compare filter behavior across different sigma levels"""
-    fig, axes = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
+    """Compare filter tracking accuracy across different sigma levels"""
+    fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
     
     colors = plt.cm.plasma(np.linspace(0.2, 0.9, len(sigmas)))
     
@@ -128,23 +136,37 @@ def plot_sigma_comparison(scenario_prefix, sigmas=[10, 20, 30, 40, 50]):
         filepath = os.path.join(DATA_DIR, filename)
         try:
             df = pd.read_csv(filepath)
+            # True vol (solid) vs Estimated vol (dashed)
+            axes[0].plot(df['t'], df['true_vol'] * 100, color=colors[i], 
+                        linewidth=1.5, label=f'{sigma:.0f}σ true', alpha=0.9)
             axes[0].plot(df['t'], df['vol'] * 100, color=colors[i], 
+                        linewidth=1.5, linestyle='--', alpha=0.6)
+            
+            # Tracking error
+            tracking_error = (df['h_mean'] - df['true_h']).abs()
+            axes[1].plot(df['t'], tracking_error, color=colors[i], 
                         linewidth=1.5, label=f'{sigma:.0f}σ', alpha=0.8)
-            axes[1].plot(df['t'], df['ess'], color=colors[i], 
+            
+            # ESS
+            axes[2].plot(df['t'], df['ess'], color=colors[i], 
                         linewidth=1.5, label=f'{sigma:.0f}σ', alpha=0.8)
         except FileNotFoundError:
             print(f"Not found: {filepath}")
     
     axes[0].set_ylabel('Volatility (%)')
-    axes[0].set_title(f'{scenario_prefix.replace("_", " ")}: Vol Tracking by Spike Magnitude')
-    axes[0].legend(loc='upper right')
+    axes[0].set_title(f'{scenario_prefix.replace("_", " ")}: True (solid) vs Estimated (dashed)')
+    axes[0].legend(loc='upper right', ncol=2)
     axes[0].set_ylim(bottom=0)
     
-    axes[1].set_ylabel('ESS')
-    axes[1].set_xlabel('Timestep')
-    axes[1].axhline(10, color='red', linestyle='--', alpha=0.5)
-    axes[1].legend(loc='lower right')
-    axes[1].set_ylim(0, 550)
+    axes[1].set_ylabel('|h_est - h_true|')
+    axes[1].set_title('Tracking Error')
+    axes[1].legend(loc='upper right')
+    
+    axes[2].set_ylabel('ESS')
+    axes[2].set_xlabel('Timestep')
+    axes[2].axhline(10, color='red', linestyle='--', alpha=0.5)
+    axes[2].legend(loc='lower right')
+    axes[2].set_ylim(0, 550)
     
     plt.tight_layout()
     return fig
@@ -203,6 +225,61 @@ for scenario in summary['scenario'].unique():
         print(f"  {scenario}: {breaking_sigma:.0f}σ")
     else:
         print(f"  {scenario}: > 50σ (robust)")
+
+# =====================================================================
+# 4b. Tracking Accuracy (RMSE of h_est vs h_true)
+# =====================================================================
+
+print("\n" + "-"*60)
+print("TRACKING ACCURACY (RMSE of h_estimated vs h_true):")
+print("-"*60)
+
+rmse_data = []
+for scenario in ['Single_Spike', 'Double_Spike', 'Flash_Crash', 'Gradual_Build']:
+    for sigma in [10, 20, 30, 40, 50]:
+        filename = f'svpf_stress_{scenario}_{sigma:.0f}sigma.csv'
+        filepath = os.path.join(DATA_DIR, filename)
+        try:
+            df = pd.read_csv(filepath)
+            rmse = np.sqrt(((df['h_mean'] - df['true_h'])**2).mean())
+            mae = (df['h_mean'] - df['true_h']).abs().mean()
+            rmse_data.append({
+                'scenario': scenario,
+                'sigma': sigma,
+                'RMSE': rmse,
+                'MAE': mae
+            })
+        except FileNotFoundError:
+            pass
+
+if rmse_data:
+    rmse_df = pd.DataFrame(rmse_data)
+    pivot = rmse_df.pivot_table(values='RMSE', index='scenario', columns='sigma')
+    print("\nRMSE by Scenario and Sigma:")
+    print(pivot.round(3).to_string())
+    
+    # Plot RMSE heatmap
+    fig, ax = plt.subplots(figsize=(10, 5))
+    im = ax.imshow(pivot.values, cmap='YlOrRd', aspect='auto')
+    ax.set_xticks(range(len(pivot.columns)))
+    ax.set_xticklabels([f'{s:.0f}σ' for s in pivot.columns])
+    ax.set_yticks(range(len(pivot.index)))
+    ax.set_yticklabels(pivot.index)
+    ax.set_title('Tracking Error (RMSE of h_est vs h_true)')
+    plt.colorbar(im, ax=ax, label='RMSE')
+    
+    # Add text annotations
+    for i in range(len(pivot.index)):
+        for j in range(len(pivot.columns)):
+            val = pivot.values[i, j]
+            ax.text(j, i, f'{val:.2f}', ha='center', va='center', 
+                   color='white' if val > pivot.values.mean() else 'black')
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR, 'stress_rmse_heatmap.png'), dpi=150)
+    plt.show()
+else:
+    print("No CSV files found - run test_svpf_extreme.exe first")
 
 # =====================================================================
 # 5. Plot All Scenarios at 20σ
