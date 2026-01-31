@@ -687,8 +687,13 @@ static float svpf_get_smoothed_output(SVPFState* state, float h_mean_raw) {
 // 5. Output computation
 // =============================================================================
 
-void svpf_step_graph(SVPFState* state, float y_t, float y_prev, const SVPFParams* params,
-                     float* h_loglik_out, float* h_vol_out, float* h_mean_out) {
+// =============================================================================
+// ASYNC STEP: Launch all GPU work, return immediately
+// =============================================================================
+// Does NOT sync - call svpf_sync_outputs() later to get results.
+// For batch processing: call this on all filters, then sync all.
+
+void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams* params) {
     SVPFOptimizedState* opt = get_opt(state);
     int n = state->n_particles;
     cudaStream_t cs = state->stream;
@@ -1144,6 +1149,24 @@ void svpf_step_graph(SVPFState* state, float y_t, float y_prev, const SVPFParams
     // Single D2H transfer (5 floats packed, 32 bytes)
     cudaMemcpyAsync(opt->h_output_pinned, opt->d_output_pack, 
                     5 * sizeof(float), cudaMemcpyDeviceToHost, cs);
+    
+    // Store params needed for post-sync processing
+    opt->pending_y_t = y_t;
+    opt->pending_params = (const void*)params;
+}
+
+// =============================================================================
+// SYNC AND FINALIZE: Wait for GPU, read outputs, update state
+// =============================================================================
+// Call this after svpf_step_async to get results.
+// For batch processing: call svpf_step_async on all filters first,
+// then call svpf_sync_outputs on all filters.
+
+void svpf_sync_outputs(SVPFState* state, 
+                       float* h_loglik_out, float* h_vol_out, float* h_mean_out) {
+    SVPFOptimizedState* opt = get_opt(state);
+    cudaStream_t cs = state->stream;
+    
     cudaStreamSynchronize(cs);
     
     // Unpack results: [loglik, vol, h_mean, bandwidth, ksd]
@@ -1156,26 +1179,35 @@ void svpf_step_graph(SVPFState* state, float y_t, float y_prev, const SVPFParams
     // =========================================================================
     // BACKWARD SMOOTHING (Optional)
     // =========================================================================
-    // Estimate variance from bandwidth (heuristic: var ≈ bw²)
     float h_var_est = bandwidth_local * bandwidth_local;
-    svpf_smooth_backward(state, h_mean_local, h_var_est, y_t, params);
+    const SVPFParams* params = (const SVPFParams*)opt->pending_params;
+    svpf_smooth_backward(state, h_mean_local, h_var_est, opt->pending_y_t, params);
     
-    // Get smoothed output (if smoothing enabled and output_lag > 0)
     float h_mean_output = svpf_get_smoothed_output(state, h_mean_local);
     
     // Return outputs
     if (h_loglik_out) *h_loglik_out = results[0];
     if (h_vol_out) *h_vol_out = vol_local;
-    if (h_mean_out) *h_mean_out = h_mean_output;  // Smoothed if enabled
+    if (h_mean_out) *h_mean_out = h_mean_output;
     
     state->vol_prev = vol_local;
-    state->ksd_prev = ksd_local;  // For next timestep's step budget
+    state->ksd_prev = ksd_local;
     
     if (state->use_adaptive_mu && state->timestep > 10) {
         svpf_adaptive_mu_update(state, h_mean_local, bandwidth_local);
     }
     
     state->timestep++;
+}
+
+// =============================================================================
+// SYNCHRONOUS STEP (Original API - calls async + sync)
+// =============================================================================
+
+void svpf_step_graph(SVPFState* state, float y_t, float y_prev, const SVPFParams* params,
+                     float* h_loglik_out, float* h_vol_out, float* h_mean_out) {
+    svpf_step_async(state, y_t, y_prev, params);
+    svpf_sync_outputs(state, h_loglik_out, h_vol_out, h_mean_out);
 }
 
 void svpf_step_adaptive(SVPFState* state, float y_t, float y_prev, const SVPFParams* params,

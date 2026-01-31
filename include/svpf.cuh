@@ -235,6 +235,11 @@ typedef struct {
     // Single 32-byte transfer for all outputs (5 floats + padding)
     float* d_output_pack;      // Device: [loglik, vol, h_mean, bandwidth, ksd, pad, pad, pad]
     float* h_output_pinned;    // Pinned host (same layout)
+    
+    // === Async Processing State ===
+    // Stored between svpf_step_async() and svpf_sync_outputs()
+    float pending_y_t;
+    const void* pending_params;  // Actually SVPFParams*, but void* avoids forward decl
 } SVPFOptimizedState;
 
 /**
@@ -822,6 +827,52 @@ void svpf_step_graph(
     float y_t,
     float y_prev,
     const SVPFParams* params,
+    float* h_loglik_out,
+    float* h_vol_out,
+    float* h_mean_out
+);
+
+// =============================================================================
+// MULTI-STREAM ASYNC API (for parallel filter execution)
+// =============================================================================
+// 
+// Usage for running N filters in parallel:
+// 
+//   // 1. Launch all filters (non-blocking)
+//   for (int i = 0; i < n_filters; i++) {
+//       svpf_step_async(filters[i], y_t[i], y_prev[i], &params[i]);
+//   }
+//   
+//   // 2. Sync all and read outputs
+//   for (int i = 0; i < n_filters; i++) {
+//       svpf_sync_outputs(filters[i], &loglik[i], &vol[i], &h_mean[i]);
+//   }
+// 
+// Each filter must have its own CUDA stream (pass to svpf_create).
+// GPU work overlaps across filters during step 1.
+// =============================================================================
+
+/**
+ * @brief Launch GPU work asynchronously (non-blocking)
+ * 
+ * Queues all kernels and D2H transfer on filter's stream.
+ * Returns immediately - call svpf_sync_outputs() to get results.
+ */
+void svpf_step_async(
+    SVPFState* state,
+    float y_t,
+    float y_prev,
+    const SVPFParams* params
+);
+
+/**
+ * @brief Sync stream and read outputs
+ * 
+ * Waits for GPU work to complete, reads results, updates state.
+ * Must be called after svpf_step_async().
+ */
+void svpf_sync_outputs(
+    SVPFState* state,
     float* h_loglik_out,
     float* h_vol_out,
     float* h_mean_out
