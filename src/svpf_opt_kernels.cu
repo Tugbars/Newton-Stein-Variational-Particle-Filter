@@ -1981,6 +1981,7 @@ __device__ __forceinline__ void warp_reduce_5(float* v1, float* v2, float* v3, f
 
 // -----------------------------------------------------------------------------
 // Parallel Standard Stein Operator (No Newton, No KSD)
+// FIXED: Fused accumulation to match sequential floating-point behavior
 // -----------------------------------------------------------------------------
 __global__ void svpf_stein_operator_parallel_kernel(
     const float* __restrict__ h,
@@ -2003,8 +2004,9 @@ __global__ void svpf_stein_operator_parallel_kernel(
     float sign_mult = (stein_sign_mode == 1) ? 1.0f : -1.0f;
     float inv_n = 1.0f / (float)n;
 
-    float k_sum = 0.0f;
-    float gk_sum = 0.0f;
+    // FUSED: Single accumulator to prevent catastrophic cancellation
+    // Sequential combines (grad_term + repulsive_term) per j immediately
+    float combined_sum = 0.0f;
 
     for (int j = tid; j < n; j += blockDim.x) {
         float h_j = h[j];
@@ -2016,28 +2018,44 @@ __global__ void svpf_stein_operator_parallel_kernel(
         float K = 1.0f / base;
         float K_sq = K * K;
 
-        k_sum += K * grad_j;
-        gk_sum += sign_mult * 2.0f * diff * inv_bw_sq * K_sq;
+        float grad_term = K * grad_j;
+        float repulsive_term = sign_mult * 2.0f * diff * inv_bw_sq * K_sq;
+        
+        // Combine BEFORE accumulating (mimics sequential)
+        combined_sum += (grad_term + repulsive_term);
     }
 
-    warp_reduce_2(&k_sum, &gk_sum);
-
-    __shared__ float s_k[8], s_gk[8];
-    if (lane == 0) { s_k[wid] = k_sum; s_gk[wid] = gk_sum; }
+    // Sync before warp reduction to handle non-multiple of blockDim.x
     __syncthreads();
 
-    if (tid < 8) { k_sum = s_k[tid]; gk_sum = s_gk[tid]; } 
-    else { k_sum = gk_sum = 0.0f; }
+    // Warp reduction for single value
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        combined_sum += __shfl_down_sync(0xffffffff, combined_sum, offset);
+    }
 
-    if (wid == 0) warp_reduce_2(&k_sum, &gk_sum);
+    __shared__ float s_combined[8];
+    if (lane == 0) { s_combined[wid] = combined_sum; }
+    __syncthreads();
+
+    if (tid < 8) { combined_sum = s_combined[tid]; } 
+    else { combined_sum = 0.0f; }
+
+    if (wid == 0) {
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            combined_sum += __shfl_down_sync(0xffffffff, combined_sum, offset);
+        }
+    }
 
     if (tid == 0) {
-        phi_out[i] = (k_sum + gk_sum) * inv_n;
+        phi_out[i] = combined_sum * inv_n;
     }
 }
 
 // -----------------------------------------------------------------------------
 // Parallel Standard Stein Operator + KSD (No Newton)
+// FIXED: Fused phi accumulation to match sequential floating-point behavior
 // -----------------------------------------------------------------------------
 __global__ void svpf_stein_operator_parallel_ksd_kernel(
     const float* __restrict__ h,
@@ -2062,8 +2080,8 @@ __global__ void svpf_stein_operator_parallel_ksd_kernel(
     float sign_mult = (stein_sign_mode == 1) ? 1.0f : -1.0f;
     float inv_n = 1.0f / (float)n;
 
-    float k_sum = 0.0f;
-    float gk_sum = 0.0f;
+    // FUSED: Single accumulator for phi terms
+    float combined_sum = 0.0f;
     float ksd_sum = 0.0f;
 
     for (int j = tid; j < n; j += blockDim.x) {
@@ -2077,35 +2095,42 @@ __global__ void svpf_stein_operator_parallel_ksd_kernel(
         float K_sq = K * K;
         float K_cube = K_sq * K;
 
-        k_sum += K * grad_j;
-        gk_sum += sign_mult * 2.0f * diff * inv_bw_sq * K_sq;
+        float grad_term = K * grad_j;
+        float repulsive_term = sign_mult * 2.0f * diff * inv_bw_sq * K_sq;
+        
+        // Fuse phi terms immediately
+        combined_sum += (grad_term + repulsive_term);
 
-        // KSD
+        // KSD (separate - not part of phi)
         float grad_k_i = -2.0f * diff * inv_bw_sq * K_sq;
         float grad_k_j = -grad_k_i;
         float grad2_k = -2.0f * inv_bw_sq * K_sq + 8.0f * dist_sq * inv_bw_sq * K_cube;
         ksd_sum += K * grad_i * grad_j + grad_i * grad_k_j + grad_j * grad_k_i + grad2_k;
     }
 
-    warp_reduce_3(&k_sum, &gk_sum, &ksd_sum);
-
-    __shared__ float s_k[8], s_gk[8], s_ksd[8];
-    if (lane == 0) { s_k[wid] = k_sum; s_gk[wid] = gk_sum; s_ksd[wid] = ksd_sum; }
     __syncthreads();
 
-    if (tid < 8) { k_sum = s_k[tid]; gk_sum = s_gk[tid]; ksd_sum = s_ksd[tid]; }
-    else { k_sum = gk_sum = ksd_sum = 0.0f; }
+    // Reduce combined_sum and ksd_sum
+    warp_reduce_2(&combined_sum, &ksd_sum);
 
-    if (wid == 0) warp_reduce_3(&k_sum, &gk_sum, &ksd_sum);
+    __shared__ float s_combined[8], s_ksd[8];
+    if (lane == 0) { s_combined[wid] = combined_sum; s_ksd[wid] = ksd_sum; }
+    __syncthreads();
+
+    if (tid < 8) { combined_sum = s_combined[tid]; ksd_sum = s_ksd[tid]; }
+    else { combined_sum = ksd_sum = 0.0f; }
+
+    if (wid == 0) warp_reduce_2(&combined_sum, &ksd_sum);
 
     if (tid == 0) {
-        phi_out[i] = (k_sum + gk_sum) * inv_n;
+        phi_out[i] = combined_sum * inv_n;
         ksd_partial[i] = ksd_sum;
     }
 }
 
 // -----------------------------------------------------------------------------
-// Parallel Full Newton Stein Operator (No KSD) - HESSIAN INVERSION FIX
+// Parallel Full Newton Stein Operator (No KSD)
+// FIXED: Fused phi accumulation to prevent catastrophic cancellation
 // -----------------------------------------------------------------------------
 __global__ void svpf_stein_operator_parallel_full_newton_kernel(
     const float* __restrict__ h,
@@ -2129,17 +2154,14 @@ __global__ void svpf_stein_operator_parallel_full_newton_kernel(
     float sign_mult = (stein_sign_mode == 1) ? 1.0f : -1.0f;
     float inv_n = 1.0f / (float)n;
 
-    float k_grad_sum = 0.0f;
-    float gk_sum = 0.0f;
+    // FUSED: Single accumulator for phi terms
+    float combined_sum = 0.0f;
     float H_weighted = 0.0f;
     float K_sum_norm = 0.0f;
 
     for (int j = tid; j < n; j += blockDim.x) {
         float h_j = h[j];
         float grad_j = grad[j];
-        
-        // Use raw Hessian (curvature H), invert AFTER averaging
-        // Sequential: H_weighted += sh_hess[j] * K, then inv_H = 1/H_weighted
         float hess_j = local_hessian[j];
 
         float diff = h_i - h_j;
@@ -2148,43 +2170,50 @@ __global__ void svpf_stein_operator_parallel_full_newton_kernel(
         float K = 1.0f / base;
         float K_sq = K * K;
 
-        // Newton weighting: accumulate raw H, invert at end
+        // Newton weighting (keep separate - needed for step calculation)
         float Nk = 2.0f * inv_bw_sq * K_sq * fabsf(3.0f * dist_sq - 1.0f);
         H_weighted += hess_j * K + Nk;
         K_sum_norm += K;
 
-        k_grad_sum += K * grad_j;
-        gk_sum += sign_mult * 2.0f * diff * inv_bw_sq * K_sq;
+        // FUSED phi terms
+        float grad_term = K * grad_j;
+        float repulsive_term = sign_mult * 2.0f * diff * inv_bw_sq * K_sq;
+        combined_sum += (grad_term + repulsive_term);
     }
 
-    warp_reduce_4(&k_grad_sum, &gk_sum, &H_weighted, &K_sum_norm);
+    __syncthreads();
 
-    __shared__ float s_k[8], s_gk[8], s_h[8], s_kn[8];
+    warp_reduce_3(&combined_sum, &H_weighted, &K_sum_norm);
+
+    __shared__ float s_combined[8], s_h[8], s_kn[8];
     if (lane == 0) {
-        s_k[wid] = k_grad_sum; s_gk[wid] = gk_sum; 
-        s_h[wid] = H_weighted; s_kn[wid] = K_sum_norm;
+        s_combined[wid] = combined_sum;
+        s_h[wid] = H_weighted; 
+        s_kn[wid] = K_sum_norm;
     }
     __syncthreads();
 
     if (tid < 8) {
-        k_grad_sum = s_k[tid]; gk_sum = s_gk[tid];
-        H_weighted = s_h[tid]; K_sum_norm = s_kn[tid];
+        combined_sum = s_combined[tid];
+        H_weighted = s_h[tid]; 
+        K_sum_norm = s_kn[tid];
     } else {
-        k_grad_sum = gk_sum = H_weighted = K_sum_norm = 0.0f;
+        combined_sum = H_weighted = K_sum_norm = 0.0f;
     }
 
-    if (wid == 0) warp_reduce_4(&k_grad_sum, &gk_sum, &H_weighted, &K_sum_norm);
+    if (wid == 0) warp_reduce_3(&combined_sum, &H_weighted, &K_sum_norm);
 
     if (tid == 0) {
         float H_val = H_weighted / fmaxf(K_sum_norm, 1e-6f);
         H_val = fminf(fmaxf(H_val, 0.1f), 100.0f);
         float inv_H = 1.0f / H_val;
-        phi_out[i] = (k_grad_sum + gk_sum) * inv_n * inv_H * 0.7f;
+        phi_out[i] = combined_sum * inv_n * inv_H * 0.7f;
     }
 }
 
 // -----------------------------------------------------------------------------
-// Parallel Full Newton Stein Operator + KSD - HESSIAN INVERSION FIX
+// Parallel Full Newton Stein Operator + KSD
+// FIXED: Fused phi accumulation to prevent catastrophic cancellation
 // -----------------------------------------------------------------------------
 __global__ void svpf_stein_operator_parallel_full_newton_ksd_kernel(
     const float* __restrict__ h,
@@ -2210,8 +2239,8 @@ __global__ void svpf_stein_operator_parallel_full_newton_ksd_kernel(
     float sign_mult = (stein_sign_mode == 1) ? 1.0f : -1.0f;
     float inv_n = 1.0f / (float)n;
 
-    float k_grad_sum = 0.0f;
-    float gk_sum = 0.0f;
+    // FUSED: Single accumulator for phi terms
+    float combined_sum = 0.0f;
     float H_weighted = 0.0f;
     float K_sum_norm = 0.0f;
     float ksd_sum = 0.0f;
@@ -2219,8 +2248,6 @@ __global__ void svpf_stein_operator_parallel_full_newton_ksd_kernel(
     for (int j = tid; j < n; j += blockDim.x) {
         float h_j = h[j];
         float grad_j = grad[j];
-        
-        // Use raw Hessian (curvature H), invert AFTER averaging
         float hess_j = local_hessian[j];
 
         float diff = h_i - h_j;
@@ -2229,16 +2256,17 @@ __global__ void svpf_stein_operator_parallel_full_newton_ksd_kernel(
         float K = 1.0f / base;
         float K_sq = K * K;
 
-        // Newton weighting: accumulate raw H, invert at end
+        // Newton weighting (keep separate)
         float Nk = 2.0f * inv_bw_sq * K_sq * fabsf(3.0f * dist_sq - 1.0f);
         H_weighted += hess_j * K + Nk;
         K_sum_norm += K;
 
-        // Stein force
-        k_grad_sum += K * grad_j;
-        gk_sum += sign_mult * 2.0f * diff * inv_bw_sq * K_sq;
+        // FUSED phi terms
+        float grad_term = K * grad_j;
+        float repulsive_term = sign_mult * 2.0f * diff * inv_bw_sq * K_sq;
+        combined_sum += (grad_term + repulsive_term);
 
-        // KSD
+        // KSD (separate)
         float K_cube = K_sq * K;
         float grad_k_i = -2.0f * diff * inv_bw_sq * K_sq;
         float grad_k_j = -grad_k_i;
@@ -2246,29 +2274,35 @@ __global__ void svpf_stein_operator_parallel_full_newton_ksd_kernel(
         ksd_sum += K * grad_i * grad_j + grad_i * grad_k_j + grad_j * grad_k_i + grad2_k;
     }
 
-    warp_reduce_5(&k_grad_sum, &gk_sum, &H_weighted, &K_sum_norm, &ksd_sum);
+    __syncthreads();
 
-    __shared__ float s_k[8], s_gk[8], s_h[8], s_kn[8], s_ksd[8];
+    warp_reduce_4(&combined_sum, &H_weighted, &K_sum_norm, &ksd_sum);
+
+    __shared__ float s_combined[8], s_h[8], s_kn[8], s_ksd[8];
     if (lane == 0) {
-        s_k[wid] = k_grad_sum; s_gk[wid] = gk_sum; 
-        s_h[wid] = H_weighted; s_kn[wid] = K_sum_norm; s_ksd[wid] = ksd_sum;
+        s_combined[wid] = combined_sum;
+        s_h[wid] = H_weighted; 
+        s_kn[wid] = K_sum_norm; 
+        s_ksd[wid] = ksd_sum;
     }
     __syncthreads();
 
     if (tid < 8) {
-        k_grad_sum = s_k[tid]; gk_sum = s_gk[tid];
-        H_weighted = s_h[tid]; K_sum_norm = s_kn[tid]; ksd_sum = s_ksd[tid];
+        combined_sum = s_combined[tid];
+        H_weighted = s_h[tid]; 
+        K_sum_norm = s_kn[tid]; 
+        ksd_sum = s_ksd[tid];
     } else {
-        k_grad_sum = gk_sum = H_weighted = K_sum_norm = ksd_sum = 0.0f;
+        combined_sum = H_weighted = K_sum_norm = ksd_sum = 0.0f;
     }
 
-    if (wid == 0) warp_reduce_5(&k_grad_sum, &gk_sum, &H_weighted, &K_sum_norm, &ksd_sum);
+    if (wid == 0) warp_reduce_4(&combined_sum, &H_weighted, &K_sum_norm, &ksd_sum);
 
     if (tid == 0) {
         float H_val = H_weighted / fmaxf(K_sum_norm, 1e-6f);
         H_val = fminf(fmaxf(H_val, 0.1f), 100.0f);
         float inv_H = 1.0f / H_val;
-        phi_out[i] = (k_grad_sum + gk_sum) * inv_n * inv_H * 0.7f;
+        phi_out[i] = combined_sum * inv_n * inv_H * 0.7f;
         ksd_partial[i] = ksd_sum;
     }
 }
