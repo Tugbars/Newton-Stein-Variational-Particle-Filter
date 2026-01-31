@@ -467,6 +467,10 @@ static void svpf_optimized_init(SVPFOptimizedState* opt, int n) {
     cudaMalloc(&opt->d_phi_pred, n * sizeof(float));
     cudaMalloc(&opt->d_h_orig, n * sizeof(float));
     
+    // === Consolidated output pack (single D2H transfer) ===
+    cudaMalloc(&opt->d_output_pack, 8 * sizeof(float));  // 32 bytes aligned
+    cudaMallocHost(&opt->h_output_pinned, 8 * sizeof(float));
+    
     cudaStreamCreateWithFlags(&opt->graph_stream, cudaStreamNonBlocking);
     opt->graph_captured = false;
     opt->graph_n = 0;
@@ -507,6 +511,13 @@ static void svpf_optimized_cleanup(SVPFOptimizedState* opt) {
     cudaFree(opt->d_phi_orig);
     cudaFree(opt->d_phi_pred);
     cudaFree(opt->d_h_orig);
+    
+    // === Consolidated output pack ===
+    cudaFree(opt->d_output_pack);
+    if (opt->h_output_pinned) {
+        cudaFreeHost(opt->h_output_pinned);
+        opt->h_output_pinned = nullptr;
+    }
     
     if (opt->h_results_pinned) {
         cudaFreeHost(opt->h_results_pinned);
@@ -1113,23 +1124,23 @@ void svpf_step_graph(SVPFState* state, float y_t, float y_prev, const SVPFParams
     }
     
     // =========================================================================
-    // OUTPUTS
+    // OUTPUTS (consolidated D2H transfer)
     // =========================================================================
     svpf_fused_outputs_kernel<<<1, BLOCK_SIZE, 0, cs>>>(
         state->h, state->log_weights,
-        opt->d_loglik_single, opt->d_vol_single, opt->d_h_mean_prev, 0, n
+        opt->d_bandwidth, opt->d_ksd,  // Input: read existing values
+        opt->d_loglik_single, opt->d_vol_single, opt->d_h_mean_prev,
+        (float*)opt->d_output_pack,    // Output: packed struct
+        0, n
     );
     
-    // Read results (including KSD for next timestep's budget)
-    float results[5];
-    cudaMemcpyAsync(&results[0], opt->d_loglik_single, sizeof(float), cudaMemcpyDeviceToHost, cs);
-    cudaMemcpyAsync(&results[1], opt->d_vol_single, sizeof(float), cudaMemcpyDeviceToHost, cs);
-    cudaMemcpyAsync(&results[2], opt->d_h_mean_prev, sizeof(float), cudaMemcpyDeviceToHost, cs);
-    cudaMemcpyAsync(&results[3], opt->d_bandwidth, sizeof(float), cudaMemcpyDeviceToHost, cs);
-    cudaMemcpyAsync(&results[4], opt->d_ksd, sizeof(float), cudaMemcpyDeviceToHost, cs);
-    
+    // Single D2H transfer (5 floats packed, 32 bytes)
+    cudaMemcpyAsync(opt->h_output_pinned, opt->d_output_pack, 
+                    5 * sizeof(float), cudaMemcpyDeviceToHost, cs);
     cudaStreamSynchronize(cs);
     
+    // Unpack results: [loglik, vol, h_mean, bandwidth, ksd]
+    float* results = opt->h_output_pinned;
     float h_mean_local = results[2];
     float bandwidth_local = results[3];
     float vol_local = results[1];

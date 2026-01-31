@@ -1231,9 +1231,12 @@ __global__ void svpf_fused_stein_transport_full_newton_ksd_kernel(
 __global__ void svpf_fused_outputs_kernel(
     const float* __restrict__ h,
     const float* __restrict__ log_w,
+    const float* __restrict__ d_bandwidth_in,  // Read bandwidth for packing
+    const float* __restrict__ d_ksd_in,        // Read KSD for packing
     float* __restrict__ d_loglik,
     float* __restrict__ d_vol,
     float* __restrict__ d_h_mean,
+    float* __restrict__ d_output_pack,         // Packed output [5 floats]
     int t_out,
     int n
 ) {
@@ -1268,9 +1271,21 @@ __global__ void svpf_fused_outputs_kernel(
     if (threadIdx.x == 0) {
         float inv_n = 1.0f / (float)n;
         float safe_sum = fmaxf(local_sum_exp * inv_n, 1e-10f);
-        d_loglik[t_out] = max_log_w + __logf(safe_sum);
-        d_vol[t_out] = local_sum_vol * inv_n;
-        *d_h_mean = local_sum_h * inv_n;
+        float loglik = max_log_w + __logf(safe_sum);
+        float vol = local_sum_vol * inv_n;
+        float h_mean = local_sum_h * inv_n;
+        
+        // Write to legacy outputs (backward compat)
+        d_loglik[t_out] = loglik;
+        d_vol[t_out] = vol;
+        *d_h_mean = h_mean;
+        
+        // Pack all outputs for single D2H transfer
+        d_output_pack[0] = loglik;
+        d_output_pack[1] = vol;
+        d_output_pack[2] = h_mean;
+        d_output_pack[3] = *d_bandwidth_in;
+        d_output_pack[4] = *d_ksd_in;
     }
 }
 

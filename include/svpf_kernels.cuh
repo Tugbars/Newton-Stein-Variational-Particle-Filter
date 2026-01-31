@@ -385,9 +385,12 @@ __global__ void svpf_fused_stein_transport_full_newton_ksd_kernel(
 __global__ void svpf_fused_outputs_kernel(
     const float* __restrict__ h,
     const float* __restrict__ log_w,
+    const float* __restrict__ d_bandwidth_in,  // Read bandwidth for packing
+    const float* __restrict__ d_ksd_in,        // Read KSD for packing
     float* __restrict__ d_loglik,
     float* __restrict__ d_vol,
     float* __restrict__ d_h_mean,
+    float* __restrict__ d_output_pack,         // Packed output [5 floats]
     int t_out, int n
 );
 

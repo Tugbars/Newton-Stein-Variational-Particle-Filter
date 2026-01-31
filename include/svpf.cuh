@@ -230,6 +230,11 @@ typedef struct {
     float *d_phi_orig; // Stein operator at original h
     float *d_phi_pred; // Stein operator at predicted h̃
     float *d_h_orig;   // Original h before predictor step
+    
+    // === Consolidated D2H Output Pack ===
+    // Single 32-byte transfer for all outputs (5 floats + padding)
+    float* d_output_pack;      // Device: [loglik, vol, h_mean, bandwidth, ksd, pad, pad, pad]
+    float* h_output_pinned;    // Pinned host (same layout)
 } SVPFOptimizedState;
 
 /**
