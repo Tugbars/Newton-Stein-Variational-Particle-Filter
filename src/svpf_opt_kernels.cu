@@ -2075,7 +2075,7 @@ __global__ void svpf_stein_operator_parallel_ksd_kernel(
         // KSD components
         float grad_k_i = -2.0f * diff * inv_bw_sq * K_sq;
         float grad_k_j = -grad_k_i;
-        float grad2_k = -2.0f * inv_bw_sq * K_sq + 8.0f * dist_sq * inv_bw_sq * inv_bw_sq * K_cube;
+        float grad2_k = -2.0f * inv_bw_sq * K_sq + 8.0f * dist_sq * inv_bw_sq * K_cube;
         float u_p = K * grad_i * grad_j + grad_i * grad_k_j + grad_j * grad_k_i + grad2_k;
         my_ksd += u_p;
     }
@@ -2340,7 +2340,7 @@ __global__ void svpf_stein_operator_parallel_full_newton_ksd_kernel(
         // KSD components
         float grad_k_i = -2.0f * diff * inv_bw_sq * K_sq;
         float grad_k_j = -grad_k_i;
-        float grad2_k = -2.0f * inv_bw_sq * K_sq + 8.0f * dist_sq * inv_bw_sq * inv_bw_sq * K_cube;
+        float grad2_k = -2.0f * inv_bw_sq * K_sq + 8.0f * dist_sq * inv_bw_sq * K_cube;
         float u_p = K * grad_i * grad_j + grad_i * grad_k_j + grad_j * grad_k_i + grad2_k;
         my_ksd += u_p;
     }
@@ -2511,7 +2511,7 @@ __global__ void svpf_stein_operator_parallel_newton_ksd_kernel(
         // KSD (using preconditioned gradients)
         float grad_k_i = -2.0f * diff * inv_bw_sq * K_sq;
         float grad_k_j = -grad_k_i;
-        float grad2_k = -2.0f * inv_bw_sq * K_sq + 8.0f * dist_sq * inv_bw_sq * inv_bw_sq * K_cube;
+        float grad2_k = -2.0f * inv_bw_sq * K_sq + 8.0f * dist_sq * inv_bw_sq * K_cube;
         float u_p = K * grad_i * grad_j + grad_i * grad_k_j + grad_j * grad_k_i + grad2_k;
         my_ksd += u_p;
     }
