@@ -502,6 +502,24 @@ __global__ void svpf_heun_corrector_ksd_kernel(
     int n
 );
 
+__global__ void svpf_predict_guided_antithetic_kernel(
+    float* __restrict__ h,
+    float* __restrict__ h_prev,
+    curandStatePhilox4_32_10_t* __restrict__ rng,
+    const float* __restrict__ d_y,
+    const float* __restrict__ d_h_mean,
+    int t,
+    float rho_up, float rho_down,
+    float sigma_z, float mu, float gamma,
+    float jump_prob, float jump_scale,
+    float delta_rho, float delta_sigma,
+    float alpha_base, float alpha_shock,
+    float innovation_threshold,
+    float implied_offset,
+    int use_student_t_state, float nu_state,
+    int n
+);
+
 // =============================================================================
 // Host-side Helper (inline - safe in header)
 // =============================================================================

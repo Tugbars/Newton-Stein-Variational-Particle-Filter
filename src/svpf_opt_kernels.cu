@@ -276,6 +276,128 @@ __global__ void svpf_predict_guided_kernel(
 }
 
 // =============================================================================
+// ANTITHETIC SAMPLING VERSION
+// =============================================================================
+// Each thread handles TWO particles: i and i + n/2
+// They share the same z, but particle i+n/2 uses -z
+// This halves variance of expectations over the transition distribution.
+// Launch with n/2 threads!
+
+__global__ void svpf_predict_guided_antithetic_kernel(
+    float* __restrict__ h,
+    float* __restrict__ h_prev,
+    curandStatePhilox4_32_10_t* __restrict__ rng,
+    const float* __restrict__ d_y,
+    const float* __restrict__ d_h_mean,
+    int t,
+    float rho_up, float rho_down,
+    float sigma_z, float mu, float gamma,
+    float jump_prob, float jump_scale,
+    float delta_rho, float delta_sigma,
+    float alpha_base, float alpha_shock,
+    float innovation_threshold,
+    float implied_offset,
+    int use_student_t_state, float nu_state,
+    int n  // FULL n, not n/2
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int half_n = n / 2;
+    if (i >= half_n) return;
+    
+    int j = i + half_n;  // Antithetic partner
+    
+    // Load both particles
+    float h_i = h[i];
+    float h_j = h[j];
+    float h_prev_i = h_prev[i];
+    float h_prev_j = h_prev[j];
+    
+    // Save to h_prev
+    h_prev[i] = h_i;
+    h_prev[j] = h_j;
+    
+    float h_bar = *d_h_mean;
+    
+    // Generate ONE random sample, use +z and -z
+    float z;
+    if (use_student_t_state) {
+        z = sample_student_t(&rng[i], nu_state);
+    } else {
+        z = curand_normal(&rng[i]);
+    }
+    
+    // MIM jump: same decision for both (they'll go opposite directions)
+    float selector = curand_uniform(&rng[i]);
+    float scale = (selector < jump_prob) ? jump_scale : 1.0f;
+    
+    // Process particle i (with +z)
+    {
+        float dev = h_i - h_bar;
+        float rho_adjust = delta_rho * tanhf(dev);
+        float sigma_scale = 1.0f + delta_sigma * fabsf(dev);
+        
+        float base_rho = (h_i > h_prev_i) ? rho_up : rho_down;
+        float rho = fminf(fmaxf(base_rho + rho_adjust, 0.0f), 0.999f);
+        float sigma_local = sigma_z * sigma_scale;
+        
+        float y_prev = (t > 0) ? d_y[t - 1] : 0.0f;
+        float vol_prev = safe_exp(h_i / 2.0f);
+        float leverage = gamma * y_prev / (vol_prev + 1e-8f);
+        float mean_prior = mu + rho * (h_i - mu) + leverage;
+        
+        float y_curr = d_y[t];
+        float log_y2 = __logf(y_curr * y_curr + 1e-10f);
+        float mean_implied = fmaxf(log_y2 + implied_offset, -5.0f);
+        
+        float innovation = mean_implied - mean_prior;
+        float z_score = innovation / 2.5f;
+        
+        float activation = 0.0f;
+        if (z_score > innovation_threshold) {
+            activation = tanhf(z_score - innovation_threshold);
+        }
+        
+        float guided_alpha = alpha_base + (alpha_shock - alpha_base) * activation;
+        float mean_proposal = (1.0f - guided_alpha) * mean_prior + guided_alpha * mean_implied;
+        
+        h[i] = clamp_logvol(mean_proposal + sigma_local * scale * z);  // +z
+    }
+    
+    // Process particle j (with -z)
+    {
+        float dev = h_j - h_bar;
+        float rho_adjust = delta_rho * tanhf(dev);
+        float sigma_scale = 1.0f + delta_sigma * fabsf(dev);
+        
+        float base_rho = (h_j > h_prev_j) ? rho_up : rho_down;
+        float rho = fminf(fmaxf(base_rho + rho_adjust, 0.0f), 0.999f);
+        float sigma_local = sigma_z * sigma_scale;
+        
+        float y_prev = (t > 0) ? d_y[t - 1] : 0.0f;
+        float vol_prev = safe_exp(h_j / 2.0f);
+        float leverage = gamma * y_prev / (vol_prev + 1e-8f);
+        float mean_prior = mu + rho * (h_j - mu) + leverage;
+        
+        float y_curr = d_y[t];
+        float log_y2 = __logf(y_curr * y_curr + 1e-10f);
+        float mean_implied = fmaxf(log_y2 + implied_offset, -5.0f);
+        
+        float innovation = mean_implied - mean_prior;
+        float z_score = innovation / 2.5f;
+        
+        float activation = 0.0f;
+        if (z_score > innovation_threshold) {
+            activation = tanhf(z_score - innovation_threshold);
+        }
+        
+        float guided_alpha = alpha_base + (alpha_shock - alpha_base) * activation;
+        float mean_proposal = (1.0f - guided_alpha) * mean_prior + guided_alpha * mean_implied;
+        
+        h[j] = clamp_logvol(mean_proposal + sigma_local * scale * (-z));  // -z
+    }
+}
+
+// =============================================================================
 // Guide Kernels
 // =============================================================================
 

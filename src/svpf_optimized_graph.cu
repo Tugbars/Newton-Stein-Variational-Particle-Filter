@@ -15,6 +15,7 @@
  */
 
 #include "svpf_kernels.cuh"
+
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
 #include <cub/cub.cuh>
@@ -31,6 +32,9 @@
 #ifndef SVPF_SMOOTH_MAX_LAG
 #define SVPF_SMOOTH_MAX_LAG 8
 #endif
+
+// Forward declarations
+static void svpf_optimized_init(SVPFOptimizedState* opt, int n);
 
 // =============================================================================
 // HEUN'S METHOD KERNEL DECLARATIONS
@@ -249,6 +253,10 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     // === Heun's Method (Improved Euler) ===
     // 0 = Euler (default), 1 = Heun's method (2nd order, 2× gradient evals)
     state->use_heun = 0;
+    
+    // === Antithetic Sampling ===
+    // Pairs particles (i, i+n/2) with (+z, -z) noise for variance reduction
+    state->use_antithetic = 1;  // ON by default (reduces variance ~2×)
     
     // === Backward Smoothing (Fan et al. 2021 sliding window, lightweight) ===
     // Applies RTS-style correction to past estimates using recent observations
@@ -716,18 +724,35 @@ void svpf_step_graph(SVPFState* state, float y_t, float y_prev, const SVPFParams
     // PREDICT
     // =========================================================================
     if (state->use_guided) {
-        svpf_predict_guided_kernel<<<nb, BLOCK_SIZE, 0, cs>>>(
-            state->h, state->h_prev, state->rng_states,
-            opt->d_y_single, opt->d_h_mean_prev, 1,
-            rho_up, rho_down, effective_sigma_z, effective_mu, params->gamma,
-            state->mim_jump_prob, state->mim_jump_scale,
-            delta_rho, delta_sigma,
-            state->guided_alpha_base, state->guided_alpha_shock,
-            state->guided_innovation_threshold,
-            state->student_t_implied_offset,
-            state->use_student_t_state, state->nu_state,
-            n
-        );
+        if (state->use_antithetic) {
+            // Antithetic version: each thread handles 2 particles (i, i+n/2) with (+z, -z)
+            int nb_half = ((n / 2) + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            svpf_predict_guided_antithetic_kernel<<<nb_half, BLOCK_SIZE, 0, cs>>>(
+                state->h, state->h_prev, state->rng_states,
+                opt->d_y_single, opt->d_h_mean_prev, 1,
+                rho_up, rho_down, effective_sigma_z, effective_mu, params->gamma,
+                state->mim_jump_prob, state->mim_jump_scale,
+                delta_rho, delta_sigma,
+                state->guided_alpha_base, state->guided_alpha_shock,
+                state->guided_innovation_threshold,
+                state->student_t_implied_offset,
+                state->use_student_t_state, state->nu_state,
+                n  // Full n, kernel internally handles the pairing
+            );
+        } else {
+            svpf_predict_guided_kernel<<<nb, BLOCK_SIZE, 0, cs>>>(
+                state->h, state->h_prev, state->rng_states,
+                opt->d_y_single, opt->d_h_mean_prev, 1,
+                rho_up, rho_down, effective_sigma_z, effective_mu, params->gamma,
+                state->mim_jump_prob, state->mim_jump_scale,
+                delta_rho, delta_sigma,
+                state->guided_alpha_base, state->guided_alpha_shock,
+                state->guided_innovation_threshold,
+                state->student_t_implied_offset,
+                state->use_student_t_state, state->nu_state,
+                n
+            );
+        }
     } else if (state->use_mim) {
         svpf_predict_mim_kernel<<<nb, BLOCK_SIZE, 0, cs>>>(
             state->h, state->h_prev, state->rng_states,

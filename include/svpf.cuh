@@ -514,6 +514,7 @@ typedef struct {
 
     int use_heun;  // 0 = Euler (default), 1 = Heun's method
 
+    int use_antithetic;
 
 } SVPFState;
 
