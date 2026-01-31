@@ -592,7 +592,7 @@ static Metrics run_svpf_on_scenario(
         // Replaces fixed n_stein_steps with convergence-based early stopping
         // KSD (Kernel Stein Discrepancy) computed in same O(N²) pass - zero extra cost
         filter->stein_min_steps = 8;              // Always run at least 4 (RMSProp warmup)
-        filter->stein_max_steps = 16;             // Cap at 12 (crisis budget)
+        filter->stein_max_steps = 8;             // Cap at 12 (crisis budget)
         filter->ksd_improvement_threshold = 0.05; // Stop if <5% relative improvement
 
         // Enable Student-t state dynamics
