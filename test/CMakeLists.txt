@@ -306,5 +306,26 @@ set_target_properties(test_fused_v2_scenario PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
 )
 
+# Profile Multi Stream
+add_executable(tet_profile_multi_stream profile_multi_stream.cu)
+
+target_include_directories(tet_profile_multi_stream
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CUDAToolkit_INCLUDE_DIRS}
+)
+
+target_link_libraries(tet_profile_multi_stream
+    PRIVATE
+        svpf
+        CUDA::cudart
+        CUDA::curand
+)
+
+set_target_properties(tet_profile_multi_stream PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+)
+
+
 
 
