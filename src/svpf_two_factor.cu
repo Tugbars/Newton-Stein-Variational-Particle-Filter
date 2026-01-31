@@ -231,18 +231,17 @@ __global__ void svpf_gradient_two_factor_kernel(
     float prior_grad_slow = -(hs - rho_slow * hs_prev) / sigma_slow_sq;
     
     // =========================================================================
-    // VARIANCE-WEIGHTED LIKELIHOOD SPLIT (for identifiability)
+    // INNOVATION VARIANCE WEIGHTING (for identifiability)
     // =========================================================================
-    // Use STATIONARY variances (not innovation variances) for balanced split.
-    // Stationary var = σ² / (1 - ρ²)
-    // This accounts for persistence: slow component has high stationary var
-    // even though its innovation var is small.
-    float one_minus_rho_fast_sq = 1.0f - rho_fast * rho_fast + 1e-6f;
-    float one_minus_rho_slow_sq = 1.0f - rho_slow * rho_slow + 1e-6f;
-    float var_fast_stat = sigma_fast_sq / one_minus_rho_fast_sq;
-    float var_slow_stat = sigma_slow_sq / one_minus_rho_slow_sq;
-    
-    float w_fast = var_fast_stat / (var_fast_stat + var_slow_stat);
+    // Use PROCESS VARIANCE (σ²), not stationary variance.
+    // This measures "how much is this component allowed to move per step".
+    // 
+    // Fast component: large σ → absorbs spikes
+    // Slow component: small σ → prior dominates, only tracks trends
+    //
+    // The prior gradients already encode stiffness (÷σ²), so using innovation
+    // variance here lets the slow component's strong prior keep it stable.
+    float w_fast = sigma_fast_sq / (sigma_fast_sq + sigma_slow_sq);
     float w_slow = 1.0f - w_fast;
     
     grad_fast[i] = prior_grad_fast + beta * w_fast * lik_grad;
