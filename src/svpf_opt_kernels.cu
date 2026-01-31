@@ -11,6 +11,7 @@
  */
 
 #include "svpf_kernels.cuh"
+#include <cuda_pipeline.h>
 #include <stdio.h>
 
 // =============================================================================
@@ -657,30 +658,38 @@ __global__ void svpf_fused_stein_transport_kernel(
     float temperature,
     float rho_rmsprop,
     float epsilon,
-    int stein_sign_mode,  // 0=legacy(subtract), 1=paper(add)
+    int stein_sign_mode,
     int n
 ) {
     extern __shared__ float smem[];
     float* sh_h = smem;
     float* sh_grad = smem + n;
     
-    for (int k = threadIdx.x; k < n; k += blockDim.x) {
-        sh_h[k] = h[k];
-        sh_grad[k] = grad[k];
-    }
-    __syncthreads();
-    
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
     
-    float h_i = sh_h[i];
+    // Issue async loads to shared memory
+    for (int k = threadIdx.x; k < n; k += blockDim.x) {
+        __pipeline_memcpy_async(&sh_h[k], &h[k], sizeof(float));
+        __pipeline_memcpy_async(&sh_grad[k], &grad[k], sizeof(float));
+    }
+    __pipeline_commit();
+    
+    // Independent work while loads are in flight
     float global_bw = *d_bandwidth;
     float bw_sq = global_bw * global_bw;
     float inv_bw_sq = 1.0f / bw_sq;
     float inv_n = 1.0f / (float)n;
-    
-    // Sign multiplier: -1 for legacy (attraction), +1 for paper (repulsion)
     float sign_mult = (stein_sign_mode == 1) ? 1.0f : -1.0f;
+    float effective_step = step_size * beta_factor;
+    float v_prev = (i < n) ? v_rmsprop[i] : 0.0f;
+    
+    // Wait for shared memory loads
+    __pipeline_wait_prior(0);
+    __syncthreads();
+    
+    if (i >= n) return;
+    
+    float h_i = sh_h[i];
     
     // ===== STEIN OPERATOR with IMQ Kernel =====
     float k_sum = 0.0f;
@@ -702,12 +711,10 @@ __global__ void svpf_fused_stein_transport_kernel(
     float phi_i = (k_sum + gk_sum) * inv_n;
     
     // ===== RMSPROP =====
-    float v_prev = v_rmsprop[i];
     float v_new = rho_rmsprop * v_prev + (1.0f - rho_rmsprop) * phi_i * phi_i;
     v_rmsprop[i] = v_new;
     
     // ===== TRANSPORT =====
-    float effective_step = step_size * beta_factor;
     float precond = rsqrtf(v_new + epsilon);
     float drift = effective_step * phi_i * precond;
     
@@ -743,37 +750,45 @@ __global__ void svpf_fused_stein_transport_ksd_kernel(
     float* __restrict__ v_rmsprop,
     curandStatePhilox4_32_10_t* __restrict__ rng,
     const float* __restrict__ d_bandwidth,
-    float* __restrict__ d_ksd_partial,  // Output: partial KSD sums per particle
+    float* __restrict__ d_ksd_partial,
     float step_size,
     float beta_factor,
     float temperature,
     float rho_rmsprop,
     float epsilon,
-    int stein_sign_mode,  // 0=legacy(subtract), 1=paper(add)
+    int stein_sign_mode,
     int n
 ) {
     extern __shared__ float smem[];
     float* sh_h = smem;
     float* sh_grad = smem + n;
     
-    for (int k = threadIdx.x; k < n; k += blockDim.x) {
-        sh_h[k] = h[k];
-        sh_grad[k] = grad[k];
-    }
-    __syncthreads();
-    
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
     
-    float h_i = sh_h[i];
-    float s_i = sh_grad[i];  // Score at particle i
+    // Issue async loads to shared memory
+    for (int k = threadIdx.x; k < n; k += blockDim.x) {
+        __pipeline_memcpy_async(&sh_h[k], &h[k], sizeof(float));
+        __pipeline_memcpy_async(&sh_grad[k], &grad[k], sizeof(float));
+    }
+    __pipeline_commit();
+    
+    // Independent work while loads are in flight
     float global_bw = *d_bandwidth;
     float bw_sq = global_bw * global_bw;
     float inv_bw_sq = 1.0f / bw_sq;
     float inv_n = 1.0f / (float)n;
-    
-    // Sign multiplier: -1 for legacy (attraction), +1 for paper (repulsion)
     float sign_mult = (stein_sign_mode == 1) ? 1.0f : -1.0f;
+    float effective_step = step_size * beta_factor;
+    float v_prev = (i < n) ? v_rmsprop[i] : 0.0f;
+    
+    // Wait for shared memory loads
+    __pipeline_wait_prior(0);
+    __syncthreads();
+    
+    if (i >= n) return;
+    
+    float h_i = sh_h[i];
+    float s_i = sh_grad[i];
     
     // ===== FUSED: Stein operator + KSD =====
     float k_sum = 0.0f;
@@ -788,16 +803,13 @@ __global__ void svpf_fused_stein_transport_ksd_kernel(
         float diff_sq = diff * diff;
         float dist_sq = diff_sq * inv_bw_sq;
         
-        // IMQ kernel: K = (1 + dist_sq)^(-1)
         float base = 1.0f + dist_sq;
         float K = 1.0f / base;
         float K_sq = K * K;
         
-        // ----- Stein operator -----
         k_sum += K * s_j;
         gk_sum += sign_mult * 2.0f * diff * inv_bw_sq * K_sq;
         
-        // ----- KSD Stein kernel -----
         float grad_x_k = -2.0f * diff * inv_bw_sq * K_sq;
         float grad_y_k = -grad_x_k;
         float hess_xy_k = 2.0f * inv_bw_sq * K_sq * (4.0f * dist_sq * K - 1.0f);
@@ -807,17 +819,13 @@ __global__ void svpf_fused_stein_transport_ksd_kernel(
     }
     
     float phi_i = (k_sum + gk_sum) * inv_n;
-    
-    // Store partial KSD sum (will reduce to KSD² = sum / N²)
     d_ksd_partial[i] = ksd_sum;
     
     // ===== RMSPROP =====
-    float v_prev = v_rmsprop[i];
     float v_new = rho_rmsprop * v_prev + (1.0f - rho_rmsprop) * phi_i * phi_i;
     v_rmsprop[i] = v_new;
     
     // ===== TRANSPORT =====
-    float effective_step = step_size * beta_factor;
     float precond = rsqrtf(v_new + epsilon);
     float drift = effective_step * phi_i * precond;
     
@@ -1700,4 +1708,243 @@ __global__ void svpf_heun_corrector_ksd_kernel(
     }
     
     d_ksd_partial[i] = ksd_sum;
+}
+
+// =============================================================================
+// MEGA-FUSED: Gradient + Stein + Transport (No Newton, No KSD)
+// =============================================================================
+// 
+// Fuses svpf_fused_gradient_kernel + svpf_fused_stein_transport_kernel
+// into a single kernel launch, halving launch overhead per Stein iteration.
+// 
+// This is for non-final iterations (no KSD computation needed).
+// 
+// Shared memory layout (reused across phases):
+//   Phase 1-2: sh_A[n] = h_prev, sh_B[n] = mu_i (per-particle AR(1) mean)
+//   Phase 3-4: sh_A[n] = h,      sh_B[n] = grad
+// 
+// Total shared: 2n floats (same as individual kernels)
+// =============================================================================
+
+__global__ void svpf_fused_gradient_stein_transport_kernel(
+    float* __restrict__ h,
+    const float* __restrict__ h_prev,
+    float* __restrict__ log_w,
+    float* __restrict__ v_rmsprop,
+    curandStatePhilox4_32_10_t* __restrict__ rng,
+    const float* __restrict__ d_y,
+    const float* __restrict__ d_bandwidth,
+    int y_idx,
+    float rho,
+    float sigma_z,
+    float mu,
+    float beta,
+    float nu,
+    float student_t_const,
+    float lik_offset,
+    float gamma,
+    float step_size,
+    float beta_factor,
+    float temperature,
+    float rho_rmsprop,
+    float epsilon,
+    int stein_sign_mode,
+    bool use_exact_gradient,
+    bool use_fan_mode,
+    int use_student_t_state,
+    float nu_state,
+    int n
+) {
+    extern __shared__ float smem[];
+    float* sh_A = smem;       // Phase 1-2: h_prev, Phase 3-4: h
+    float* sh_B = smem + n;   // Phase 1-2: mu_i,   Phase 3-4: grad
+    
+    int tid = threadIdx.x;
+    int j = blockIdx.x * blockDim.x + tid;
+    
+    float y_prev = (y_idx > 0) ? d_y[y_idx - 1] : 0.0f;
+    float y_t = d_y[y_idx];
+    
+    // =========================================================================
+    // PHASE 1: Load h_prev, compute mu_i (AR(1) conditional mean per particle)
+    // =========================================================================
+    for (int k = tid; k < n; k += blockDim.x) {
+        float hp = h_prev[k];
+        sh_A[k] = hp;  // h_prev
+        
+        float vol_prev_k = __expf(hp * 0.5f);
+        float leverage_k = gamma * y_prev / (vol_prev_k + 1e-8f);
+        sh_B[k] = mu + rho * (hp - mu) + leverage_k;  // mu_i
+    }
+    __syncthreads();
+    
+    // =========================================================================
+    // PHASE 2: Compute gradient for particle j
+    // =========================================================================
+    float grad_j = 0.0f;
+    float h_j = 0.0f;
+    
+    if (j < n) {
+        h_j = h[j];
+        
+        // ===== PRIOR GRADIENT =====
+        float sigma_z_sq = sigma_z * sigma_z;
+        float grad_prior;
+        
+        if (use_student_t_state) {
+            // Student-t prior: bounded gradient
+            float nu_sigma_sq = nu_state * sigma_z_sq;
+            float nu_plus_1 = nu_state + 1.0f;
+            float half_nu_plus_1 = 0.5f * nu_plus_1;
+            
+            float log_r_max = -1e10f;
+            #pragma unroll 8
+            for (int i = 0; i < n; i++) {
+                float diff = h_j - sh_B[i];  // h_j - mu_i
+                float diff_sq = diff * diff;
+                float log_r_i = -half_nu_plus_1 * __logf(1.0f + diff_sq / nu_sigma_sq);
+                log_r_max = fmaxf(log_r_max, log_r_i);
+            }
+            
+            float sum_r = 0.0f;
+            float weighted_grad = 0.0f;
+            #pragma unroll 8
+            for (int i = 0; i < n; i++) {
+                float diff = h_j - sh_B[i];
+                float diff_sq = diff * diff;
+                float denom = nu_sigma_sq + diff_sq;
+                
+                float log_r_i = -half_nu_plus_1 * __logf(1.0f + diff_sq / nu_sigma_sq);
+                float r_i = __expf(log_r_i - log_r_max);
+                sum_r += r_i;
+                
+                weighted_grad -= r_i * nu_plus_1 * diff / denom;
+            }
+            grad_prior = weighted_grad / (sum_r + 1e-8f);
+            
+        } else {
+            // Gaussian prior
+            float inv_2sigma_sq = 0.5f / sigma_z_sq;
+            float inv_sigma_sq = 1.0f / sigma_z_sq;
+            
+            float log_r_max = -1e10f;
+            #pragma unroll 8
+            for (int i = 0; i < n; i++) {
+                float diff = h_j - sh_B[i];
+                float log_r_i = -diff * diff * inv_2sigma_sq;
+                log_r_max = fmaxf(log_r_max, log_r_i);
+            }
+            
+            float sum_r = 0.0f;
+            float weighted_grad = 0.0f;
+            #pragma unroll 8
+            for (int i = 0; i < n; i++) {
+                float diff = h_j - sh_B[i];
+                float log_r_i = -diff * diff * inv_2sigma_sq;
+                float r_i = __expf(log_r_i - log_r_max);
+                sum_r += r_i;
+                weighted_grad -= r_i * diff * inv_sigma_sq;
+            }
+            grad_prior = weighted_grad / (sum_r + 1e-8f);
+        }
+        
+        // ===== LIKELIHOOD GRADIENT =====
+        float vol = safe_exp(h_j);
+        float y_sq = y_t * y_t;
+        float scaled_y_sq = y_sq / (vol + 1e-8f);
+        float A = scaled_y_sq / nu;
+        float one_plus_A = 1.0f + A;
+        
+        // Log weights
+        if (use_fan_mode) {
+            log_w[j] = 0.0f;
+        } else {
+            log_w[j] = student_t_const - 0.5f * h_j
+                     - (nu + 1.0f) * 0.5f * log1pf(fmaxf(A, -0.999f));
+        }
+        
+        float grad_lik;
+        if (use_exact_gradient) {
+            float raw_grad = -0.5f + 0.5f * (nu + 1.0f) * A / one_plus_A;
+            grad_lik = raw_grad - lik_offset;
+        } else {
+            float log_y2 = __logf(y_sq + 1e-10f);
+            float R_noise = 1.4f;
+            grad_lik = (log_y2 - h_j + lik_offset) / R_noise;
+        }
+        
+        // ===== COMBINE =====
+        float effective_beta = use_fan_mode ? 1.0f : beta;
+        grad_j = grad_prior + effective_beta * grad_lik;
+        grad_j = fminf(fmaxf(grad_j, -10.0f), 10.0f);
+    }
+    __syncthreads();
+    
+    // =========================================================================
+    // PHASE 3: Reload shared memory with h and grad for Stein operator
+    // =========================================================================
+    // Each thread writes its own gradient to shared (no race - different indices)
+    // But we need to load ALL h values, so do cooperative load first
+    
+    for (int k = tid; k < n; k += blockDim.x) {
+        sh_A[k] = h[k];  // Current particle positions
+    }
+    __syncthreads();
+    
+    // Now each valid thread writes its gradient
+    if (j < n) {
+        sh_B[j] = grad_j;
+    }
+    __syncthreads();
+    
+    // =========================================================================
+    // PHASE 4: Stein operator + Transport
+    // =========================================================================
+    if (j >= n) return;
+    
+    float global_bw = *d_bandwidth;
+    float bw_sq = global_bw * global_bw;
+    float inv_bw_sq = 1.0f / bw_sq;
+    float inv_n = 1.0f / (float)n;
+    
+    // Sign multiplier: -1 for legacy (attraction), +1 for paper (repulsion)
+    float sign_mult = (stein_sign_mode == 1) ? 1.0f : -1.0f;
+    
+    // ===== STEIN OPERATOR with IMQ Kernel =====
+    float h_i = sh_A[j];  // Note: j is our particle index
+    float k_sum = 0.0f;
+    float gk_sum = 0.0f;
+    
+    #pragma unroll 8
+    for (int k = 0; k < n; k++) {
+        float diff = h_i - sh_A[k];
+        float dist_sq = diff * diff * inv_bw_sq;
+        
+        float base = 1.0f + dist_sq;
+        float K = 1.0f / base;
+        float K_sq = K * K;
+        
+        k_sum += K * sh_B[k];  // K * grad[k]
+        gk_sum += sign_mult * 2.0f * diff * inv_bw_sq * K_sq;
+    }
+    
+    float phi_i = (k_sum + gk_sum) * inv_n;
+    
+    // ===== RMSPROP =====
+    float v_prev = v_rmsprop[j];
+    float v_new = rho_rmsprop * v_prev + (1.0f - rho_rmsprop) * phi_i * phi_i;
+    v_rmsprop[j] = v_new;
+    
+    // ===== TRANSPORT =====
+    float effective_step = step_size * beta_factor;
+    float precond = rsqrtf(v_new + epsilon);
+    float drift = effective_step * phi_i * precond;
+    
+    float diffusion = 0.0f;
+    if (temperature > 1e-6f) {
+        float noise = curand_normal(&rng[j]);
+        diffusion = sqrtf(2.0f * effective_step * temperature) * noise;
+    }
+    
+    h[j] = clamp_logvol(h_i + drift + diffusion);
 }
