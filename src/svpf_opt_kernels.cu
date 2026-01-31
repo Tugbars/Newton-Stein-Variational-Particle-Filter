@@ -2034,7 +2034,11 @@ __global__ void svpf_stein_operator_parallel_kernel(
         combined_sum += __shfl_down_sync(0xffffffff, combined_sum, offset);
     }
 
+    // Zero-init shared memory to prevent garbage from inactive warps
     __shared__ float s_combined[8];
+    if (tid < 8) { s_combined[tid] = 0.0f; }
+    __syncthreads();
+
     if (lane == 0) { s_combined[wid] = combined_sum; }
     __syncthreads();
 
@@ -2113,7 +2117,14 @@ __global__ void svpf_stein_operator_parallel_ksd_kernel(
     // Reduce combined_sum and ksd_sum
     warp_reduce_2(&combined_sum, &ksd_sum);
 
+    // Zero-init shared memory to prevent garbage from inactive warps
     __shared__ float s_combined[8], s_ksd[8];
+    if (tid < 8) { 
+        s_combined[tid] = 0.0f; 
+        s_ksd[tid] = 0.0f; 
+    }
+    __syncthreads();
+
     if (lane == 0) { s_combined[wid] = combined_sum; s_ksd[wid] = ksd_sum; }
     __syncthreads();
 
@@ -2185,7 +2196,15 @@ __global__ void svpf_stein_operator_parallel_full_newton_kernel(
 
     warp_reduce_3(&combined_sum, &H_weighted, &K_sum_norm);
 
+    // Zero-init shared memory to prevent garbage from inactive warps (N < 256)
     __shared__ float s_combined[8], s_h[8], s_kn[8];
+    if (tid < 8) {
+        s_combined[tid] = 0.0f;
+        s_h[tid] = 0.0f;
+        s_kn[tid] = 0.0f;
+    }
+    __syncthreads();
+
     if (lane == 0) {
         s_combined[wid] = combined_sum;
         s_h[wid] = H_weighted; 
@@ -2278,7 +2297,16 @@ __global__ void svpf_stein_operator_parallel_full_newton_ksd_kernel(
 
     warp_reduce_4(&combined_sum, &H_weighted, &K_sum_norm, &ksd_sum);
 
+    // Zero-init shared memory to prevent garbage from inactive warps (N < 256)
     __shared__ float s_combined[8], s_h[8], s_kn[8], s_ksd[8];
+    if (tid < 8) {
+        s_combined[tid] = 0.0f;
+        s_h[tid] = 0.0f;
+        s_kn[tid] = 0.0f;
+        s_ksd[tid] = 0.0f;
+    }
+    __syncthreads();
+
     if (lane == 0) {
         s_combined[wid] = combined_sum;
         s_h[wid] = H_weighted; 
