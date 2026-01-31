@@ -710,7 +710,7 @@ int main(int argc, char** argv) {
     /* Configuration */
     int seed = 42;
     int n_ticks = 5000;
-    int n_particles = 2048;
+    int n_particles = 1024;
     int n_stein = 8;
     float nu = 50.0f;
     int use_adaptive = 1;
