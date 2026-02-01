@@ -155,6 +155,7 @@ typedef struct {
     float* d_h;                 /* Current log-vol particles [N] */
     float* d_h_prev;            /* Previous step [N] */
     float* d_grad_log_p;        /* Gradient buffer [N] */
+    float* d_local_hessian;     /* Local Hessian for Full Newton [N] */
     float* d_phi;               /* Stein operator output [N] */
     float* d_grad_v;            /* RMSProp accumulator [N] */
     

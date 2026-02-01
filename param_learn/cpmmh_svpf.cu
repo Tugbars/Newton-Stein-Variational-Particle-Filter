@@ -200,6 +200,9 @@ SVPFReplayState* svpf_replay_create(int N_particles, const SVPFReplayConfig* con
     CUDA_CHECK(cudaMalloc(&state->d_grad_v, N_bytes));
     CUDA_CHECK(cudaMalloc(&state->d_reduce_buf, N_bytes));
     
+    /* Local Hessian for Full Newton */
+    CUDA_CHECK(cudaMalloc(&state->d_local_hessian, N_bytes));
+    
     /* Scalars */
     CUDA_CHECK(cudaMalloc(&state->d_bandwidth, sizeof(float)));
     CUDA_CHECK(cudaMalloc(&state->d_log_lik_inc, sizeof(float)));
@@ -241,6 +244,7 @@ void svpf_replay_destroy(SVPFReplayState* state) {
     cudaFree(state->d_phi);
     cudaFree(state->d_grad_v);
     cudaFree(state->d_reduce_buf);
+    cudaFree(state->d_local_hessian);
     cudaFree(state->d_bandwidth);
     cudaFree(state->d_log_lik_inc);
     cudaFree(state->d_cub_temp);
@@ -339,11 +343,13 @@ __global__ void kernel_replay_predict(
     }
 }
 
-/* Kernel: Compute gradient of log posterior */
+/* Kernel: Compute gradient of log posterior (matches production SVPF) */
+/* Uses log-sum-exp mixture over h_prev particles for numerical stability */
 __global__ void kernel_replay_gradient(
     const float* d_h,
     const float* d_h_prev,
     float* d_grad_log_p,
+    float* d_local_hessian,  /* Output: local Hessian for Newton */
     float y_t,
     float rho,
     float sigma_z,
@@ -354,40 +360,120 @@ __global__ void kernel_replay_gradient(
     float nu_state,
     int N
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < N) {
-        float h = d_h[idx];
-        float h_prev = d_h_prev[idx];
+    extern __shared__ float smem[];
+    float* sh_h_prev = smem;
+    float* sh_mu_i = smem + N;  /* AR(1) conditional mean per particle */
+    
+    int tid = threadIdx.x;
+    int j = blockIdx.x * blockDim.x + tid;
+    
+    /* Load h_prev and compute mu_i = mu + rho*(h_prev - mu) */
+    for (int k = tid; k < N; k += blockDim.x) {
+        float hp = d_h_prev[k];
+        sh_h_prev[k] = hp;
+        sh_mu_i[k] = mu + rho * (hp - mu);
+    }
+    __syncthreads();
+    
+    if (j >= N) return;
+    
+    float h_j = d_h[j];
+    float sigma_z_sq = sigma_z * sigma_z;
+    
+    /* ===== PRIOR GRADIENT (mixture over h_prev particles) ===== */
+    float grad_prior;
+    float hess_prior;
+    
+    if (use_student_t_state && nu_state > 2.5f) {
+        /* Student-t prior: bounded gradient */
+        float nu_sigma_sq = nu_state * sigma_z_sq;
+        float nu_plus_1 = nu_state + 1.0f;
+        float half_nu_plus_1 = 0.5f * nu_plus_1;
         
-        /* Log-likelihood gradient: d/dh log p(y|h) */
-        /* Student-t: log p(y|h) = const - (ν+1)/2 * log(1 + y²/(ν·exp(h))) - h/2 */
-        float exp_h = expf(h);
-        float y_sq = y_t * y_t;
-        float z_sq = y_sq / (nu_obs * exp_h + 1e-10f);
-        float denom = 1.0f + z_sq;
-        
-        /* d/dh log p(y|h) = -0.5 + (ν+1)/2 * z² / (1 + z²) */
-        float grad_lik = -0.5f + 0.5f * (nu_obs + 1.0f) * z_sq / denom;
-        
-        /* Prior gradient: d/dh log p(h|h_prev) */
-        /* Gaussian AR(1): -0.5 * (h - μ - ρ(h_prev - μ))² / σ² */
-        float h_mean = mu + rho * (h_prev - mu);
-        float residual = h - h_mean;
-        float sigma_z_sq = sigma_z * sigma_z + 1e-10f;
-        
-        float grad_prior;
-        if (use_student_t_state && nu_state > 2.5f) {
-            /* Student-t state: bounded gradient */
-            float scale_sq = sigma_z_sq * nu_state;
-            float z_state = residual * residual / scale_sq;
-            grad_prior = -(nu_state + 1.0f) * residual / (scale_sq * (1.0f + z_state));
-        } else {
-            /* Gaussian state */
-            grad_prior = -residual / sigma_z_sq;
+        /* Log-sum-exp for numerical stability */
+        float log_r_max = -1e10f;
+        #pragma unroll 8
+        for (int i = 0; i < N; i++) {
+            float diff = h_j - sh_mu_i[i];
+            float diff_sq = diff * diff;
+            float log_r_i = -half_nu_plus_1 * __logf(1.0f + diff_sq / nu_sigma_sq);
+            log_r_max = fmaxf(log_r_max, log_r_i);
         }
         
-        d_grad_log_p[idx] = grad_lik + grad_prior;
+        float sum_r = 0.0f;
+        float weighted_grad = 0.0f;
+        float weighted_hess = 0.0f;
+        #pragma unroll 8
+        for (int i = 0; i < N; i++) {
+            float diff = h_j - sh_mu_i[i];
+            float diff_sq = diff * diff;
+            float denom = nu_sigma_sq + diff_sq;
+            
+            float log_r_i = -half_nu_plus_1 * __logf(1.0f + diff_sq / nu_sigma_sq);
+            float r_i = __expf(log_r_i - log_r_max);
+            sum_r += r_i;
+            
+            /* Gradient: -d/dh log p = (nu+1) * diff / denom */
+            weighted_grad -= r_i * nu_plus_1 * diff / denom;
+            
+            /* Hessian: d²/dh² (-log p) */
+            float h_i = nu_plus_1 * (1.0f - 2.0f * diff_sq / denom) / denom;
+            weighted_hess += r_i * h_i;
+        }
+        grad_prior = weighted_grad / (sum_r + 1e-8f);
+        hess_prior = weighted_hess / (sum_r + 1e-8f);
+        
+    } else {
+        /* Gaussian prior */
+        float inv_2sigma_sq = 0.5f / sigma_z_sq;
+        float inv_sigma_sq = 1.0f / sigma_z_sq;
+        
+        /* Log-sum-exp for numerical stability */
+        float log_r_max = -1e10f;
+        #pragma unroll 8
+        for (int i = 0; i < N; i++) {
+            float diff = h_j - sh_mu_i[i];
+            float log_r_i = -diff * diff * inv_2sigma_sq;
+            log_r_max = fmaxf(log_r_max, log_r_i);
+        }
+        
+        float sum_r = 0.0f;
+        float weighted_grad = 0.0f;
+        #pragma unroll 8
+        for (int i = 0; i < N; i++) {
+            float diff = h_j - sh_mu_i[i];
+            float log_r_i = -diff * diff * inv_2sigma_sq;
+            float r_i = __expf(log_r_i - log_r_max);
+            sum_r += r_i;
+            weighted_grad -= r_i * diff * inv_sigma_sq;
+        }
+        grad_prior = weighted_grad / (sum_r + 1e-8f);
+        hess_prior = inv_sigma_sq;  /* Constant for Gaussian */
     }
+    
+    /* ===== LIKELIHOOD GRADIENT ===== */
+    /* Student-t: log p(y|h) = const - h/2 - (ν+1)/2 * log(1 + y²/(ν·exp(h))) */
+    float exp_h = __expf(h_j);
+    float y_sq = y_t * y_t;
+    float A = y_sq / (nu_obs * exp_h + 1e-10f);
+    float one_plus_A = 1.0f + A;
+    
+    /* d/dh log p(y|h) = -0.5 + (ν+1)/2 * A / (1 + A) */
+    float grad_lik = -0.5f + 0.5f * (nu_obs + 1.0f) * A / one_plus_A;
+    
+    /* Hessian of likelihood: d²/dh² (-log p) ≈ (ν+1)/2 * A * (1-A) / (1+A)² */
+    float hess_lik = 0.5f * (nu_obs + 1.0f) * A * (1.0f - A) / (one_plus_A * one_plus_A);
+    hess_lik = fmaxf(hess_lik, 0.1f);  /* Ensure positive definiteness */
+    
+    /* ===== COMBINE ===== */
+    float total_grad = grad_prior + grad_lik;
+    total_grad = fminf(fmaxf(total_grad, -10.0f), 10.0f);
+    
+    float total_hess = hess_prior + hess_lik;
+    total_hess = fminf(fmaxf(total_hess, 0.1f), 100.0f);
+    
+    d_grad_log_p[j] = total_grad;
+    d_local_hessian[j] = total_hess;
 }
 
 /* Kernel: Compute median-based bandwidth */
@@ -434,10 +520,11 @@ __global__ void kernel_compute_bandwidth(
     }
 }
 
-/* Kernel: Stein transport operator (deterministic, no SVLD noise) */
+/* Kernel: Stein transport operator with IMQ kernel + Full Newton (matches production SVPF) */
 __global__ void kernel_replay_stein_transport(
     float* d_h,
     const float* d_grad_log_p,
+    const float* d_local_hessian,
     float* d_grad_v,         /* RMSProp accumulator */
     float bandwidth,
     float step_size,
@@ -447,44 +534,77 @@ __global__ void kernel_replay_stein_transport(
     float h_max,
     int N
 ) {
+    extern __shared__ float smem[];
+    float* sh_h = smem;
+    float* sh_grad = smem + N;
+    float* sh_hess = smem + 2 * N;
+    
+    /* Load to shared memory */
+    for (int k = threadIdx.x; k < N; k += blockDim.x) {
+        sh_h[k] = d_h[k];
+        sh_grad[k] = d_grad_log_p[k];
+        sh_hess[k] = d_local_hessian[k];
+    }
+    __syncthreads();
+    
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
     
-    float h_i = d_h[i];
-    float grad_i = d_grad_log_p[i];
-    float h_sq = bandwidth * bandwidth;
-    float inv_h_sq = 1.0f / (h_sq + 1e-10f);
+    float h_i = sh_h[i];
+    float bw_sq = bandwidth * bandwidth;
+    float inv_bw_sq = 1.0f / bw_sq;
+    float inv_n = 1.0f / (float)N;
     
-    /* Compute Stein operator: φ(x_i) = (1/N) Σ_j [k(x_j, x_i) ∇log p(x_j) + ∇_j k(x_j, x_i)] */
-    float phi = 0.0f;
+    /* Full Newton: kernel-weighted Hessian aggregation */
+    float H_weighted = 0.0f;
+    float K_sum_norm = 0.0f;
+    float k_grad_sum = 0.0f;
+    float gk_sum = 0.0f;
     
+    #pragma unroll 4
     for (int j = 0; j < N; j++) {
-        float h_j = d_h[j];
-        float grad_j = d_grad_log_p[j];
+        float diff = h_i - sh_h[j];
+        float diff_sq = diff * diff;
+        float dist_sq = diff_sq * inv_bw_sq;
         
-        float diff = h_j - h_i;
-        float dist_sq = diff * diff;
+        /* IMQ kernel: K(x,y) = 1 / (1 + ||x-y||²/h²) */
+        float base = 1.0f + dist_sq;
+        float K = 1.0f / base;
+        float K_sq = K * K;
         
-        /* RBF kernel: k(x,y) = exp(-||x-y||² / (2h²)) */
-        float k = expf(-0.5f * dist_sq * inv_h_sq);
+        /* Accumulate kernel-weighted Hessian */
+        H_weighted += sh_hess[j] * K;
         
-        /* ∇_x k(x,y) = k(x,y) * (y-x) / h² */
-        float grad_k = k * diff * inv_h_sq;
+        /* Add kernel curvature contribution: |∇²K| ≈ 2/h² · K² · |3d² - 1| */
+        float Nk = 2.0f * inv_bw_sq * K_sq * fabsf(3.0f * dist_sq - 1.0f);
+        H_weighted += Nk;
+        K_sum_norm += K;
         
-        /* Stein operator (repulsive form): k·∇log p + ∇k */
-        phi += k * grad_j + grad_k;
+        /* Stein operator terms */
+        k_grad_sum += K * sh_grad[j];
+        
+        /* ∇_x K for IMQ: 2(x-y)/h² · K² (repulsive) */
+        gk_sum += 2.0f * diff * inv_bw_sq * K_sq;
     }
-    phi /= (float)N;
     
-    /* RMSProp update */
+    /* Normalize and bound Hessian */
+    H_weighted = H_weighted / fmaxf(K_sum_norm, 1e-6f);
+    H_weighted = fminf(fmaxf(H_weighted, 0.1f), 100.0f);
+    float inv_H_i = 1.0f / H_weighted;
+    
+    /* Full Newton Stein operator: φ = H⁻¹ · (k·∇log p + ∇k) / N */
+    /* The 0.7 damping factor matches production SVPF */
+    float phi_i = (k_grad_sum + gk_sum) * inv_n * inv_H_i * 0.7f;
+    
+    /* RMSProp adaptive step size */
     float grad_v_old = d_grad_v[i];
-    float grad_v_new = rmsprop_rho * grad_v_old + (1.0f - rmsprop_rho) * phi * phi;
+    float grad_v_new = rmsprop_rho * grad_v_old + (1.0f - rmsprop_rho) * phi_i * phi_i;
     d_grad_v[i] = grad_v_new;
     
     float adaptive_step = step_size / (sqrtf(grad_v_new) + rmsprop_eps);
     
-    /* Update particle (no SVLD noise in replay mode) */
-    float h_new = h_i + adaptive_step * phi;
+    /* Update particle (no SVLD noise in replay mode - deterministic) */
+    float h_new = h_i + adaptive_step * phi_i;
     d_h[i] = fminf(fmaxf(h_new, h_min), h_max);
 }
 
@@ -563,10 +683,14 @@ float svpf_replay_step(
                                cudaMemcpyDeviceToHost, cs));
     CUDA_CHECK(cudaStreamSynchronize(cs));
     
-    /* 3. Stein iterations (fixed steps, no KSD early stopping) */
+    /* 3. Stein iterations (fixed steps, Full Newton, no SVLD noise) */
     float step_size = 0.1f;
     float rmsprop_rho = 0.9f;
     float rmsprop_eps = 1e-6f;
+    
+    /* Shared memory: 2*N for gradient kernel, 3*N for Stein kernel */
+    size_t grad_smem = 2 * N * sizeof(float);
+    size_t stein_smem = 3 * N * sizeof(float);
     
     for (int ai = 0; ai < cfg->n_anneal_steps; ai++) {
         /* Annealing schedule */
@@ -577,17 +701,19 @@ float svpf_replay_step(
         }
         
         for (int s = 0; s < n_steps; s++) {
-            /* Gradient computation */
-            kernel_replay_gradient<<<grid, block, 0, cs>>>(
+            /* Gradient computation (outputs both gradient and Hessian) */
+            kernel_replay_gradient<<<grid, block, grad_smem, cs>>>(
                 state->d_h, state->d_h_prev, state->d_grad_log_p,
+                state->d_local_hessian,
                 y_t, params->rho, params->sigma_z, params->mu,
                 cfg->nu_obs, state->student_t_const,
                 cfg->use_student_t_state, cfg->nu_state, N
             );
             
-            /* Stein transport */
-            kernel_replay_stein_transport<<<grid, block, 0, cs>>>(
-                state->d_h, state->d_grad_log_p, state->d_grad_v,
+            /* Stein transport with Full Newton */
+            kernel_replay_stein_transport<<<grid, block, stein_smem, cs>>>(
+                state->d_h, state->d_grad_log_p, state->d_local_hessian,
+                state->d_grad_v,
                 h_bandwidth, step_size * sqrtf(beta), rmsprop_rho, rmsprop_eps,
                 cfg->h_min, cfg->h_max, N
             );
