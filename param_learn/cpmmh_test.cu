@@ -197,7 +197,7 @@ int main(int argc, char** argv) {
      *─────────────────────────────────────────────────────────────────────────*/
     printf("Creating CPMMH state...\n");
     
-    int N_particles = 256;      /* Inner SVPF particles */
+    int N_particles = 1024;     /* Increased from 256 to prevent collapse */
     int T_max = T + 100;        /* Buffer */
     int history_cap = n_iter;   /* Store all samples */
     
@@ -210,11 +210,12 @@ int main(int argc, char** argv) {
     /* Set observations */
     cpmmh_set_observations(cpmmh, y, T);
     
-    /* Configure replay */
+    /* Configure replay - MUST match simulation model */
     SVPFReplayConfig replay_cfg = svpf_replay_config_default();
     replay_cfg.nu_obs = nu_obs;
     replay_cfg.n_stein_steps = 8;
     replay_cfg.n_anneal_steps = 3;
+    replay_cfg.use_student_t_state = 0;  /* Simulation uses Gaussian state, not Student-t */
     cpmmh_set_replay_config(cpmmh, &replay_cfg);
     
     /* Set CPMMH correlation */

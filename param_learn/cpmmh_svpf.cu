@@ -521,18 +521,21 @@ __global__ void kernel_compute_bandwidth(
 }
 
 /* Kernel: Stein transport operator with IMQ kernel + Full Newton (matches production SVPF) */
+/* Reads bandwidth from device pointer to avoid CPU-GPU sync */
+/* Added repulsion_scale parameter to prevent particle collapse in CPMMH */
 __global__ void kernel_replay_stein_transport(
     float* d_h,
     const float* d_grad_log_p,
     const float* d_local_hessian,
     float* d_grad_v,         /* RMSProp accumulator */
-    float bandwidth,
+    const float* d_bandwidth,  /* Device pointer - no sync needed */
     float step_size,
     float rmsprop_rho,
     float rmsprop_eps,
     float h_min,
     float h_max,
-    int N
+    int N,
+    float repulsion_scale    /* Scale repulsive force to prevent collapse (2.0 typical) */
 ) {
     extern __shared__ float smem[];
     float* sh_h = smem;
@@ -551,6 +554,7 @@ __global__ void kernel_replay_stein_transport(
     if (i >= N) return;
     
     float h_i = sh_h[i];
+    float bandwidth = *d_bandwidth;  /* Read from device */
     float bw_sq = bandwidth * bandwidth;
     float inv_bw_sq = 1.0f / bw_sq;
     float inv_n = 1.0f / (float)N;
@@ -583,8 +587,9 @@ __global__ void kernel_replay_stein_transport(
         /* Stein operator terms */
         k_grad_sum += K * sh_grad[j];
         
-        /* ∇_x K for IMQ: 2(x-y)/h² · K² (repulsive) */
-        gk_sum += 2.0f * diff * inv_bw_sq * K_sq;
+        /* ∇_x K for IMQ: 2(x-y)/h² · K² (repulsive) 
+         * SCALED by repulsion_scale to prevent particle collapse */
+        gk_sum += repulsion_scale * 2.0f * diff * inv_bw_sq * K_sq;
     }
     
     /* Normalize and bound Hessian */
@@ -608,7 +613,12 @@ __global__ void kernel_replay_stein_transport(
     d_h[i] = fminf(fmaxf(h_new, h_min), h_max);
 }
 
-/* Kernel: Compute log-likelihood increment */
+/* Kernel: Robust Log-Sum-Exp for Unbiased Likelihood (supervisor's corrected version)
+ * Math: log( (1/N) * sum( exp(log_w_i) ) )
+ *     = max_w + log( sum( exp(log_w_i - max_w) ) ) - log(N)
+ * 
+ * MUST be called on PREDICTIVE particles (before transport) for unbiased estimate!
+ */
 __global__ void kernel_replay_log_lik(
     const float* d_h,
     float* d_log_lik_inc,
@@ -617,37 +627,68 @@ __global__ void kernel_replay_log_lik(
     float student_t_const,
     int N
 ) {
-    __shared__ float s_sum;
+    extern __shared__ float smem[];
+    float* s_log_w = smem;
     
-    if (threadIdx.x == 0) s_sum = 0.0f;
-    __syncthreads();
+    int tid = threadIdx.x;
+    int idx = blockIdx.x * blockDim.x + tid;
     
-    float local_sum = 0.0f;
-    float y_sq = y_t * y_t;
-    
-    for (int i = threadIdx.x; i < N; i += blockDim.x) {
-        float h = d_h[i];
-        float exp_h = expf(h);
-        float z_sq = y_sq / (nu_obs * exp_h + 1e-10f);
+    /* 1. Compute log-weights for every particle */
+    float log_w = -1e20f;
+    if (idx < N) {
+        float h = d_h[idx];
+        float exp_h = __expf(h);
+        float z_sq = (y_t * y_t) / (nu_obs * exp_h + 1e-10f);
         
         /* Student-t log density */
-        float log_p = student_t_const - 0.5f * h 
-                    - 0.5f * (nu_obs + 1.0f) * logf(1.0f + z_sq);
-        
-        local_sum += log_p;
+        log_w = student_t_const - 0.5f * h 
+              - 0.5f * (nu_obs + 1.0f) * __logf(1.0f + z_sq);
     }
-    
-    atomicAdd(&s_sum, local_sum);
+    s_log_w[tid] = log_w;
     __syncthreads();
     
-    if (threadIdx.x == 0) {
-        /* Average log-likelihood (particle approximation) */
-        *d_log_lik_inc = s_sum / (float)N;
+    /* 2. Block reduce: find max weight (for numerical stability) */
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_log_w[tid] = fmaxf(s_log_w[tid], s_log_w[tid + s]);
+        }
+        __syncthreads();
+    }
+    float max_log_w = s_log_w[0];
+    __syncthreads();
+    
+    /* 3. Compute exponential residuals: exp(log_w - max) */
+    if (idx < N) {
+        float h = d_h[idx];
+        float exp_h = __expf(h);
+        float z_sq = (y_t * y_t) / (nu_obs * exp_h + 1e-10f);
+        float val = student_t_const - 0.5f * h 
+                  - 0.5f * (nu_obs + 1.0f) * __logf(1.0f + z_sq);
+        
+        s_log_w[tid] = __expf(val - max_log_w);
+    } else {
+        s_log_w[tid] = 0.0f;
+    }
+    __syncthreads();
+    
+    /* 4. Block reduce: sum exp residuals */
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_log_w[tid] += s_log_w[tid + s];
+        }
+        __syncthreads();
+    }
+    
+    /* 5. Final calculation (single thread) */
+    if (tid == 0) {
+        float sum_exp = s_log_w[0];
+        /* Result = max + log(sum) - log(N) */
+        *d_log_lik_inc = max_log_w + __logf(sum_exp) - __logf((float)N);
     }
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
- * SVPF REPLAY STEP IMPLEMENTATION
+ * SVPF REPLAY STEP IMPLEMENTATION (CORRECTED ORDER)
  *═══════════════════════════════════════════════════════════════════════════════*/
 
 float svpf_replay_step(
@@ -666,7 +707,9 @@ float svpf_replay_step(
     
     (void)y_prev;  /* Not used in basic replay */
     
-    /* 1. Predict with external noise */
+    /* ═══════════════════════════════════════════════════════════════════════
+     * STEP 1: PREDICT - Generate predictive particles h ~ p(h_t | h_{t-1})
+     * ═══════════════════════════════════════════════════════════════════════ */
     kernel_replay_predict<<<grid, block, 0, cs>>>(
         state->d_h, state->d_h_prev, d_noise_t,
         params->rho, params->mu, params->sigma_z,
@@ -674,17 +717,35 @@ float svpf_replay_step(
         cfg->use_student_t_state, cfg->nu_state, N
     );
     
-    /* 2. Compute bandwidth */
+    /* ═══════════════════════════════════════════════════════════════════════
+     * STEP 2: WEIGHT - Compute likelihood on PREDICTIVE particles
+     *         This must happen BEFORE transport to avoid bias!
+     *         Uses log-sum-exp: log((1/N) Σ exp(log_w)) = max + log(Σ exp(log_w - max)) - log(N)
+     * ═══════════════════════════════════════════════════════════════════════ */
+    size_t lse_smem = 256 * sizeof(float);  /* Shared mem for log-sum-exp reduction */
+    kernel_replay_log_lik<<<1, 256, lse_smem, cs>>>(
+        state->d_h, state->d_log_lik_inc, y_t,
+        cfg->nu_obs, state->student_t_const, N
+    );
+    
+    /* ═══════════════════════════════════════════════════════════════════════
+     * STEP 3: TRANSPORT - Move particles toward posterior for next timestep
+     *         This prepares h to be h_prev for t+1
+     *         
+     *         FIX: Use fewer, softer steps to prevent Mode Collapse.
+     *         Over-optimizing particles destroys variance needed for MCMC.
+     * ═══════════════════════════════════════════════════════════════════════ */
+    
+    /* Compute bandwidth (pass device pointer to avoid sync) */
     kernel_compute_bandwidth<<<1, 256, 0, cs>>>(state->d_h, state->d_bandwidth, N);
     
-    /* Copy bandwidth to host for kernel launch */
-    float h_bandwidth;
-    CUDA_CHECK(cudaMemcpyAsync(&h_bandwidth, state->d_bandwidth, sizeof(float), 
-                               cudaMemcpyDeviceToHost, cs));
-    CUDA_CHECK(cudaStreamSynchronize(cs));
-    
-    /* 3. Stein iterations (fixed steps, Full Newton, no SVLD noise) */
-    float step_size = 0.1f;
+    /* CPMMH-specific: Soft transport to maintain particle diversity
+     * - Fewer steps (1-2) instead of 8
+     * - Smaller step size
+     * - Higher repulsion to push particles apart */
+    int n_stein_steps = 1;      /* Reduced from cfg->n_stein_steps (8) */
+    float step_size = 0.05f;    /* Reduced from 0.1 */
+    float repulsion_scale = 2.0f; /* Boost repulsive force */
     float rmsprop_rho = 0.9f;
     float rmsprop_eps = 1e-6f;
     
@@ -692,48 +753,38 @@ float svpf_replay_step(
     size_t grad_smem = 2 * N * sizeof(float);
     size_t stein_smem = 3 * N * sizeof(float);
     
-    for (int ai = 0; ai < cfg->n_anneal_steps; ai++) {
-        /* Annealing schedule */
-        float beta = (float)(ai + 1) / (float)cfg->n_anneal_steps;
-        int n_steps = cfg->n_stein_steps / cfg->n_anneal_steps;
-        if (ai == cfg->n_anneal_steps - 1) {
-            n_steps = cfg->n_stein_steps - n_steps * (cfg->n_anneal_steps - 1);
-        }
+    for (int s = 0; s < n_stein_steps; s++) {
+        /* Gradient computation (outputs both gradient and Hessian) */
+        kernel_replay_gradient<<<grid, block, grad_smem, cs>>>(
+            state->d_h, state->d_h_prev, state->d_grad_log_p,
+            state->d_local_hessian,
+            y_t, params->rho, params->sigma_z, params->mu,
+            cfg->nu_obs, state->student_t_const,
+            cfg->use_student_t_state, cfg->nu_state, N
+        );
         
-        for (int s = 0; s < n_steps; s++) {
-            /* Gradient computation (outputs both gradient and Hessian) */
-            kernel_replay_gradient<<<grid, block, grad_smem, cs>>>(
-                state->d_h, state->d_h_prev, state->d_grad_log_p,
-                state->d_local_hessian,
-                y_t, params->rho, params->sigma_z, params->mu,
-                cfg->nu_obs, state->student_t_const,
-                cfg->use_student_t_state, cfg->nu_state, N
-            );
-            
-            /* Stein transport with Full Newton */
-            kernel_replay_stein_transport<<<grid, block, stein_smem, cs>>>(
-                state->d_h, state->d_grad_log_p, state->d_local_hessian,
-                state->d_grad_v,
-                h_bandwidth, step_size * sqrtf(beta), rmsprop_rho, rmsprop_eps,
-                cfg->h_min, cfg->h_max, N
-            );
-        }
+        /* Stein transport with Full Newton + repulsion scaling */
+        kernel_replay_stein_transport<<<grid, block, stein_smem, cs>>>(
+            state->d_h, state->d_grad_log_p, state->d_local_hessian,
+            state->d_grad_v, state->d_bandwidth,
+            step_size, rmsprop_rho, rmsprop_eps,
+            cfg->h_min, cfg->h_max, N,
+            repulsion_scale
+        );
     }
     
-    /* 4. Compute log-likelihood increment */
-    kernel_replay_log_lik<<<1, 256, 0, cs>>>(
-        state->d_h, state->d_log_lik_inc, y_t,
-        cfg->nu_obs, state->student_t_const, N
-    );
-    
-    float h_log_lik_inc;
-    CUDA_CHECK(cudaMemcpyAsync(&h_log_lik_inc, state->d_log_lik_inc, sizeof(float),
-                               cudaMemcpyDeviceToHost, cs));
-    
-    /* 5. Update h_prev for next step */
+    /* ═══════════════════════════════════════════════════════════════════════
+     * STEP 4: UPDATE - Store transported particles as h_prev for next step
+     * ═══════════════════════════════════════════════════════════════════════ */
     CUDA_CHECK(cudaMemcpyAsync(state->d_h_prev, state->d_h, N * sizeof(float),
                                cudaMemcpyDeviceToDevice, cs));
     
+    /* ═══════════════════════════════════════════════════════════════════════
+     * STEP 5: RETRIEVE - Get likelihood (single sync point at end)
+     * ═══════════════════════════════════════════════════════════════════════ */
+    float h_log_lik_inc;
+    CUDA_CHECK(cudaMemcpyAsync(&h_log_lik_inc, state->d_log_lik_inc, sizeof(float),
+                               cudaMemcpyDeviceToHost, cs));
     CUDA_CHECK(cudaStreamSynchronize(cs));
     
     return h_log_lik_inc;
