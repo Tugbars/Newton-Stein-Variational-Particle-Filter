@@ -1,28 +1,32 @@
 """
-Differentiable SVPF - Robust Parameter Estimator with Likelihood Tempering
+Differentiable SVPF - Physics-Dominant Parameter Estimator
 
 Purpose: Learn {ρ, σ_z, μ} from historical returns via backprop.
          Then freeze and feed to real-time CUDA SVPF.
 
-Key Features:
-1. Likelihood Tempering: log p / T flattens landscape WITHOUT shifting mode
-2. Repulsion Boosting: Force particle diversity (3x → 1x)  
-3. Bandwidth Floor: Prevent gradient death (min 0.5)
-4. Antithetic Sampling: Variance reduction for gradients
-5. Truncated BPTT: Window of 50 steps for memory efficiency
+Physics-Dominant Configuration:
+1. Likelihood-only tempering (Option C): 
+   - grad_log_p = grad_prior + (grad_lik / T)
+   - Weakens data fitting, preserves physics (transition dynamics)
+   - Implicit repulsion boost: when T=5, repulsion is 5× stronger relative to lik
+   
+2. Unit repulsion (repulsion_scale = 1.0):
+   - No explicit boost needed (implicit boost from tempering is enough)
+   - Prevents "double boost" failure where optimizer provides variance
+   - Forces σ_z to provide the particle spread, not artificial repulsion
 
-The Problem This Solves:
-- Without tempering, SVPF is "too good" at finding latent states for wrong params
-- Particles collapse to explain data via h*, leaving no gradient for θ
-- Result: σ_z collapses, ρ gets stuck at initialization
+3. Low Stein LR (0.02):
+   - Prevents particle "teleportation" to optimal positions
+   - Forces particles to follow the physics (transition dynamics)
 
-Why Tempering (not Noise Scaling):
-- Noise scaling: p(y | exp(h/2) * scale) SHIFTS the mode by -2*ln(scale)
-- Tempering:     p(y | h)^(1/T) PRESERVES the mode, only flattens the peak
-  
-  Proof: argmax_h [p(y|h)^(1/T)] = argmax_h [log p(y|h) / T] = argmax_h [log p(y|h)]
-  
-This is standard thermodynamic annealing (Neal 2001, Welling SGLD).
+4. Faster temperature schedule:
+   - linear_fast: T reaches 1.0 at epoch 50 (not 100)
+   - Model must face real likelihood sooner, needs σ_z to survive
+
+The Key Insight:
+- Particle spread should come from σ_z (MODEL PHYSICS)
+- NOT from artificial repulsion (OPTIMIZER TRICKS)
+- If repulsion provides variance, σ_z is free to collapse
 """
 
 import torch
@@ -82,22 +86,26 @@ class RobustSVPFEstimator(nn.Module):
     Learns: ρ (persistence), σ_z (vol-of-vol), μ (mean level)
     Fixed:  ν (Student-t df) - poorly identified, keep fixed
     
-    Key Mechanisms:
-    1. Observation noise annealing: Smooth likelihood landscape initially
-    2. Repulsion boosting: Maintain particle diversity for gradient signal
-    3. Bandwidth floor: Prevent kernel collapse
+    Key Mechanisms (Physics-Dominant Configuration):
+    1. Likelihood-only tempering: Weaken data fitting, preserve physics
+    2. Unit repulsion: Let implicit boost from tempering handle diversity
+    3. Low Stein LR: Prevent particle "teleportation"
+    4. Bandwidth floor: Prevent kernel collapse
+    
+    The goal: Particle spread should come from σ_z (model physics),
+    not from artificial repulsion (optimizer tricks).
     """
     
     def __init__(
         self,
-        n_particles: int = 128,      # Increased for robustness
-        n_stein_steps: int = 1,      # Reduced for smoother gradients
-        stein_lr: float = 0.1,
-        nu: float = 8.0,             # Fixed, not learned
-        init_rho: float = 0.85,      # Conservative initialization
+        n_particles: int = 128,
+        n_stein_steps: int = 1,
+        stein_lr: float = 0.02,      # LOW: Prevent teleportation
+        nu: float = 8.0,
+        init_rho: float = 0.85,
         init_sigma_z: float = 0.10,
         init_mu: float = -4.0,
-        bandwidth_floor: float = 0.5,  # Prevents gradient death
+        bandwidth_floor: float = 0.5,
     ):
         super().__init__()
         
@@ -350,18 +358,21 @@ def train_annealed(
     lr: float = 0.015,
     batch_size: int = 500,
     burn_in: int = 20,
-    anneal_schedule: str = 'cosine',  # 'linear', 'cosine', 'exponential'
+    anneal_schedule: str = 'linear_fast',  # Fast linear is better for physics-dominant
     temperature_start: float = 5.0,
     temperature_end: float = 1.0,
-    repulsion_start: float = 3.0,
-    repulsion_end: float = 1.0,
+    temperature_half_life: int = 30,       # Epochs to reach T≈2.5
+    repulsion_scale: float = 1.0,          # UNIT: Let implicit boost handle it
     verbose: bool = True,
 ):
     """
     Train parameter estimator with likelihood tempering.
     
-    Uses TEMPERING (not noise scaling) to smooth the likelihood landscape.
-    Tempering preserves the mode location while flattening the peak.
+    Physics-Dominant Configuration:
+    - Likelihood-only tempering (Option C): Weaken data, preserve physics
+    - Unit repulsion: Implicit boost from T>1 is enough
+    - Faster schedule: Force model to face real likelihood sooner
+    - Low Stein LR (0.02): Prevent particle teleportation
     
     Args:
         y_data: Numpy array of returns
@@ -370,9 +381,10 @@ def train_annealed(
         lr: Initial learning rate
         batch_size: Batch size for stochastic updates
         burn_in: Steps to exclude from loss
-        anneal_schedule: 'linear', 'cosine', or 'exponential'
+        anneal_schedule: 'linear_fast', 'exponential', or 'cosine'
         temperature_start/end: Tempering range (T>1 flattens likelihood)
-        repulsion_start/end: Repulsion boosting range
+        temperature_half_life: Epochs for T to decay halfway (for exponential)
+        repulsion_scale: Keep at 1.0 for physics-dominant mode
         verbose: Print progress
         
     Returns:
@@ -383,20 +395,10 @@ def train_annealed(
     T = len(y_data)
     n_batches = max(1, (T - burn_in - 10) // batch_size)
     
-    # Choose annealing function
-    if anneal_schedule == 'linear':
-        anneal_fn = linear_anneal
-    elif anneal_schedule == 'cosine':
-        anneal_fn = cosine_anneal
-    elif anneal_schedule == 'exponential':
-        anneal_fn = exponential_anneal
-    else:
-        raise ValueError(f"Unknown anneal_schedule: {anneal_schedule}")
-    
     model = RobustSVPFEstimator(
         n_particles=128,
         n_stein_steps=1,
-        stein_lr=0.1,
+        stein_lr=0.02,               # LOW: Physics-dominant
         nu=true_params.get('nu', 8.0),
         init_rho=0.85,
         init_sigma_z=0.10,
@@ -414,12 +416,13 @@ def train_annealed(
     
     if verbose:
         print(f"\n{'='*70}")
-        print("DIFFERENTIABLE SVPF - TEMPERED PARAMETER LEARNING")
+        print("DIFFERENTIABLE SVPF - PHYSICS-DOMINANT TEMPERING")
         print(f"{'='*70}")
         print(f"Data:       T={T}, batch_size={batch_size}, burn_in={burn_in}")
         print(f"Annealing:  {anneal_schedule} schedule")
         print(f"            temperature: {temperature_start:.1f} → {temperature_end:.1f}")
-        print(f"            repulsion:   {repulsion_start:.1f} → {repulsion_end:.1f}")
+        print(f"            repulsion:   {repulsion_scale:.1f} (unit, implicit boost only)")
+        print(f"            stein_lr:    0.02 (low, prevent teleportation)")
         print(f"True:       ρ={true_params['rho']:.3f}, σ_z={true_params['sigma_z']:.3f}, μ={true_params['mu']:.3f}")
         print(f"Init:       ρ={model.rho.item():.3f}, σ_z={model.sigma_z.item():.3f}, μ={model.mu.item():.3f}")
         print(f"Fixed:      ν={model.nu:.1f}")
@@ -428,10 +431,21 @@ def train_annealed(
     t0 = time()
     
     for epoch in range(n_epochs):
-        # Compute annealing factors based on progress
+        # Compute temperature based on schedule
         progress = epoch / max(n_epochs - 1, 1)
-        temperature = anneal_fn(progress, temperature_start, temperature_end)
-        repulsion_scale = anneal_fn(progress, repulsion_start, repulsion_end)
+        
+        if anneal_schedule == 'linear_fast':
+            # Linear decay, reaches T=1 at epoch 50 (halfway through)
+            temperature = max(temperature_end, 
+                            temperature_start - (temperature_start - temperature_end) * (progress * 2))
+        elif anneal_schedule == 'exponential':
+            # Exponential decay with configurable half-life
+            decay_rate = math.log(2) / temperature_half_life
+            temperature = temperature_end + (temperature_start - temperature_end) * math.exp(-decay_rate * epoch)
+        elif anneal_schedule == 'cosine':
+            temperature = cosine_anneal(progress, temperature_start, temperature_end)
+        else:
+            temperature = linear_anneal(progress, temperature_start, temperature_end)
         
         # Random batch selection
         perm = np.random.permutation(n_batches) * batch_size
@@ -450,7 +464,7 @@ def train_annealed(
                 truncate_every=50,
                 burn_in=burn_in,
                 temperature=temperature,
-                repulsion_scale=repulsion_scale,
+                repulsion_scale=repulsion_scale,  # Unit (1.0)
             )
             nll.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -481,7 +495,7 @@ def train_annealed(
                 f"ρ={p['rho']:.4f} ({true_params['rho']:.3f}) | "
                 f"σ={p['sigma_z']:.4f} ({true_params['sigma_z']:.3f}) | "
                 f"μ={p['mu']:.3f} ({true_params['mu']:.3f}) | "
-                f"T={temperature:.2f} rep={repulsion_scale:.2f}"
+                f"T={temperature:.2f}"
             )
     
     if verbose:
@@ -609,7 +623,11 @@ if __name__ == "__main__":
     y, h_true = generate_sv_data(T, **TRUE_PARAMS, seed=42)
     print(f"Data statistics: y.std={y.std():.4f}, h.mean={h_true.mean():.3f}, h.std={h_true.std():.3f}")
     
-    # Train with cosine tempering (correct approach - preserves mode)
+    # Train with physics-dominant configuration
+    # - Likelihood-only tempering (Option C)
+    # - Unit repulsion (implicit boost from T>1 is enough)
+    # - Faster schedule (linear_fast reaches T=1 at epoch 50)
+    # - Low Stein LR (0.02, prevent teleportation)
     model, history = train_annealed(
         y,
         TRUE_PARAMS,
@@ -617,11 +635,10 @@ if __name__ == "__main__":
         lr=0.015,
         batch_size=500,
         burn_in=20,
-        anneal_schedule='cosine',
-        temperature_start=5.0,   # High temp = flat likelihood, exploration
-        temperature_end=1.0,     # Low temp = sharp likelihood, exploitation
-        repulsion_start=3.0,
-        repulsion_end=1.0,
+        anneal_schedule='linear_fast',  # Reaches T=1 at epoch 50
+        temperature_start=5.0,
+        temperature_end=1.0,
+        repulsion_scale=1.0,            # Unit: let physics provide variance
         verbose=True,
     )
     
