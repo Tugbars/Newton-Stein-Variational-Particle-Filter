@@ -1,25 +1,28 @@
 """
-Differentiable SVPF - Robust Parameter Estimator with Annealing
+Differentiable SVPF - Robust Parameter Estimator with Likelihood Tempering
 
 Purpose: Learn {ρ, σ_z, μ} from historical returns via backprop.
          Then freeze and feed to real-time CUDA SVPF.
 
-Key Features (Supervisor's Recommendations):
-1. Observation Noise Annealing: Blur likelihood initially (5x → 1x)
+Key Features:
+1. Likelihood Tempering: log p / T flattens landscape WITHOUT shifting mode
 2. Repulsion Boosting: Force particle diversity (3x → 1x)  
 3. Bandwidth Floor: Prevent gradient death (min 0.5)
 4. Antithetic Sampling: Variance reduction for gradients
 5. Truncated BPTT: Window of 50 steps for memory efficiency
 
 The Problem This Solves:
-- Without annealing, SVPF is "too good" at finding latent states for wrong params
+- Without tempering, SVPF is "too good" at finding latent states for wrong params
 - Particles collapse to explain data via h*, leaving no gradient for θ
 - Result: σ_z collapses, ρ gets stuck at initialization
 
-The Solution:
-- Start with blurry likelihood (obs_noise_scale=5) → smooth landscape
-- High repulsion keeps particles spread → rich gradient signal
-- Gradually sharpen (→1.0) to lock in precise values
+Why Tempering (not Noise Scaling):
+- Noise scaling: p(y | exp(h/2) * scale) SHIFTS the mode by -2*ln(scale)
+- Tempering:     p(y | h)^(1/T) PRESERVES the mode, only flattens the peak
+  
+  Proof: argmax_h [p(y|h)^(1/T)] = argmax_h [log p(y|h) / T] = argmax_h [log p(y|h)]
+  
+This is standard thermodynamic annealing (Neal 2001, Welling SGLD).
 """
 
 import torch
@@ -199,7 +202,7 @@ class RobustSVPFEstimator(nn.Module):
         y, 
         truncate_every: int = 50,
         burn_in: int = 20,
-        obs_noise_scale: float = 1.0,
+        temperature: float = 1.0,
         repulsion_scale: float = 1.0,
     ):
         """
@@ -209,12 +212,19 @@ class RobustSVPFEstimator(nn.Module):
             y: Returns tensor [T]
             truncate_every: TBPTT window size (0 = full BPTT)
             burn_in: Steps to exclude from loss (cold start)
-            obs_noise_scale: >1.0 blurs likelihood (annealing)
+            temperature: >1.0 flattens likelihood via tempering (preserves mode!)
             repulsion_scale: >1.0 forces particle diversity
             
         Returns:
             neg_log_lik: Scalar, mean predictive NLL (after burn-in)
             vol_estimates: [T] volatility estimates
+            
+        Note on Tempering vs Noise Scaling:
+            - Noise scaling (vol * scale): SHIFTS the mode (biases μ)
+            - Tempering (log_p / T): FLATTENS the peak (preserves mode)
+            
+            We use tempering because it smooths the landscape for exploration
+            without biasing where the optimum is located.
         """
         T = y.shape[0]
         N = self.n_particles
@@ -251,24 +261,26 @@ class RobustSVPFEstimator(nn.Module):
             y_t = y[t]
             
             # ═══════════════════════════════════════════════════════════════
-            # WEIGHTING with OBSERVATION NOISE ANNEALING
-            # Scale observation noise to blur likelihood landscape
+            # WEIGHTING with LIKELIHOOD TEMPERING
+            # Temperature > 1 flattens the likelihood WITHOUT shifting mode
+            # This is the correct way to smooth for exploration
             # ═══════════════════════════════════════════════════════════════
-            vol_pred = torch.exp(h_pred / 2)
+            vol_pred = torch.exp(h_pred / 2)  # NO SCALING - preserves mode
             
-            # Annealed scale: wider target is easier to hit
-            annealed_scale = vol_pred * obs_noise_scale
-            
-            # Student-t log-likelihood
-            z = y_t / (annealed_scale + 1e-8)
+            # Standard Student-t log-likelihood
+            z = y_t / (vol_pred + 1e-8)
             log_p = (
                 self.student_t_const 
-                - torch.log(annealed_scale + 1e-8)
+                - torch.log(vol_pred + 1e-8)
                 - (self.nu + 1) / 2 * torch.log1p(z**2 / self.nu)
             )
             
+            # TEMPERING: Divide by temperature to flatten (T>1) or sharpen (T<1)
+            # Mode location is preserved, only the sharpness changes
+            log_p_tempered = log_p / temperature
+            
             # Predictive log-likelihood (before Stein transport!)
-            log_lik_t = torch.logsumexp(log_p, dim=0) - math.log(N)
+            log_lik_t = torch.logsumexp(log_p_tempered, dim=0) - math.log(N)
             log_liks.append(log_lik_t)
             
             # Store volatility estimate
@@ -287,10 +299,13 @@ class RobustSVPFEstimator(nn.Module):
             h = h_pred
             
             for _ in range(self.n_stein_steps):
-                # Gradient of log-posterior (annealed likelihood + prior)
-                vol = torch.exp(h / 2) * obs_noise_scale
+                # Gradient of STANDARD likelihood (no scaling on vol!)
+                vol = torch.exp(h / 2)
                 A = y_t**2 / (vol**2 * self.nu + 1e-8)
-                grad_lik = -0.5 + 0.5 * (self.nu + 1) * A / (1 + A)
+                grad_lik_standard = -0.5 + 0.5 * (self.nu + 1) * A / (1 + A)
+                
+                # Apply temperature to gradient (flattens without shifting)
+                grad_lik = grad_lik_standard / temperature
                 
                 grad_prior = -(h - transition_mean) / (sigma_z**2 + 1e-8)
                 grad_log_p = (grad_prior + grad_lik).clamp(-10, 10)
@@ -336,14 +351,17 @@ def train_annealed(
     batch_size: int = 500,
     burn_in: int = 20,
     anneal_schedule: str = 'cosine',  # 'linear', 'cosine', 'exponential'
-    obs_noise_start: float = 5.0,
-    obs_noise_end: float = 1.0,
+    temperature_start: float = 5.0,
+    temperature_end: float = 1.0,
     repulsion_start: float = 3.0,
     repulsion_end: float = 1.0,
     verbose: bool = True,
 ):
     """
-    Train parameter estimator with annealing.
+    Train parameter estimator with likelihood tempering.
+    
+    Uses TEMPERING (not noise scaling) to smooth the likelihood landscape.
+    Tempering preserves the mode location while flattening the peak.
     
     Args:
         y_data: Numpy array of returns
@@ -353,7 +371,7 @@ def train_annealed(
         batch_size: Batch size for stochastic updates
         burn_in: Steps to exclude from loss
         anneal_schedule: 'linear', 'cosine', or 'exponential'
-        obs_noise_start/end: Observation noise annealing range
+        temperature_start/end: Tempering range (T>1 flattens likelihood)
         repulsion_start/end: Repulsion boosting range
         verbose: Print progress
         
@@ -391,17 +409,17 @@ def train_annealed(
     
     history = {
         'nll': [], 'rho': [], 'sigma_z': [], 'mu': [],
-        'obs_noise_scale': [], 'repulsion_scale': []
+        'temperature': [], 'repulsion_scale': []
     }
     
     if verbose:
         print(f"\n{'='*70}")
-        print("DIFFERENTIABLE SVPF - ANNEALED PARAMETER LEARNING")
+        print("DIFFERENTIABLE SVPF - TEMPERED PARAMETER LEARNING")
         print(f"{'='*70}")
         print(f"Data:       T={T}, batch_size={batch_size}, burn_in={burn_in}")
         print(f"Annealing:  {anneal_schedule} schedule")
-        print(f"            obs_noise: {obs_noise_start:.1f} → {obs_noise_end:.1f}")
-        print(f"            repulsion: {repulsion_start:.1f} → {repulsion_end:.1f}")
+        print(f"            temperature: {temperature_start:.1f} → {temperature_end:.1f}")
+        print(f"            repulsion:   {repulsion_start:.1f} → {repulsion_end:.1f}")
         print(f"True:       ρ={true_params['rho']:.3f}, σ_z={true_params['sigma_z']:.3f}, μ={true_params['mu']:.3f}")
         print(f"Init:       ρ={model.rho.item():.3f}, σ_z={model.sigma_z.item():.3f}, μ={model.mu.item():.3f}")
         print(f"Fixed:      ν={model.nu:.1f}")
@@ -412,7 +430,7 @@ def train_annealed(
     for epoch in range(n_epochs):
         # Compute annealing factors based on progress
         progress = epoch / max(n_epochs - 1, 1)
-        obs_noise_scale = anneal_fn(progress, obs_noise_start, obs_noise_end)
+        temperature = anneal_fn(progress, temperature_start, temperature_end)
         repulsion_scale = anneal_fn(progress, repulsion_start, repulsion_end)
         
         # Random batch selection
@@ -431,7 +449,7 @@ def train_annealed(
                 y_batch,
                 truncate_every=50,
                 burn_in=burn_in,
-                obs_noise_scale=obs_noise_scale,
+                temperature=temperature,
                 repulsion_scale=repulsion_scale,
             )
             nll.backward()
@@ -451,7 +469,7 @@ def train_annealed(
         history['rho'].append(p['rho'])
         history['sigma_z'].append(p['sigma_z'])
         history['mu'].append(p['mu'])
-        history['obs_noise_scale'].append(obs_noise_scale)
+        history['temperature'].append(temperature)
         history['repulsion_scale'].append(repulsion_scale)
         
         # Print progress
@@ -463,7 +481,7 @@ def train_annealed(
                 f"ρ={p['rho']:.4f} ({true_params['rho']:.3f}) | "
                 f"σ={p['sigma_z']:.4f} ({true_params['sigma_z']:.3f}) | "
                 f"μ={p['mu']:.3f} ({true_params['mu']:.3f}) | "
-                f"anneal: {obs_noise_scale:.1f}x/{repulsion_scale:.1f}x"
+                f"T={temperature:.2f} rep={repulsion_scale:.2f}"
             )
     
     if verbose:
@@ -521,10 +539,10 @@ def plot_results(history, true_params, save_path='svpf_param_learning.png'):
     
     # Annealing schedule
     ax = axes[1, 1]
-    ax.plot(epochs, history['obs_noise_scale'], 'g-', linewidth=1.5, label='Obs Noise Scale')
+    ax.plot(epochs, history['temperature'], 'g-', linewidth=1.5, label='Temperature')
     ax.plot(epochs, history['repulsion_scale'], 'm-', linewidth=1.5, label='Repulsion Scale')
     ax.axhline(1.0, color='k', ls=':', alpha=0.5)
-    ax.set_title('Annealing Schedule', fontsize=12, fontweight='bold')
+    ax.set_title('Tempering Schedule', fontsize=12, fontweight='bold')
     ax.set_xlabel('Epoch')
     ax.set_ylabel('Scale Factor')
     ax.legend()
@@ -591,7 +609,7 @@ if __name__ == "__main__":
     y, h_true = generate_sv_data(T, **TRUE_PARAMS, seed=42)
     print(f"Data statistics: y.std={y.std():.4f}, h.mean={h_true.mean():.3f}, h.std={h_true.std():.3f}")
     
-    # Train with cosine annealing (smoother than linear)
+    # Train with cosine tempering (correct approach - preserves mode)
     model, history = train_annealed(
         y,
         TRUE_PARAMS,
@@ -600,8 +618,8 @@ if __name__ == "__main__":
         batch_size=500,
         burn_in=20,
         anneal_schedule='cosine',
-        obs_noise_start=5.0,
-        obs_noise_end=1.0,
+        temperature_start=5.0,   # High temp = flat likelihood, exploration
+        temperature_end=1.0,     # Low temp = sharp likelihood, exploitation
         repulsion_start=3.0,
         repulsion_end=1.0,
         verbose=True,
