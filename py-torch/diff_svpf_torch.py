@@ -1,15 +1,25 @@
 """
-Differentiable SVPF - Offline Parameter Estimator (Production Version)
+Differentiable SVPF - Robust Parameter Estimator with Annealing
 
 Purpose: Learn {ρ, σ_z, μ} from historical returns via backprop.
          Then freeze and feed to real-time CUDA SVPF.
 
-Key decisions:
-- ν (Student-t df) is FIXED (poorly identified, noisy to learn)
-- Loss: One-step-ahead predictive NLL (computed BEFORE Stein transport)
-- Truncated BPTT: Window of 50 steps for temporal credit assignment
-- Burn-in: First N steps excluded from loss (cold start bias)
-- Antithetic sampling: Variance reduction for gradients
+Key Features (Supervisor's Recommendations):
+1. Observation Noise Annealing: Blur likelihood initially (5x → 1x)
+2. Repulsion Boosting: Force particle diversity (3x → 1x)  
+3. Bandwidth Floor: Prevent gradient death (min 0.5)
+4. Antithetic Sampling: Variance reduction for gradients
+5. Truncated BPTT: Window of 50 steps for memory efficiency
+
+The Problem This Solves:
+- Without annealing, SVPF is "too good" at finding latent states for wrong params
+- Particles collapse to explain data via h*, leaving no gradient for θ
+- Result: σ_z collapses, ρ gets stuck at initialization
+
+The Solution:
+- Start with blurry likelihood (obs_noise_scale=5) → smooth landscape
+- High repulsion keeps particles spread → rich gradient signal
+- Gradually sharpen (→1.0) to lock in precise values
 """
 
 import torch
@@ -29,12 +39,23 @@ if device.type == 'cuda':
     torch.backends.cuda.matmul.allow_tf32 = True
 
 
+# =============================================================================
+# DATA GENERATION
+# =============================================================================
+
 def generate_sv_data(T, rho, sigma_z, mu, nu, seed=42):
-    """Generate synthetic SV data."""
+    """
+    Generate synthetic SV data.
+    
+    Model:
+        h_t = μ + ρ*(h_{t-1} - μ) + σ_z*ε_t    (log-volatility)
+        y_t = exp(h_t/2) * η_t                  (returns, η ~ Student-t(ν))
+    """
     np.random.seed(seed)
     h = np.zeros(T)
     y = np.zeros(T)
     
+    # Initialize from stationary distribution
     h_std = sigma_z / np.sqrt(1 - rho**2)
     h[0] = mu + h_std * np.random.randn()
     
@@ -47,34 +68,43 @@ def generate_sv_data(T, rho, sigma_z, mu, nu, seed=42):
     return y.astype(np.float32), h.astype(np.float32)
 
 
-class SVPFParamEstimator(nn.Module):
+# =============================================================================
+# ROBUST SVPF PARAMETER ESTIMATOR
+# =============================================================================
+
+class RobustSVPFEstimator(nn.Module):
     """
-    Offline parameter estimator for SVPF.
+    Differentiable SVPF for offline parameter learning.
     
-    Learns: ρ, σ_z, μ
-    Fixed:  ν (Student-t df)
+    Learns: ρ (persistence), σ_z (vol-of-vol), μ (mean level)
+    Fixed:  ν (Student-t df) - poorly identified, keep fixed
     
-    Loss: Predictive NLL = -mean(logsumexp(log p(y_t | h_pred)))
+    Key Mechanisms:
+    1. Observation noise annealing: Smooth likelihood landscape initially
+    2. Repulsion boosting: Maintain particle diversity for gradient signal
+    3. Bandwidth floor: Prevent kernel collapse
     """
     
     def __init__(
         self,
-        n_particles: int = 64,
-        n_stein_steps: int = 2,
+        n_particles: int = 128,      # Increased for robustness
+        n_stein_steps: int = 1,      # Reduced for smoother gradients
         stein_lr: float = 0.1,
-        nu: float = 8.0,  # FIXED
-        init_rho: float = 0.9,
-        init_sigma_z: float = 0.15,
-        init_mu: float = -3.5,
+        nu: float = 8.0,             # Fixed, not learned
+        init_rho: float = 0.85,      # Conservative initialization
+        init_sigma_z: float = 0.10,
+        init_mu: float = -4.0,
+        bandwidth_floor: float = 0.5,  # Prevents gradient death
     ):
         super().__init__()
         
         self.n_particles = n_particles
         self.n_stein_steps = n_stein_steps
         self.stein_lr = stein_lr
-        self.nu = nu  # Fixed, not learned
+        self.nu = nu
+        self.bandwidth_floor = bandwidth_floor
         
-        # Precompute Student-t constant (since ν is fixed)
+        # Precompute Student-t constant (ν is fixed)
         # C(ν) = lgamma((ν+1)/2) - lgamma(ν/2) - 0.5*log(ν*π)
         self.register_buffer(
             'student_t_const',
@@ -83,10 +113,10 @@ class SVPFParamEstimator(nn.Module):
             )
         )
         
-        # Learnable parameters (unconstrained space, SOFT transforms)
+        # Learnable parameters (unconstrained space with soft transforms)
         self._rho_logit = nn.Parameter(torch.tensor(self._logit(init_rho)))
         self._log_sigma = nn.Parameter(torch.tensor(math.log(init_sigma_z)))
-        self._mu = nn.Parameter(torch.tensor(init_mu))  # Unconstrained
+        self._mu = nn.Parameter(torch.tensor(init_mu))
     
     @staticmethod
     def _logit(x):
@@ -94,20 +124,21 @@ class SVPFParamEstimator(nn.Module):
     
     @property
     def rho(self):
-        """ρ ∈ (0.5, 0.999) via scaled sigmoid (smooth, no dead gradients)"""
+        """ρ ∈ (0.5, 0.999) via scaled sigmoid"""
         return 0.5 + 0.499 * torch.sigmoid(self._rho_logit)
     
     @property
     def sigma_z(self):
-        """σ_z > 0 via softplus (smooth, no dead gradients)"""
+        """σ_z > 0 via softplus"""
         return F.softplus(self._log_sigma) + 0.001
     
     @property
     def mu(self):
-        """μ unconstrained (daily log-var can be around -9 to -2)"""
+        """μ unconstrained"""
         return self._mu
     
     def get_params(self):
+        """Return current parameter estimates as dict."""
         return {
             'rho': self.rho.item(),
             'sigma_z': self.sigma_z.item(),
@@ -116,7 +147,7 @@ class SVPFParamEstimator(nn.Module):
         }
     
     def _student_t_log_prob(self, y, scale):
-        """Log p(y | scale, ν) using precomputed constant."""
+        """Log p(y | scale, ν) for Student-t observation model."""
         z = y / (scale + 1e-8)
         return (
             self.student_t_const
@@ -125,41 +156,68 @@ class SVPFParamEstimator(nn.Module):
         )
     
     def _imq_kernel(self, h, bandwidth):
-        """IMQ kernel and gradient."""
-        diff = h.unsqueeze(1) - h.unsqueeze(0)
+        """
+        Inverse Multi-Quadric kernel and its gradient.
+        
+        K(x,y) = 1 / sqrt(1 + ||x-y||²/h²)
+        ∇_x K = -(x-y) / (h² * (1 + ||x-y||²/h²)^{3/2})
+        """
+        diff = h.unsqueeze(1) - h.unsqueeze(0)  # [N, N]
         dist_sq = diff ** 2
         bw_sq = bandwidth ** 2 + 1e-8
         base = 1.0 + dist_sq / bw_sq
         
-        K = torch.rsqrt(base)
+        K = torch.rsqrt(base)  # 1/sqrt(base)
         base_sqrt = torch.sqrt(base)
         grad_K = -diff / (bw_sq * base * base_sqrt)
         
         return K, grad_K
     
-    def _stein_step(self, h, grad_log_p, bandwidth):
-        """SVGD update."""
+    def _stein_step(self, h, grad_log_p, bandwidth, repulsion_scale=1.0):
+        """
+        SVGD update with repulsion boosting.
+        
+        φ(x) = 1/n Σ_j [K(x_j, x)·∇log p(x_j) + ∇_{x_j} K(x_j, x)]
+                       └─── attraction ───┘   └─── repulsion ───┘
+        
+        repulsion_scale > 1.0 forces particles apart (prevents collapse)
+        """
         n = h.shape[0]
         K, grad_K = self._imq_kernel(h, bandwidth)
-        phi = K @ grad_log_p / n + grad_K.sum(dim=1) / n
+        
+        # Attraction: Drive particles toward high probability
+        attraction = K @ grad_log_p / n
+        
+        # Repulsion: Push particles apart (BOOSTED to prevent collapse)
+        repulsion = (grad_K.sum(dim=1) / n) * repulsion_scale
+        
+        phi = attraction + repulsion
         return h + self.stein_lr * phi
     
-    def forward(self, y, truncate_every=50, burn_in=20):
+    def forward(
+        self, 
+        y, 
+        truncate_every: int = 50,
+        burn_in: int = 20,
+        obs_noise_scale: float = 1.0,
+        repulsion_scale: float = 1.0,
+    ):
         """
-        Forward pass: run SVPF, return predictive NLL.
+        Forward pass: Run SVPF and compute predictive NLL.
         
         Args:
-            y: Returns [T]
-            truncate_every: TBPTT window size
-            burn_in: Steps to exclude from NLL (cold start bias)
+            y: Returns tensor [T]
+            truncate_every: TBPTT window size (0 = full BPTT)
+            burn_in: Steps to exclude from loss (cold start)
+            obs_noise_scale: >1.0 blurs likelihood (annealing)
+            repulsion_scale: >1.0 forces particle diversity
             
         Returns:
-            neg_log_lik: Scalar, mean predictive NLL (excluding burn-in)
+            neg_log_lik: Scalar, mean predictive NLL (after burn-in)
             vol_estimates: [T] volatility estimates
         """
         T = y.shape[0]
         N = self.n_particles
-        nu = self.nu
         
         rho = self.rho
         sigma_z = self.sigma_z
@@ -173,92 +231,209 @@ class SVPFParamEstimator(nn.Module):
         vol_estimates = []
         
         for t in range(T):
-            # Truncated BPTT
+            # Truncated BPTT: Detach to limit gradient flow
             if truncate_every > 0 and t > 0 and (t % truncate_every) == 0:
                 h = h.detach()
             
             h_prev = h
             
-            # === PREDICT with ANTITHETIC SAMPLING ===
+            # ═══════════════════════════════════════════════════════════════
+            # PREDICT with ANTITHETIC SAMPLING
             # Use (ε, -ε) pairs for variance reduction
+            # ═══════════════════════════════════════════════════════════════
             half_N = N // 2
             eps_half = torch.randn(half_N, device=y.device)
-            eps = torch.cat([eps_half, -eps_half])  # Antithetic pairs
+            eps = torch.cat([eps_half, -eps_half])
             
             h_pred = mu + rho * (h_prev - mu) + sigma_z * eps
             transition_mean = mu + rho * (h_prev - mu)
             
             y_t = y[t]
             
-            # === PREDICTIVE LOG-LIKELIHOOD (before Stein!) ===
+            # ═══════════════════════════════════════════════════════════════
+            # WEIGHTING with OBSERVATION NOISE ANNEALING
+            # Scale observation noise to blur likelihood landscape
+            # ═══════════════════════════════════════════════════════════════
             vol_pred = torch.exp(h_pred / 2)
-            log_p = self._student_t_log_prob(y_t, vol_pred)
+            
+            # Annealed scale: wider target is easier to hit
+            annealed_scale = vol_pred * obs_noise_scale
+            
+            # Student-t log-likelihood
+            z = y_t / (annealed_scale + 1e-8)
+            log_p = (
+                self.student_t_const 
+                - torch.log(annealed_scale + 1e-8)
+                - (self.nu + 1) / 2 * torch.log1p(z**2 / self.nu)
+            )
+            
+            # Predictive log-likelihood (before Stein transport!)
             log_lik_t = torch.logsumexp(log_p, dim=0) - math.log(N)
             log_liks.append(log_lik_t)
             
-            # === STEIN TRANSPORT ===
-            bw = h_pred.detach().std(unbiased=False) + 0.1
+            # Store volatility estimate
+            vol_estimates.append(vol_pred.mean())
+            
+            # ═══════════════════════════════════════════════════════════════
+            # STEIN TRANSPORT with BANDWIDTH FLOOR and REPULSION BOOST
+            # ═══════════════════════════════════════════════════════════════
+            
+            # Bandwidth floor prevents gradient death when particles collapse
+            bw = torch.max(
+                h_pred.detach().std(),
+                torch.tensor(self.bandwidth_floor, device=y.device)
+            )
+            
             h = h_pred
             
             for _ in range(self.n_stein_steps):
-                vol = torch.exp(h / 2)
-                A = y_t**2 / (vol**2 * nu + 1e-8)
-                grad_lik = -0.5 + 0.5 * (nu + 1) * A / (1 + A)
+                # Gradient of log-posterior (annealed likelihood + prior)
+                vol = torch.exp(h / 2) * obs_noise_scale
+                A = y_t**2 / (vol**2 * self.nu + 1e-8)
+                grad_lik = -0.5 + 0.5 * (self.nu + 1) * A / (1 + A)
+                
                 grad_prior = -(h - transition_mean) / (sigma_z**2 + 1e-8)
                 grad_log_p = (grad_prior + grad_lik).clamp(-10, 10)
-                h = self._stein_step(h, grad_log_p, bw)
-            
-            vol_estimates.append(torch.exp(h / 2).mean())
+                
+                # Stein step with repulsion boosting
+                h = self._stein_step(h, grad_log_p, bw, repulsion_scale=repulsion_scale)
         
-        # NLL excluding burn-in (cold start bias fix)
+        # Loss: Negative log-likelihood (excluding burn-in)
         log_liks_tensor = torch.stack(log_liks)
         neg_log_lik = -log_liks_tensor[burn_in:].mean()
         
         return neg_log_lik, torch.stack(vol_estimates)
 
 
-def train(y_data, true_params, n_epochs=50, lr=0.02, batch_size=250, burn_in=20):
-    """Train parameter estimator via NLL."""
+# =============================================================================
+# ANNEALING SCHEDULES
+# =============================================================================
+
+def linear_anneal(progress, start, end):
+    """Linear interpolation from start to end."""
+    return start + (end - start) * progress
+
+
+def cosine_anneal(progress, start, end):
+    """Cosine annealing (smoother transition)."""
+    return end + (start - end) * (1 + math.cos(math.pi * progress)) / 2
+
+
+def exponential_anneal(progress, start, end, rate=3.0):
+    """Exponential decay from start toward end."""
+    return end + (start - end) * math.exp(-rate * progress)
+
+
+# =============================================================================
+# TRAINING LOOP
+# =============================================================================
+
+def train_annealed(
+    y_data,
+    true_params,
+    n_epochs: int = 100,
+    lr: float = 0.015,
+    batch_size: int = 500,
+    burn_in: int = 20,
+    anneal_schedule: str = 'cosine',  # 'linear', 'cosine', 'exponential'
+    obs_noise_start: float = 5.0,
+    obs_noise_end: float = 1.0,
+    repulsion_start: float = 3.0,
+    repulsion_end: float = 1.0,
+    verbose: bool = True,
+):
+    """
+    Train parameter estimator with annealing.
     
+    Args:
+        y_data: Numpy array of returns
+        true_params: Dict with true parameters (for logging)
+        n_epochs: Number of training epochs
+        lr: Initial learning rate
+        batch_size: Batch size for stochastic updates
+        burn_in: Steps to exclude from loss
+        anneal_schedule: 'linear', 'cosine', or 'exponential'
+        obs_noise_start/end: Observation noise annealing range
+        repulsion_start/end: Repulsion boosting range
+        verbose: Print progress
+        
+    Returns:
+        model: Trained model
+        history: Dict of training history
+    """
     y_tensor = torch.tensor(y_data, dtype=torch.float32, device=device)
     T = len(y_data)
-    n_batches = max(1, (T - 1) // batch_size)
+    n_batches = max(1, (T - burn_in - 10) // batch_size)
     
-    model = SVPFParamEstimator(
-        n_particles=64,
-        n_stein_steps=2,
-        stein_lr=0.15,
-        nu=true_params['nu'],
+    # Choose annealing function
+    if anneal_schedule == 'linear':
+        anneal_fn = linear_anneal
+    elif anneal_schedule == 'cosine':
+        anneal_fn = cosine_anneal
+    elif anneal_schedule == 'exponential':
+        anneal_fn = exponential_anneal
+    else:
+        raise ValueError(f"Unknown anneal_schedule: {anneal_schedule}")
+    
+    model = RobustSVPFEstimator(
+        n_particles=128,
+        n_stein_steps=1,
+        stein_lr=0.1,
+        nu=true_params.get('nu', 8.0),
         init_rho=0.85,
         init_sigma_z=0.10,
-        init_mu=-4.5,
+        init_mu=-4.0,
+        bandwidth_floor=0.5,
     ).to(device)
     
     optimizer = optim.Adam(model.parameters(), lr=lr)
+    scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.97)
     
-    history = {'nll': [], 'rho': [], 'sigma_z': [], 'mu': []}
+    history = {
+        'nll': [], 'rho': [], 'sigma_z': [], 'mu': [],
+        'obs_noise_scale': [], 'repulsion_scale': []
+    }
     
-    print(f"\nTraining: {T} obs, {n_batches} batches of {batch_size}, burn_in={burn_in}")
-    print(f"True:    ρ={true_params['rho']:.3f}, σ_z={true_params['sigma_z']:.3f}, μ={true_params['mu']:.3f}")
-    print(f"Initial: ρ={model.rho.item():.3f}, σ_z={model.sigma_z.item():.3f}, μ={model.mu.item():.3f}")
-    print(f"Fixed:   ν={model.nu:.1f}")
-    print("-" * 60)
+    if verbose:
+        print(f"\n{'='*70}")
+        print("DIFFERENTIABLE SVPF - ANNEALED PARAMETER LEARNING")
+        print(f"{'='*70}")
+        print(f"Data:       T={T}, batch_size={batch_size}, burn_in={burn_in}")
+        print(f"Annealing:  {anneal_schedule} schedule")
+        print(f"            obs_noise: {obs_noise_start:.1f} → {obs_noise_end:.1f}")
+        print(f"            repulsion: {repulsion_start:.1f} → {repulsion_end:.1f}")
+        print(f"True:       ρ={true_params['rho']:.3f}, σ_z={true_params['sigma_z']:.3f}, μ={true_params['mu']:.3f}")
+        print(f"Init:       ρ={model.rho.item():.3f}, σ_z={model.sigma_z.item():.3f}, μ={model.mu.item():.3f}")
+        print(f"Fixed:      ν={model.nu:.1f}")
+        print(f"{'─'*70}")
     
     t0 = time()
     
     for epoch in range(n_epochs):
+        # Compute annealing factors based on progress
+        progress = epoch / max(n_epochs - 1, 1)
+        obs_noise_scale = anneal_fn(progress, obs_noise_start, obs_noise_end)
+        repulsion_scale = anneal_fn(progress, repulsion_start, repulsion_end)
+        
+        # Random batch selection
         perm = np.random.permutation(n_batches) * batch_size
         epoch_nll = 0.0
         n_batches_used = 0
         
-        for start in perm[:min(10, n_batches)]:
+        for start in perm[:min(10, n_batches)]:  # Limit batches per epoch
             end = min(start + batch_size, T)
-            if end - start < burn_in + 10:  # Skip too-short batches
+            if end - start < burn_in + 20:
                 continue
             y_batch = y_tensor[start:end]
             
             optimizer.zero_grad()
-            nll, _ = model(y_batch, truncate_every=50, burn_in=burn_in)
+            nll, _ = model(
+                y_batch,
+                truncate_every=50,
+                burn_in=burn_in,
+                obs_noise_scale=obs_noise_scale,
+                repulsion_scale=repulsion_scale,
+            )
             nll.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -266,63 +441,182 @@ def train(y_data, true_params, n_epochs=50, lr=0.02, batch_size=250, burn_in=20)
             epoch_nll += nll.item()
             n_batches_used += 1
         
+        # Step LR scheduler
+        scheduler.step()
+        
+        # Record history
         p = model.get_params()
-        history['nll'].append(epoch_nll / max(n_batches_used, 1))
+        avg_nll = epoch_nll / max(n_batches_used, 1)
+        history['nll'].append(avg_nll)
         history['rho'].append(p['rho'])
         history['sigma_z'].append(p['sigma_z'])
         history['mu'].append(p['mu'])
+        history['obs_noise_scale'].append(obs_noise_scale)
+        history['repulsion_scale'].append(repulsion_scale)
         
-        if (epoch + 1) % 5 == 0 or epoch == 0:
+        # Print progress
+        if verbose and ((epoch + 1) % 10 == 0 or epoch == 0):
             elapsed = time() - t0
-            print(f"Epoch {epoch+1:3d} ({elapsed:5.1f}s): NLL={history['nll'][-1]:.3f} | "
-                  f"ρ={p['rho']:.4f} ({true_params['rho']:.3f}) | "
-                  f"σ={p['sigma_z']:.4f} ({true_params['sigma_z']:.3f}) | "
-                  f"μ={p['mu']:.3f} ({true_params['mu']:.3f})")
+            print(
+                f"Epoch {epoch+1:3d} ({elapsed:5.1f}s) | "
+                f"NLL={avg_nll:.3f} | "
+                f"ρ={p['rho']:.4f} ({true_params['rho']:.3f}) | "
+                f"σ={p['sigma_z']:.4f} ({true_params['sigma_z']:.3f}) | "
+                f"μ={p['mu']:.3f} ({true_params['mu']:.3f}) | "
+                f"anneal: {obs_noise_scale:.1f}x/{repulsion_scale:.1f}x"
+            )
+    
+    if verbose:
+        print(f"{'─'*70}")
+        elapsed = time() - t0
+        print(f"Training complete in {elapsed:.1f}s")
     
     return model, history
 
 
-def plot_results(history, true_params):
-    """Plot training convergence."""
-    fig, axes = plt.subplots(2, 2, figsize=(10, 8))
+# =============================================================================
+# VISUALIZATION
+# =============================================================================
+
+def plot_results(history, true_params, save_path='svpf_param_learning.png'):
+    """Plot training convergence and annealing schedule."""
+    fig, axes = plt.subplots(2, 3, figsize=(14, 8))
     
-    axes[0, 0].plot(history['nll'])
-    axes[0, 0].set_title('Predictive NLL')
-    axes[0, 0].set_xlabel('Epoch')
+    epochs = range(1, len(history['nll']) + 1)
     
-    for ax, key, name in [
-        (axes[0, 1], 'rho', 'ρ (persistence)'),
-        (axes[1, 0], 'sigma_z', 'σ_z (vol-of-vol)'),
-        (axes[1, 1], 'mu', 'μ (mean level)'),
-    ]:
-        ax.plot(history[key], 'b-', label='Learned')
-        ax.axhline(true_params[key], color='r', ls='--', label='True')
-        ax.set_title(name)
-        ax.set_xlabel('Epoch')
-        ax.legend()
+    # NLL
+    ax = axes[0, 0]
+    ax.plot(epochs, history['nll'], 'b-', linewidth=1.5)
+    ax.set_title('Predictive NLL', fontsize=12, fontweight='bold')
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('NLL')
+    ax.grid(True, alpha=0.3)
+    
+    # ρ
+    ax = axes[0, 1]
+    ax.plot(epochs, history['rho'], 'b-', linewidth=1.5, label='Learned')
+    ax.axhline(true_params['rho'], color='r', ls='--', linewidth=2, label='True')
+    ax.set_title('ρ (Persistence)', fontsize=12, fontweight='bold')
+    ax.set_xlabel('Epoch')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    # σ_z
+    ax = axes[0, 2]
+    ax.plot(epochs, history['sigma_z'], 'b-', linewidth=1.5, label='Learned')
+    ax.axhline(true_params['sigma_z'], color='r', ls='--', linewidth=2, label='True')
+    ax.set_title('σ_z (Vol-of-Vol)', fontsize=12, fontweight='bold')
+    ax.set_xlabel('Epoch')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    # μ
+    ax = axes[1, 0]
+    ax.plot(epochs, history['mu'], 'b-', linewidth=1.5, label='Learned')
+    ax.axhline(true_params['mu'], color='r', ls='--', linewidth=2, label='True')
+    ax.set_title('μ (Mean Level)', fontsize=12, fontweight='bold')
+    ax.set_xlabel('Epoch')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    # Annealing schedule
+    ax = axes[1, 1]
+    ax.plot(epochs, history['obs_noise_scale'], 'g-', linewidth=1.5, label='Obs Noise Scale')
+    ax.plot(epochs, history['repulsion_scale'], 'm-', linewidth=1.5, label='Repulsion Scale')
+    ax.axhline(1.0, color='k', ls=':', alpha=0.5)
+    ax.set_title('Annealing Schedule', fontsize=12, fontweight='bold')
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Scale Factor')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    # Error over time
+    ax = axes[1, 2]
+    rho_err = [abs(r - true_params['rho']) for r in history['rho']]
+    sigma_err = [abs(s - true_params['sigma_z']) for s in history['sigma_z']]
+    mu_err = [abs(m - true_params['mu']) for m in history['mu']]
+    ax.semilogy(epochs, rho_err, 'b-', linewidth=1.5, label='|ρ - ρ*|')
+    ax.semilogy(epochs, sigma_err, 'g-', linewidth=1.5, label='|σ_z - σ_z*|')
+    ax.semilogy(epochs, mu_err, 'r-', linewidth=1.5, label='|μ - μ*|')
+    ax.set_title('Parameter Errors', fontsize=12, fontweight='bold')
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Absolute Error')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
     
     plt.tight_layout()
-    plt.savefig('svpf_param_learning_final.png', dpi=150)
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    print(f"Plot saved to {save_path}")
     plt.show()
 
 
-if __name__ == "__main__":
-    TRUE = {'rho': 0.95, 'sigma_z': 0.20, 'mu': -3.0, 'nu': 8.0}
-    
-    print("Generating synthetic data...")
-    y, h = generate_sv_data(5000, **TRUE)
-    print(f"Data: y.std={y.std():.4f}, h.mean={h.mean():.3f}")
-    
-    model, history = train(y, TRUE, n_epochs=50, lr=0.02, batch_size=250, burn_in=20)
-    
-    plot_results(history, TRUE)
-    
-    print("\n" + "="*50)
-    print("FINAL LEARNED PARAMETERS")
-    print("="*50)
+def print_final_results(model, true_params):
+    """Print final parameter estimates with errors."""
     p = model.get_params()
-    for k in ['rho', 'sigma_z', 'mu']:
-        err = abs(p[k] - TRUE[k])
-        print(f"  {k:8s}: {p[k]:.4f} (true: {TRUE[k]:.3f}, err: {err:.4f})")
-    print(f"  {'nu':8s}: {p['nu']:.1f} (fixed)")
     
+    print(f"\n{'='*60}")
+    print("FINAL LEARNED PARAMETERS")
+    print(f"{'='*60}")
+    print(f"{'Parameter':<12} {'Learned':>10} {'True':>10} {'Error':>10} {'Rel.Err':>10}")
+    print(f"{'-'*60}")
+    
+    for key in ['rho', 'sigma_z', 'mu']:
+        learned = p[key]
+        true = true_params[key]
+        err = abs(learned - true)
+        rel_err = err / abs(true) * 100 if true != 0 else float('inf')
+        print(f"{key:<12} {learned:>10.4f} {true:>10.4f} {err:>10.4f} {rel_err:>9.1f}%")
+    
+    print(f"{'-'*60}")
+    print(f"{'nu (fixed)':<12} {p['nu']:>10.1f}")
+    print(f"{'='*60}\n")
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+if __name__ == "__main__":
+    # True parameters (crypto-calibrated)
+    TRUE_PARAMS = {
+        'rho': 0.94,
+        'sigma_z': 0.18,
+        'mu': -3.2,
+        'nu': 8.0,
+    }
+    
+    T = 3000  # Data length
+    
+    print("Generating synthetic SV data...")
+    y, h_true = generate_sv_data(T, **TRUE_PARAMS, seed=42)
+    print(f"Data statistics: y.std={y.std():.4f}, h.mean={h_true.mean():.3f}, h.std={h_true.std():.3f}")
+    
+    # Train with cosine annealing (smoother than linear)
+    model, history = train_annealed(
+        y,
+        TRUE_PARAMS,
+        n_epochs=100,
+        lr=0.015,
+        batch_size=500,
+        burn_in=20,
+        anneal_schedule='cosine',
+        obs_noise_start=5.0,
+        obs_noise_end=1.0,
+        repulsion_start=3.0,
+        repulsion_end=1.0,
+        verbose=True,
+    )
+    
+    # Results
+    print_final_results(model, TRUE_PARAMS)
+    
+    # Plot
+    plot_results(history, TRUE_PARAMS, save_path='svpf_param_learning_annealed.png')
+    
+    # Export for CUDA SVPF
+    print("Parameters ready for CUDA SVPF:")
+    p = model.get_params()
+    print(f"  rho     = {p['rho']:.6f}f")
+    print(f"  sigma_z = {p['sigma_z']:.6f}f")
+    print(f"  mu      = {p['mu']:.6f}f")
+    print(f"  nu      = {p['nu']:.1f}f  // fixed")
