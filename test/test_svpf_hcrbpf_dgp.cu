@@ -539,7 +539,7 @@ static Metrics run_svpf_on_scenario(
         filter->use_annealing = 1;
         filter->n_anneal_steps = 5;
         filter->temperature = 0.45f;
-        filter->rmsprop_rho = 0.9f;
+        filter->rmsprop_rho = 0.7f;
         filter->rmsprop_eps = 1e-6f;
         
         filter->use_mim = 1;
