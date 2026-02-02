@@ -542,7 +542,7 @@ static Metrics run_svpf_on_scenario(
         filter->rmsprop_rho = 0.7f;
         filter->rmsprop_eps = 1e-6f;
         
-        filter->use_mim = 1;
+        filter->use_mim = 0;
         filter->mim_jump_prob = 0.25f;
         filter->mim_jump_scale = 9.0f;
         filter->use_adaptive_beta = 1;  // ON by default, set 0 for A/B test
