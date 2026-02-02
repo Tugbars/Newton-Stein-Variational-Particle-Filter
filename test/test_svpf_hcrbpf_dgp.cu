@@ -541,11 +541,7 @@ static Metrics run_svpf_on_scenario(
         filter->temperature = 0.45f;
         filter->rmsprop_rho = 0.9f;
         filter->rmsprop_eps = 1e-6f;
-
-        filter->use_asymmetric_rho = 1;
-        filter->rho_up = 0.98f;
-        filter->rho_down = 0.93f;
-
+        
         filter->use_mim = 1;
         filter->mim_jump_prob = 0.25f;
         filter->mim_jump_scale = 9.0f;
