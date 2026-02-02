@@ -283,10 +283,6 @@ static StressTestResult run_scenario(
     state->rmsprop_rho = 0.9f;
     state->rmsprop_eps = 1e-6f;
     
-    // MIM (Mixture of Invariant Measures) for mode exploration
-    state->use_mim = 1;
-    state->mim_jump_prob = 0.25f;
-    state->mim_jump_scale = 12.0f;
     state->use_adaptive_beta = 1;
     
     // Rejuvenation (particle diversity recovery)
