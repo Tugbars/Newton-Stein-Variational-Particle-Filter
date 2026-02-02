@@ -2,16 +2,16 @@
  * @file svpf_kernels.cuh
  * @brief CUDA kernel declarations for SVPF
  * 
- * This header contains kernel DECLARATIONS only.
- * Definitions are in svpf_kernels.cu, svpf_opt_kernels.cu
+ * Declarations only. Definitions in svpf_opt_kernels.cu
+ * 
+ * For Heun's method kernels, see svpf_heun_kernels.cuh
  */
 
 #ifndef SVPF_KERNELS_CUH
 #define SVPF_KERNELS_CUH
 
 #include "svpf.cuh"
-#include <cuda_runtime.h>
-#include <curand_kernel.h>
+#include "svpf_common.cuh"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -22,42 +22,15 @@
 // =============================================================================
 
 #define TILE_J 256
-#define BLOCK_SIZE 256
-#define WARP_SIZE 32
 #define SMALL_N_THRESHOLD 4096
 #define BANDWIDTH_UPDATE_INTERVAL 5
 #define MAX_T_SIZE 10000
 
 // =============================================================================
-// Kernel Declarations - Predict
+// Predict Kernels
 // =============================================================================
 
-__global__ void svpf_predict_kernel(
-    float* __restrict__ h,
-    float* __restrict__ h_prev,
-    curandStatePhilox4_32_10_t* __restrict__ rng,
-    const float* __restrict__ d_y,
-    int t,
-    float rho, float sigma_z, float mu, float gamma,
-    int use_student_t_state, float nu_state,
-    int n
-);
-
-__global__ void svpf_predict_mim_kernel(
-    float* __restrict__ h,
-    float* __restrict__ h_prev,
-    curandStatePhilox4_32_10_t* __restrict__ rng,
-    const float* __restrict__ d_y,
-    const float* __restrict__ d_h_mean,
-    int t,
-    float rho_up, float rho_down,
-    float sigma_z, float mu, float gamma,
-    float jump_prob, float jump_scale,
-    float delta_rho, float delta_sigma,
-    int use_student_t_state, float nu_state,
-    int n
-);
-
+/** @brief Guided prediction with innovation gating. Primary predict kernel. */
 __global__ void svpf_predict_guided_kernel(
     float* __restrict__ h,
     float* __restrict__ h_prev,
@@ -71,440 +44,12 @@ __global__ void svpf_predict_guided_kernel(
     float delta_rho, float delta_sigma,
     float alpha_base, float alpha_shock,
     float innovation_threshold,
-    float implied_offset,  // Student-t implied h offset (replaces hardcoded 1.27)
+    float implied_offset,
     int use_student_t_state, float nu_state,
     int n
 );
 
-// =============================================================================
-// Kernel Declarations - Gradient (Legacy, kept for reference)
-// =============================================================================
-
-__global__ void svpf_mixture_prior_grad_kernel(
-    const float* __restrict__ h,
-    const float* __restrict__ h_prev,
-    float* __restrict__ grad_prior,
-    float rho, float sigma_z, float mu,
-    int n
-);
-
-__global__ void svpf_mixture_prior_grad_tiled_kernel(
-    const float* __restrict__ h,
-    const float* __restrict__ h_prev,
-    float* __restrict__ grad_prior,
-    float rho, float sigma_z, float mu,
-    int n
-);
-
-__global__ void svpf_likelihood_only_kernel(
-    const float* __restrict__ h,
-    float* __restrict__ grad_lik,
-    float* __restrict__ log_w,
-    const float* __restrict__ d_y,
-    int t,
-    float nu, float student_t_const,
-    int n
-);
-
-__global__ void svpf_combine_gradients_kernel(
-    const float* __restrict__ grad_prior,
-    const float* __restrict__ grad_lik,
-    float* __restrict__ grad,
-    float beta,
-    int n
-);
-
-__global__ void svpf_hessian_precond_kernel(
-    const float* __restrict__ h,
-    const float* __restrict__ grad_combined,
-    float* __restrict__ precond_grad,
-    float* __restrict__ inv_hessian,
-    const float* __restrict__ d_y,
-    int t,
-    float nu, float sigma_z,
-    int n
-);
-
-// =============================================================================
-// Kernel Declarations - Reduction (Legacy)
-// =============================================================================
-
-__global__ void svpf_logsumexp_kernel(
-    const float* __restrict__ log_w,
-    float* __restrict__ d_loglik,
-    float* __restrict__ d_max_log_w,
-    int t,
-    int n
-);
-
-__global__ void svpf_bandwidth_kernel(
-    const float* __restrict__ h,
-    float* __restrict__ d_bandwidth,
-    float* __restrict__ d_bandwidth_sq,
-    float alpha,
-    int n
-);
-
-// =============================================================================
-// Kernel Declarations - Stein (Legacy)
-// =============================================================================
-
-__global__ void svpf_stein_persistent_kernel(
-    const float* __restrict__ h,
-    const float* __restrict__ grad,
-    float* __restrict__ phi,
-    const float* __restrict__ d_bandwidth,
-    int n
-);
-
-__global__ void svpf_stein_newton_persistent_kernel(
-    const float* __restrict__ h,
-    const float* __restrict__ precond_grad,
-    const float* __restrict__ inv_hessian,
-    float* __restrict__ phi,
-    const float* __restrict__ d_bandwidth,
-    int n
-);
-
-// =============================================================================
-// Kernel Declarations - Transport (Legacy)
-// =============================================================================
-
-__global__ void svpf_apply_transport_svld_kernel(
-    float* __restrict__ h,
-    const float* __restrict__ phi,
-    float* __restrict__ v,
-    curandStatePhilox4_32_10_t* __restrict__ rng_states,
-    float base_step_size,
-    float beta_anneal_factor,
-    float temperature,
-    float rho_rmsprop,
-    float epsilon,
-    int n
-);
-
-// =============================================================================
-// Kernel Declarations - Guide
-// =============================================================================
-
-__global__ void svpf_apply_guide_kernel(
-    float* __restrict__ h,
-    float guide_mean,
-    float guide_strength,
-    int n
-);
-
-__global__ void svpf_apply_guide_kernel_graph(
-    float* __restrict__ h,
-    const float* __restrict__ d_guide_mean,
-    const float* __restrict__ d_guide_strength,  // Adaptive strength from device
-    int n
-);
-
-__global__ void svpf_apply_guide_preserving_kernel(
-    float* __restrict__ h,
-    const float* __restrict__ d_h_mean,
-    float guide_mean,
-    float guide_strength,
-    int n
-);
-
-__global__ void svpf_apply_guide_preserving_kernel_graph(
-    float* __restrict__ h,
-    const float* __restrict__ d_h_mean,
-    const float* __restrict__ d_guide_mean,
-    const float* __restrict__ d_guide_strength,  // Adaptive strength from device
-    int n
-);
-
-// =============================================================================
-// Kernel Declarations - Adaptive Bandwidth (Legacy)
-// =============================================================================
-
-__global__ void svpf_adaptive_bandwidth_kernel(
-    const float* __restrict__ h,
-    float* __restrict__ d_bandwidth,
-    float* __restrict__ d_return_ema,
-    float* __restrict__ d_return_var,
-    float new_return,
-    float ema_alpha,
-    int n
-);
-
-__global__ void svpf_adaptive_bandwidth_kernel_graph(
-    const float* __restrict__ h,
-    float* __restrict__ d_bandwidth,
-    float* __restrict__ d_return_ema,
-    float* __restrict__ d_return_var,
-    const float* __restrict__ d_y,
-    int y_idx,
-    float ema_alpha,
-    int n
-);
-
-// =============================================================================
-// Kernel Declarations - Output (Legacy)
-// =============================================================================
-
-__global__ void svpf_vol_mean_opt_kernel(
-    const float* __restrict__ h,
-    float* __restrict__ d_vol,
-    int t,
-    int n
-);
-
-__global__ void svpf_store_h_mean_kernel(
-    const float* __restrict__ d_sum,
-    float* __restrict__ d_h_mean_prev,
-    int n
-);
-
-__global__ void svpf_memset_kernel(float* __restrict__ data, float val, int n);
-
-__global__ void svpf_h_mean_reduce_kernel(
-    const float* __restrict__ h,
-    float* __restrict__ d_partial_sums,
-    int n
-);
-
-__global__ void svpf_h_mean_finalize_kernel(
-    const float* __restrict__ d_partial_sums,
-    float* __restrict__ d_h_mean,
-    int n_blocks,
-    int n_particles
-);
-
-// =============================================================================
-// FUSED KERNEL DECLARATIONS (svpf_opt_kernels.cu)
-// =============================================================================
-
-__global__ void svpf_fused_gradient_kernel(
-    const float* __restrict__ h,
-    const float* __restrict__ h_prev,
-    float* __restrict__ grad_combined,
-    float* __restrict__ log_w,
-    float* __restrict__ precond_grad,
-    float* __restrict__ inv_hessian,
-    const float* __restrict__ d_y,
-    int y_idx,
-    float rho, float sigma_z, float mu,
-    float beta, float nu, float student_t_const,
-    float lik_offset,  // Likelihood center offset (only used if !use_exact_gradient)
-    float gamma,       // Leverage coefficient
-    bool use_exact_gradient,  // true = exact Student-t, false = log-squared surrogate
-    bool use_newton,
-    bool use_fan_mode,  // Fan mode: uniform weights, no annealing
-    int use_student_t_state,  // 0 = Gaussian AR(1), 1 = Student-t AR(1)
-    float nu_state,           // Degrees of freedom for state dynamics
-    int n
-);
-
-__global__ void svpf_fused_stein_transport_kernel(
-    float* __restrict__ h,
-    const float* __restrict__ grad,
-    float* __restrict__ v_rmsprop,
-    curandStatePhilox4_32_10_t* __restrict__ rng,
-    const float* __restrict__ d_bandwidth,
-    float step_size, float beta_factor, float temperature,
-    float rho_rmsprop, float epsilon,
-    int stein_sign_mode,  // 0=legacy(subtract), 1=paper(add)
-    int n
-);
-
-// Stein + Transport + KSD (computes KSD in same O(N²) pass, zero extra cost)
-__global__ void svpf_fused_stein_transport_ksd_kernel(
-    float* __restrict__ h,
-    const float* __restrict__ grad,
-    float* __restrict__ v_rmsprop,
-    curandStatePhilox4_32_10_t* __restrict__ rng,
-    const float* __restrict__ d_bandwidth,
-    float* __restrict__ d_ksd_partial,  // Output: partial KSD sums [n floats]
-    float step_size, float beta_factor, float temperature,
-    float rho_rmsprop, float epsilon,
-    int stein_sign_mode,  // 0=legacy(subtract), 1=paper(add)
-    int n
-);
-
-__global__ void svpf_fused_stein_transport_newton_kernel(
-    float* __restrict__ h,
-    const float* __restrict__ precond_grad,
-    const float* __restrict__ inv_hessian,
-    float* __restrict__ v_rmsprop,
-    curandStatePhilox4_32_10_t* __restrict__ rng,
-    const float* __restrict__ d_bandwidth,
-    float step_size, float beta_factor, float temperature,
-    float rho_rmsprop, float epsilon,
-    int stein_sign_mode,  // 0=legacy(subtract), 1=paper(add)
-    int n
-);
-
-// Newton + KSD variant
-__global__ void svpf_fused_stein_transport_newton_ksd_kernel(
-    float* __restrict__ h,
-    const float* __restrict__ precond_grad,
-    const float* __restrict__ inv_hessian,
-    float* __restrict__ v_rmsprop,
-    curandStatePhilox4_32_10_t* __restrict__ rng,
-    const float* __restrict__ d_bandwidth,
-    float* __restrict__ d_ksd_partial,  // Output: partial KSD sums [n floats]
-    float step_size, float beta_factor, float temperature,
-    float rho_rmsprop, float epsilon,
-    int stein_sign_mode,  // 0=legacy(subtract), 1=paper(add)
-    int n
-);
-
-// Full Newton with kernel-weighted Hessian (Detommaso et al. 2018)
-__global__ void svpf_fused_stein_transport_full_newton_kernel(
-    float* __restrict__ h,
-    const float* __restrict__ grad,           // Raw combined gradient
-    const float* __restrict__ local_hessian,  // Local curvature (NOT inverted)
-    float* __restrict__ v_rmsprop,
-    curandStatePhilox4_32_10_t* __restrict__ rng,
-    const float* __restrict__ d_bandwidth,
-    float step_size, float beta_factor, float temperature,
-    float rho_rmsprop, float epsilon,
-    int stein_sign_mode,  // 0=legacy(subtract), 1=paper(add)
-    int n
-);
-
-// Full Newton with KSD computation
-__global__ void svpf_fused_stein_transport_full_newton_ksd_kernel(
-    float* __restrict__ h,
-    const float* __restrict__ grad,
-    const float* __restrict__ local_hessian,
-    float* __restrict__ v_rmsprop,
-    curandStatePhilox4_32_10_t* __restrict__ rng,
-    const float* __restrict__ d_bandwidth,
-    float* __restrict__ d_ksd_partial,
-    float step_size, float beta_factor, float temperature,
-    float rho_rmsprop, float epsilon,
-    int stein_sign_mode,
-    int n
-);
-
-__global__ void svpf_fused_outputs_kernel(
-    const float* __restrict__ h,
-    const float* __restrict__ log_w,
-    const float* __restrict__ d_bandwidth_in,  // Read bandwidth for packing
-    const float* __restrict__ d_ksd_in,        // Read KSD for packing
-    float* __restrict__ d_loglik,
-    float* __restrict__ d_vol,
-    float* __restrict__ d_h_mean,
-    float* __restrict__ d_output_pack,         // Packed output [5 floats]
-    int t_out, int n
-);
-
-__global__ void svpf_fused_bandwidth_kernel(
-    const float* __restrict__ h,
-    const float* __restrict__ d_y,
-    float* __restrict__ d_bandwidth,
-    float* __restrict__ d_bandwidth_sq,
-    float* __restrict__ d_return_ema,
-    float* __restrict__ d_return_var,
-    int y_idx, float alpha_bw, float alpha_ret, int n
-);
-
-// =============================================================================
-// KSD REDUCTION KERNEL
-// =============================================================================
-// Reduces partial KSD sums to final KSD value
-// KSD = sqrt((1/N²) * Σᵢ partial[i])
-
-__global__ void svpf_ksd_reduce_kernel(
-    const float* __restrict__ d_ksd_partial,
-    float* __restrict__ d_ksd,
-    int n
-);
-
-// =============================================================================
-// PARTIAL REJUVENATION KERNEL (Maken et al. 2022)
-// =============================================================================
-// When KSD stays high (particles stuck at boundary), nudge a fraction toward
-// the EKF guide prediction. This helps particles escape local modes.
-
-__global__ void svpf_partial_rejuvenation_kernel(
-    float* __restrict__ h,
-    float guide_mean,
-    float guide_std,
-    float rejuv_prob,       // Probability of rejuvenating each particle (e.g., 0.3)
-    float blend_factor,     // How much to blend toward guide (e.g., 0.3)
-    curandStatePhilox4_32_10_t* __restrict__ rng,
-    int n
-);
-
-// =============================================================================
-// HEUN'S METHOD KERNELS (svpf_opt_kernels.cu)
-// =============================================================================
-// Heun's method (improved Euler) for 2nd order accuracy
-
-// Compute Stein operator φ(h) without transport
-__global__ void svpf_stein_operator_kernel(
-    const float* __restrict__ h,
-    const float* __restrict__ grad,
-    float* __restrict__ phi_out,
-    const float* __restrict__ d_bandwidth,
-    int stein_sign_mode,
-    int n
-);
-
-// Stein operator with Full Newton preconditioning
-__global__ void svpf_stein_operator_full_newton_kernel(
-    const float* __restrict__ h,
-    const float* __restrict__ grad,
-    const float* __restrict__ local_hessian,
-    float* __restrict__ phi_out,
-    const float* __restrict__ d_bandwidth,
-    int stein_sign_mode,
-    int n
-);
-
-// Heun predictor: h̃ = h_orig + ε·φ (no noise)
-__global__ void svpf_heun_predictor_kernel(
-    float* __restrict__ h,
-    const float* __restrict__ h_orig,
-    const float* __restrict__ phi,
-    const float* __restrict__ v_rmsprop,
-    float step_size,
-    float beta_factor,
-    float epsilon,
-    int n
-);
-
-// Heun corrector: h = h_orig + (ε/2)·(φ₁ + φ₂) + noise
-__global__ void svpf_heun_corrector_kernel(
-    float* __restrict__ h,
-    const float* __restrict__ h_orig,
-    const float* __restrict__ phi_orig,
-    const float* __restrict__ phi_pred,
-    float* __restrict__ v_rmsprop,
-    curandStatePhilox4_32_10_t* __restrict__ rng,
-    float step_size,
-    float beta_factor,
-    float temperature,
-    float rho_rmsprop,
-    float epsilon,
-    int n
-);
-
-// Heun corrector with KSD computation
-__global__ void svpf_heun_corrector_ksd_kernel(
-    float* __restrict__ h,
-    const float* __restrict__ h_orig,
-    const float* __restrict__ phi_orig,
-    const float* __restrict__ phi_pred,
-    const float* __restrict__ grad,
-    float* __restrict__ v_rmsprop,
-    curandStatePhilox4_32_10_t* __restrict__ rng,
-    const float* __restrict__ d_bandwidth,
-    float* __restrict__ d_ksd_partial,
-    float step_size,
-    float beta_factor,
-    float temperature,
-    float rho_rmsprop,
-    float epsilon,
-    int n
-);
-
+/** @brief Antithetic sampling variant. Launch with n/2 threads. */
 __global__ void svpf_predict_guided_antithetic_kernel(
     float* __restrict__ h,
     float* __restrict__ h_prev,
@@ -524,7 +69,282 @@ __global__ void svpf_predict_guided_antithetic_kernel(
 );
 
 // =============================================================================
-// Host-side Helper (inline - safe in header)
+// Guide Kernels
+// =============================================================================
+
+/** @brief Apply guide (contracts distribution toward mean). */
+__global__ void svpf_apply_guide_kernel(
+    float* __restrict__ h,
+    float guide_mean,
+    float guide_strength,
+    int n
+);
+
+/** @brief Apply guide with device pointers (for CUDA graphs). */
+__global__ void svpf_apply_guide_kernel_graph(
+    float* __restrict__ h,
+    const float* __restrict__ d_guide_mean,
+    const float* __restrict__ d_guide_strength,
+    int n
+);
+
+/** @brief Variance-preserving guide (shifts mean, keeps spread). */
+__global__ void svpf_apply_guide_preserving_kernel(
+    float* __restrict__ h,
+    const float* __restrict__ d_h_mean,
+    float guide_mean,
+    float guide_strength,
+    int n
+);
+
+/** @brief Variance-preserving guide with device pointers (for CUDA graphs). */
+__global__ void svpf_apply_guide_preserving_kernel_graph(
+    float* __restrict__ h,
+    const float* __restrict__ d_h_mean,
+    const float* __restrict__ d_guide_mean,
+    const float* __restrict__ d_guide_strength,
+    int n
+);
+
+// =============================================================================
+// Fused Gradient Kernel
+// =============================================================================
+
+/** @brief Fused prior + likelihood + combine + optional Hessian. */
+__global__ void svpf_fused_gradient_kernel(
+    const float* __restrict__ h,
+    const float* __restrict__ h_prev,
+    float* __restrict__ grad_combined,
+    float* __restrict__ log_w,
+    float* __restrict__ precond_grad,
+    float* __restrict__ inv_hessian,
+    const float* __restrict__ d_y,
+    int y_idx,
+    float rho, float sigma_z, float mu,
+    float beta, float nu, float student_t_const,
+    float lik_offset,
+    float gamma,
+    bool use_exact_gradient,
+    bool use_newton,
+    bool use_fan_mode,
+    int use_student_t_state,
+    float nu_state,
+    int n
+);
+
+// =============================================================================
+// Fused Stein + Transport Kernels
+// =============================================================================
+
+/** @brief Vanilla SVGD (no Newton). use_newton=0, use_full_newton=0 */
+__global__ void svpf_fused_stein_transport_kernel(
+    float* __restrict__ h,
+    const float* __restrict__ grad,
+    float* __restrict__ v_rmsprop,
+    curandStatePhilox4_32_10_t* __restrict__ rng,
+    const float* __restrict__ d_bandwidth,
+    float step_size, float beta_factor, float temperature,
+    float rho_rmsprop, float epsilon,
+    int stein_sign_mode,
+    int n
+);
+
+/** @brief Vanilla SVGD + KSD computation. */
+__global__ void svpf_fused_stein_transport_ksd_kernel(
+    float* __restrict__ h,
+    const float* __restrict__ grad,
+    float* __restrict__ v_rmsprop,
+    curandStatePhilox4_32_10_t* __restrict__ rng,
+    const float* __restrict__ d_bandwidth,
+    float* __restrict__ d_ksd_partial,
+    float step_size, float beta_factor, float temperature,
+    float rho_rmsprop, float epsilon,
+    int stein_sign_mode,
+    int n
+);
+
+/** @brief Basic Newton (local Hessian). use_newton=1, use_full_newton=0 */
+__global__ void svpf_fused_stein_transport_newton_kernel(
+    float* __restrict__ h,
+    const float* __restrict__ precond_grad,
+    const float* __restrict__ inv_hessian,
+    float* __restrict__ v_rmsprop,
+    curandStatePhilox4_32_10_t* __restrict__ rng,
+    const float* __restrict__ d_bandwidth,
+    float step_size, float beta_factor, float temperature,
+    float rho_rmsprop, float epsilon,
+    int stein_sign_mode,
+    int n
+);
+
+/** @brief Basic Newton + KSD computation. */
+__global__ void svpf_fused_stein_transport_newton_ksd_kernel(
+    float* __restrict__ h,
+    const float* __restrict__ precond_grad,
+    const float* __restrict__ inv_hessian,
+    float* __restrict__ v_rmsprop,
+    curandStatePhilox4_32_10_t* __restrict__ rng,
+    const float* __restrict__ d_bandwidth,
+    float* __restrict__ d_ksd_partial,
+    float step_size, float beta_factor, float temperature,
+    float rho_rmsprop, float epsilon,
+    int stein_sign_mode,
+    int n
+);
+
+/** @brief Full Newton (Detommaso 2018). use_newton=1, use_full_newton=1 */
+__global__ void svpf_fused_stein_transport_full_newton_kernel(
+    float* __restrict__ h,
+    const float* __restrict__ grad,
+    const float* __restrict__ local_hessian,
+    float* __restrict__ v_rmsprop,
+    curandStatePhilox4_32_10_t* __restrict__ rng,
+    const float* __restrict__ d_bandwidth,
+    float step_size, float beta_factor, float temperature,
+    float rho_rmsprop, float epsilon,
+    int stein_sign_mode,
+    int n
+);
+
+/** @brief Full Newton + KSD computation. */
+__global__ void svpf_fused_stein_transport_full_newton_ksd_kernel(
+    float* __restrict__ h,
+    const float* __restrict__ grad,
+    const float* __restrict__ local_hessian,
+    float* __restrict__ v_rmsprop,
+    curandStatePhilox4_32_10_t* __restrict__ rng,
+    const float* __restrict__ d_bandwidth,
+    float* __restrict__ d_ksd_partial,
+    float step_size, float beta_factor, float temperature,
+    float rho_rmsprop, float epsilon,
+    int stein_sign_mode,
+    int n
+);
+
+// =============================================================================
+// KSD + Rejuvenation
+// =============================================================================
+
+/** @brief Reduce partial KSD sums to final KSD value. */
+__global__ void svpf_ksd_reduce_kernel(
+    const float* __restrict__ d_ksd_partial,
+    float* __restrict__ d_ksd,
+    int n
+);
+
+/** @brief Partial rejuvenation (Maken et al. 2022). Nudges stuck particles toward guide. */
+__global__ void svpf_partial_rejuvenation_kernel(
+    float* __restrict__ h,
+    float guide_mean,
+    float guide_std,
+    float rejuv_prob,
+    float blend_factor,
+    curandStatePhilox4_32_10_t* __restrict__ rng,
+    int n
+);
+
+// =============================================================================
+// Output Kernels
+// =============================================================================
+
+/** @brief Fused bandwidth computation with adaptive scaling. */
+__global__ void svpf_fused_bandwidth_kernel(
+    const float* __restrict__ h,
+    const float* __restrict__ d_y,
+    float* __restrict__ d_bandwidth,
+    float* __restrict__ d_bandwidth_sq,
+    float* __restrict__ d_return_ema,
+    float* __restrict__ d_return_var,
+    int y_idx, float alpha_bw, float alpha_ret, int n
+);
+
+/** @brief Fused output computation (logsumexp + vol + h_mean + packing). */
+__global__ void svpf_fused_outputs_kernel(
+    const float* __restrict__ h,
+    const float* __restrict__ log_w,
+    const float* __restrict__ d_bandwidth_in,
+    const float* __restrict__ d_ksd_in,
+    float* __restrict__ d_loglik,
+    float* __restrict__ d_vol,
+    float* __restrict__ d_h_mean,
+    float* __restrict__ d_output_pack,
+    int t_out, int n
+);
+
+// =============================================================================
+// Heun's Method Kernels (2nd-order integrator)
+// =============================================================================
+
+/** @brief Compute Stein operator φ(h) without transport. */
+__global__ void svpf_stein_operator_kernel(
+    const float* __restrict__ h,
+    const float* __restrict__ grad,
+    float* __restrict__ phi_out,
+    const float* __restrict__ d_bandwidth,
+    int stein_sign_mode,
+    int n
+);
+
+/** @brief Stein operator with Full Newton preconditioning. */
+__global__ void svpf_stein_operator_full_newton_kernel(
+    const float* __restrict__ h,
+    const float* __restrict__ grad,
+    const float* __restrict__ local_hessian,
+    float* __restrict__ phi_out,
+    const float* __restrict__ d_bandwidth,
+    int stein_sign_mode,
+    int n
+);
+
+/** @brief Heun predictor: h̃ = h_orig + ε·φ (no noise). */
+__global__ void svpf_heun_predictor_kernel(
+    float* __restrict__ h,
+    const float* __restrict__ h_orig,
+    const float* __restrict__ phi,
+    const float* __restrict__ v_rmsprop,
+    float step_size,
+    float beta_factor,
+    float epsilon,
+    int n
+);
+
+/** @brief Heun corrector: h = h_orig + (ε/2)·(φ₁ + φ₂) + noise. */
+__global__ void svpf_heun_corrector_kernel(
+    float* __restrict__ h,
+    const float* __restrict__ h_orig,
+    const float* __restrict__ phi_orig,
+    const float* __restrict__ phi_pred,
+    float* __restrict__ v_rmsprop,
+    curandStatePhilox4_32_10_t* __restrict__ rng,
+    float step_size,
+    float beta_factor,
+    float temperature,
+    float rho_rmsprop,
+    float epsilon,
+    int n
+);
+
+/** @brief Heun corrector with KSD computation. */
+__global__ void svpf_heun_corrector_ksd_kernel(
+    float* __restrict__ h,
+    const float* __restrict__ h_orig,
+    const float* __restrict__ phi_orig,
+    const float* __restrict__ phi_pred,
+    const float* __restrict__ grad,
+    float* __restrict__ v_rmsprop,
+    curandStatePhilox4_32_10_t* __restrict__ rng,
+    const float* __restrict__ d_bandwidth,
+    float* __restrict__ d_ksd_partial,
+    float step_size,
+    float beta_factor,
+    float temperature,
+    float rho_rmsprop,
+    float epsilon,
+    int n
+);
+
+// =============================================================================
+// Host-side EKF Helper
 // =============================================================================
 
 static inline void svpf_ekf_update(
@@ -542,8 +362,6 @@ static inline void svpf_ekf_update(
     float P_pred = p->rho * p->rho * state->guide_var + p->sigma_z * p->sigma_z;
     
     float log_y2 = logf(y_t * y_t + 1e-8f);
-    // Observation model: log(y²) = h + E[log(ε²)]
-    // For Student-t: E[log(y²)|h] = h - student_t_implied_offset
     float obs_offset = -state->student_t_implied_offset;
     float obs_var = 4.93f + 2.0f;
     

@@ -40,42 +40,6 @@
 
 // Forward declarations
 static void svpf_optimized_init(SVPFOptimizedState* opt, int n);
-// =============================================================================
-// BASIC UTILITY KERNELS
-// =============================================================================
-
-__global__ void svpf_init_rng_kernel(
-    curandStatePhilox4_32_10_t* states,
-    int n,
-    unsigned long long seed
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        curand_init(seed, idx, 0, &states[idx]);
-    }
-}
-
-__global__ void svpf_init_particles_kernel(
-    float* h,
-    curandStatePhilox4_32_10_t* rng_states,
-    float mu,
-    float stationary_std,
-    int n
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        float z = curand_normal(&rng_states[idx]);
-        float h_new = mu + stationary_std * z;
-        h[idx] = fminf(fmaxf(h_new, SVPF_H_MIN), SVPF_H_MAX);
-    }
-}
-
-__global__ void svpf_copy_kernel(const float* src, float* dst, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        dst[idx] = src[idx];
-    }
-}
 
 // =============================================================================
 // STATE MANAGEMENT: Create

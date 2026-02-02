@@ -16,108 +16,39 @@
 #include <stdio.h>
 
 // =============================================================================
-// Device Helpers
+// Basic Utility Kernels (definitions)
 // =============================================================================
 
-__device__ __forceinline__ float clamp_logvol(float h) {
-    return fminf(fmaxf(h, -15.0f), 5.0f);
-}
-
-__device__ __forceinline__ float safe_exp(float x) {
-    return __expf(fminf(x, 20.0f));
-}
-
-// Sample from Student-t distribution via ratio of Gaussian to sqrt(Chi-squared/nu)
-// For small nu (5-7), this is ~5-7 extra curand_normal calls per particle - negligible
-// Note: This implementation assumes integer nu. For nu > 30, Student-t ≈ Gaussian.
-__device__ __forceinline__ float sample_student_t(curandStatePhilox4_32_10_t* rng, float nu) {
-    // Large nu: Student-t converges to Gaussian
-    if (nu > 30.0f) {
-        return curand_normal(rng);
+__global__ void svpf_init_rng_kernel(
+    curandStatePhilox4_32_10_t* states,
+    int n,
+    unsigned long long seed
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        curand_init(seed, idx, 0, &states[idx]);
     }
-    
-    float z = curand_normal(rng);
-    
-    // Chi-squared(nu) via sum of nu squared standard normals
-    // Rounded to nearest integer - use integer nu for correctness
-    int nu_int = (int)(nu + 0.5f);
-    nu_int = max(nu_int, 3);  // Safety floor
-    
-    float chi2 = 0.0f;
-    #pragma unroll 8
-    for (int i = 0; i < nu_int; i++) {
-        float u = curand_normal(rng);
-        chi2 += u * u;
+}
+
+__global__ void svpf_init_particles_kernel(
+    float* h,
+    curandStatePhilox4_32_10_t* rng_states,
+    float mu,
+    float stationary_std,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float z = curand_normal(&rng_states[idx]);
+        h[idx] = clamp_logvol(mu + stationary_std * z);
     }
-    
-    // t = z / sqrt(chi2 / nu) = z * sqrt(nu / chi2)
-    return z * sqrtf((float)nu_int / (chi2 + 1e-8f));
 }
 
-__device__ __forceinline__ float warp_reduce_sum(float val) {
-    #pragma unroll
-    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
-        val += __shfl_down_sync(0xffffffff, val, offset);
+__global__ void svpf_copy_kernel(const float* src, float* dst, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        dst[idx] = src[idx];
     }
-    return val;
-}
-
-__device__ __forceinline__ float warp_reduce_max(float val) {
-    #pragma unroll
-    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
-        val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));
-    }
-    return val;
-}
-
-__device__ __forceinline__ float warp_reduce_min(float val) {
-    #pragma unroll
-    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
-        val = fminf(val, __shfl_down_sync(0xffffffff, val, offset));
-    }
-    return val;
-}
-
-__device__ float block_reduce_sum(float val) {
-    __shared__ float warp_sums[BLOCK_SIZE / WARP_SIZE];
-    int lane = threadIdx.x % WARP_SIZE;
-    int wid = threadIdx.x / WARP_SIZE;
-    
-    val = warp_reduce_sum(val);
-    if (lane == 0) warp_sums[wid] = val;
-    __syncthreads();
-    
-    val = (threadIdx.x < BLOCK_SIZE / WARP_SIZE) ? warp_sums[threadIdx.x] : 0.0f;
-    if (wid == 0) val = warp_reduce_sum(val);
-    return val;
-}
-
-__device__ float block_reduce_min(float val) {
-    __shared__ float warp_vals[BLOCK_SIZE / WARP_SIZE];
-    int lane = threadIdx.x % WARP_SIZE;
-    int wid = threadIdx.x / WARP_SIZE;
-    
-    val = warp_reduce_min(val);
-    if (lane == 0) warp_vals[wid] = val;
-    __syncthreads();
-    
-    val = (threadIdx.x < BLOCK_SIZE / WARP_SIZE) ? warp_vals[threadIdx.x] : 1e10f;
-    if (wid == 0) val = warp_reduce_min(val);
-    return val;
-}
-
-__device__ float block_reduce_max(float val) {
-    __shared__ float warp_vals[BLOCK_SIZE / WARP_SIZE];
-    int lane = threadIdx.x % WARP_SIZE;
-    int wid = threadIdx.x / WARP_SIZE;
-    
-    val = warp_reduce_max(val);
-    if (lane == 0) warp_vals[wid] = val;
-    __syncthreads();
-    
-    val = (threadIdx.x < BLOCK_SIZE / WARP_SIZE) ? warp_vals[threadIdx.x] : -1e10f;
-    if (wid == 0) val = warp_reduce_max(val);
-    return val;
 }
 
 __global__ void svpf_predict_guided_kernel(
