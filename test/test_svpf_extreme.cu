@@ -334,12 +334,12 @@ static StressTestResult run_scenario(
     
     // KSD-based Adaptive Stein Steps
     state->stein_min_steps = 16;
-    state->stein_max_steps = 16;
+    state->stein_max_steps = 32;
     state->ksd_improvement_threshold = 0.05f;
     
     // Student-t state dynamics (fat tails)
     state->use_student_t_state = 1;
-    state->nu_state = 3.0f;
+    state->nu_state = 2.5f;
     
     // Smoothing (1-tick lag for cleaner output)
     state->use_smoothing = 1;
@@ -349,7 +349,11 @@ static StressTestResult run_scenario(
     // Persistent kernel (launch optimization)
     state->use_persistent_kernel = 1;
 
-    state->use_heun = 1;
+    state->use_adaptive_anneal = 1; // Already default
+    state->anneal_kl_threshold = 0.9f;
+    state->anneal_steps_per_beta = 5;
+
+   // state->use_heun = 1;
     
     // =========================================================================
     
