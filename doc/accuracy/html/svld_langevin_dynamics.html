@@ -1,0 +1,760 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SVLD: Stein Variational Langevin Dynamics</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+    <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+    <style>
+        :root {
+            --primary: #1a1a2e;
+            --secondary: #16213e;
+            --accent: #00897b;
+            --accent-light: #4db6ac;
+            --svgd-color: #e65100;
+            --svld-color: #00897b;
+            --text: #2d2d2d;
+            --light: #f8f9fa;
+            --border: #dee2e6;
+        }
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Computer Modern Serif', 'Times New Roman', Times, serif;
+            font-size: 11pt;
+            line-height: 1.6;
+            color: var(--text);
+            background: white;
+            max-width: 850px;
+            margin: 0 auto;
+            padding: 40px 20px;
+        }
+        
+        .title-block {
+            text-align: center;
+            margin-bottom: 40px;
+            padding-bottom: 30px;
+            border-bottom: 1px solid var(--border);
+        }
+        
+        h1 {
+            font-size: 22pt;
+            font-weight: normal;
+            margin-bottom: 20px;
+            line-height: 1.3;
+        }
+        
+        .subtitle {
+            font-size: 12pt;
+            color: #666;
+            font-style: italic;
+        }
+        
+        .date {
+            font-size: 10pt;
+            color: #888;
+            margin-top: 15px;
+        }
+        
+        h2 {
+            font-size: 14pt;
+            font-weight: bold;
+            margin: 35px 0 15px 0;
+            color: var(--primary);
+        }
+        
+        h3 {
+            font-size: 12pt;
+            font-weight: bold;
+            margin: 25px 0 10px 0;
+            color: var(--secondary);
+        }
+        
+        p {
+            margin-bottom: 12px;
+            text-align: justify;
+            hyphens: auto;
+        }
+        
+        .equation {
+            margin: 20px 0;
+            text-align: center;
+            font-size: 11pt;
+        }
+        
+        .figure {
+            margin: 30px 0;
+            text-align: center;
+        }
+        
+        .figure-content {
+            background: #fafafa;
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            padding: 20px;
+            display: inline-block;
+        }
+        
+        .figure-caption {
+            font-size: 10pt;
+            color: #555;
+            margin-top: 15px;
+            max-width: 700px;
+            margin-left: auto;
+            margin-right: auto;
+        }
+        
+        .figure-caption strong {
+            color: var(--text);
+        }
+        
+        /* Problem box */
+        .problem {
+            background: #fff3e0;
+            border: 1px solid #ffca28;
+            border-radius: 4px;
+            padding: 15px 20px;
+            margin: 20px 0;
+        }
+        
+        .problem-title {
+            font-weight: bold;
+            color: #e65100;
+            margin-bottom: 8px;
+        }
+        
+        /* Solution box */
+        .solution {
+            background: #e0f2f1;
+            border: 1px solid #4db6ac;
+            border-radius: 4px;
+            padding: 15px 20px;
+            margin: 20px 0;
+        }
+        
+        .solution-title {
+            font-weight: bold;
+            color: #00695c;
+            margin-bottom: 8px;
+        }
+        
+        /* Insight box */
+        .insight {
+            background: linear-gradient(135deg, #e0f2f1 0%, #b2dfdb 100%);
+            border: 2px solid var(--accent);
+            border-radius: 8px;
+            padding: 20px;
+            margin: 25px 0;
+        }
+        
+        .insight-title {
+            font-weight: bold;
+            color: #00695c;
+            margin-bottom: 10px;
+            font-size: 12pt;
+        }
+        
+        /* Comparison panels */
+        .comparison-row {
+            display: flex;
+            gap: 20px;
+            margin: 25px 0;
+            flex-wrap: wrap;
+        }
+        
+        .comparison-panel {
+            flex: 1;
+            min-width: 300px;
+            border-radius: 10px;
+            padding: 20px;
+        }
+        
+        .panel-svgd {
+            background: linear-gradient(135deg, #fff3e0 0%, #ffe0b2 100%);
+            border: 2px solid var(--svgd-color);
+        }
+        
+        .panel-svld {
+            background: linear-gradient(135deg, #e0f2f1 0%, #b2dfdb 100%);
+            border: 2px solid var(--svld-color);
+        }
+        
+        .panel-title {
+            font-weight: bold;
+            font-size: 13pt;
+            margin-bottom: 12px;
+        }
+        
+        .panel-svgd .panel-title { color: var(--svgd-color); }
+        .panel-svld .panel-title { color: var(--svld-color); }
+        
+        ul, ol {
+            margin: 15px 0 15px 30px;
+        }
+        
+        li {
+            margin-bottom: 8px;
+        }
+        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+            font-size: 10pt;
+        }
+        
+        th, td {
+            padding: 10px 15px;
+            border: 1px solid var(--border);
+            text-align: center;
+        }
+        
+        th {
+            background: var(--light);
+            font-weight: bold;
+        }
+        
+        .references {
+            font-size: 10pt;
+            margin-top: 40px;
+            padding-top: 20px;
+            border-top: 1px solid var(--border);
+        }
+        
+        .references h2 {
+            font-size: 12pt;
+        }
+        
+        .references ol {
+            margin-left: 20px;
+        }
+        
+        .footer {
+            margin-top: 50px;
+            padding-top: 20px;
+            border-top: 1px solid var(--border);
+            font-size: 9pt;
+            color: #888;
+            text-align: center;
+        }
+        
+        .katex {
+            font-size: 1.05em;
+        }
+        
+        /* Animations */
+        @keyframes particle-deterministic {
+            0% { transform: translate(0, 0); }
+            100% { transform: translate(80px, 0); }
+        }
+        
+        @keyframes particle-stochastic-1 {
+            0% { transform: translate(0, 0); }
+            20% { transform: translate(18px, 4px); }
+            40% { transform: translate(34px, -3px); }
+            60% { transform: translate(52px, 6px); }
+            80% { transform: translate(68px, -2px); }
+            100% { transform: translate(80px, 3px); }
+        }
+        
+        @keyframes particle-stochastic-2 {
+            0% { transform: translate(0, 0); }
+            20% { transform: translate(16px, -5px); }
+            40% { transform: translate(36px, 4px); }
+            60% { transform: translate(50px, -4px); }
+            80% { transform: translate(70px, 5px); }
+            100% { transform: translate(80px, -2px); }
+        }
+        
+        @keyframes particle-stochastic-3 {
+            0% { transform: translate(0, 0); }
+            20% { transform: translate(20px, 3px); }
+            40% { transform: translate(32px, -6px); }
+            60% { transform: translate(54px, 2px); }
+            80% { transform: translate(66px, -4px); }
+            100% { transform: translate(80px, 5px); }
+        }
+        
+        @keyframes particle-stochastic-4 {
+            0% { transform: translate(0, 0); }
+            20% { transform: translate(14px, -2px); }
+            40% { transform: translate(38px, 5px); }
+            60% { transform: translate(48px, -3px); }
+            80% { transform: translate(72px, 2px); }
+            100% { transform: translate(80px, -4px); }
+        }
+        
+        @keyframes particle-stochastic-5 {
+            0% { transform: translate(0, 0); }
+            20% { transform: translate(22px, 6px); }
+            40% { transform: translate(30px, -2px); }
+            60% { transform: translate(56px, -5px); }
+            80% { transform: translate(64px, 4px); }
+            100% { transform: translate(80px, 1px); }
+        }
+        
+        @keyframes collapse-particles {
+            0% { 
+                transform: translate(0, 0) scale(1);
+            }
+            50% {
+                transform: translate(60px, 0) scale(0.6);
+            }
+            100% { 
+                transform: translate(80px, 0) scale(0.4);
+            }
+        }
+        
+        @keyframes spread-particles {
+            0% { 
+                transform: translate(0, 0) scale(1);
+            }
+            50% {
+                transform: translate(60px, 0) scale(1.1);
+            }
+            100% { 
+                transform: translate(80px, 0) scale(1);
+            }
+        }
+        
+        @keyframes jitter {
+            0%, 100% { transform: translate(0, 0); }
+            25% { transform: translate(2px, -2px); }
+            50% { transform: translate(-1px, 2px); }
+            75% { transform: translate(1px, -1px); }
+        }
+        
+        @keyframes noise-wave {
+            0% { opacity: 0.3; }
+            50% { opacity: 0.7; }
+            100% { opacity: 0.3; }
+        }
+    </style>
+</head>
+<body>
+    <div class="title-block">
+        <h1>SVLD: Stein Variational Langevin Dynamics</h1>
+        <div class="subtitle">Preventing Variance Collapse in Stein Particle Filters</div>
+        <div class="date">February 2025 · Research Notes</div>
+    </div>
+    
+    <h2>1. The Variance Collapse Problem</h2>
+    
+    <p>
+        Deterministic SVGD transports particles toward the target posterior through a combination of attraction (gradient term) and repulsion (kernel gradient term). In theory, the repulsion should maintain particle diversity. In practice, Ba et al. (2021) showed that SVGD systematically <strong>underestimates posterior variance</strong>—particles cluster more tightly than they should.
+    </p>
+    
+    <div class="problem">
+        <div class="problem-title">Why Variance Collapse Occurs</div>
+        <p>
+            The repulsion term $\nabla_x k(x, x')$ depends on inter-particle distances. As particles converge, they enter a region where the kernel gradient becomes small, reducing the repulsion force. The system reaches an equilibrium with <em>less spread</em> than the true posterior.
+        </p>
+        <p style="margin-top: 10px;">
+            This is especially problematic for filtering applications where proper uncertainty quantification is essential for:
+        </p>
+        <ul style="margin-top: 8px;">
+            <li>Calibrated confidence intervals</li>
+            <li>Risk management decisions</li>
+            <li>Downstream predictions</li>
+        </ul>
+    </div>
+    
+    <div class="figure">
+        <div class="figure-content">
+            <svg width="650" height="200" viewBox="0 0 650 200">
+                <!-- Left: Initial state -->
+                <g transform="translate(30, 20)">
+                    <text x="70" y="0" text-anchor="middle" font-size="11" font-weight="bold" fill="#333">Initial Distribution</text>
+                    
+                    <!-- Prior ellipse -->
+                    <ellipse cx="70" cy="100" rx="50" ry="40" fill="#e3f2fd" stroke="#1976d2" stroke-width="1.5"/>
+                    
+                    <!-- Particles spread out -->
+                    <circle cx="35" cy="85" r="6" fill="#1976d2"/>
+                    <circle cx="55" cy="115" r="6" fill="#1976d2"/>
+                    <circle cx="75" cy="75" r="6" fill="#1976d2"/>
+                    <circle cx="85" cy="105" r="6" fill="#1976d2"/>
+                    <circle cx="105" cy="95" r="6" fill="#1976d2"/>
+                    <circle cx="60" cy="130" r="6" fill="#1976d2"/>
+                    <circle cx="90" cy="125" r="6" fill="#1976d2"/>
+                    
+                    <text x="70" y="165" text-anchor="middle" font-size="9" fill="#666">Good spread</text>
+                </g>
+                
+                <!-- Arrow -->
+                <g transform="translate(180, 90)">
+                    <path d="M0,10 L60,10" stroke="#666" stroke-width="2" marker-end="url(#arrowG)"/>
+                    <text x="30" y="0" text-anchor="middle" font-size="9" fill="#666">SVGD</text>
+                </g>
+                
+                <!-- Middle: Collapsed -->
+                <g transform="translate(270, 20)">
+                    <text x="70" y="0" text-anchor="middle" font-size="11" font-weight="bold" fill="#e65100">After Deterministic SVGD</text>
+                    
+                    <!-- Target ellipse (true) -->
+                    <ellipse cx="70" cy="100" rx="45" ry="35" fill="none" stroke="#4caf50" stroke-width="2" stroke-dasharray="5,5"/>
+                    <text x="130" y="75" font-size="8" fill="#4caf50">True posterior</text>
+                    
+                    <!-- Collapsed particles -->
+                    <g style="animation: collapse-particles 4s ease-in-out infinite alternate;">
+                        <circle cx="62" cy="97" r="6" fill="#e65100"/>
+                        <circle cx="70" cy="102" r="6" fill="#e65100"/>
+                        <circle cx="78" cy="98" r="6" fill="#e65100"/>
+                        <circle cx="66" cy="105" r="6" fill="#e65100"/>
+                        <circle cx="74" cy="95" r="6" fill="#e65100"/>
+                        <circle cx="68" cy="100" r="6" fill="#e65100"/>
+                        <circle cx="72" cy="103" r="6" fill="#e65100"/>
+                    </g>
+                    
+                    <text x="70" y="165" text-anchor="middle" font-size="9" fill="#e65100" font-weight="bold">Variance collapse!</text>
+                </g>
+                
+                <!-- Arrow -->
+                <g transform="translate(420, 90)">
+                    <path d="M0,10 L60,10" stroke="#666" stroke-width="2" marker-end="url(#arrowG)"/>
+                    <text x="30" y="0" text-anchor="middle" font-size="9" fill="#666">SVLD</text>
+                </g>
+                
+                <!-- Right: SVLD maintained -->
+                <g transform="translate(510, 20)">
+                    <text x="70" y="0" text-anchor="middle" font-size="11" font-weight="bold" fill="#00897b">After SVLD</text>
+                    
+                    <!-- Target ellipse (true) -->
+                    <ellipse cx="70" cy="100" rx="45" ry="35" fill="#e0f2f1" stroke="#00897b" stroke-width="2"/>
+                    
+                    <!-- Well-spread particles with jitter -->
+                    <circle cx="40" cy="90" r="6" fill="#00897b" style="animation: jitter 0.5s ease-in-out infinite;"/>
+                    <circle cx="55" cy="115" r="6" fill="#00897b" style="animation: jitter 0.5s ease-in-out infinite 0.1s;"/>
+                    <circle cx="70" cy="80" r="6" fill="#00897b" style="animation: jitter 0.5s ease-in-out infinite 0.2s;"/>
+                    <circle cx="85" cy="105" r="6" fill="#00897b" style="animation: jitter 0.5s ease-in-out infinite 0.15s;"/>
+                    <circle cx="100" cy="95" r="6" fill="#00897b" style="animation: jitter 0.5s ease-in-out infinite 0.25s;"/>
+                    <circle cx="60" cy="125" r="6" fill="#00897b" style="animation: jitter 0.5s ease-in-out infinite 0.05s;"/>
+                    <circle cx="80" cy="120" r="6" fill="#00897b" style="animation: jitter 0.5s ease-in-out infinite 0.3s;"/>
+                    
+                    <text x="70" y="165" text-anchor="middle" font-size="9" fill="#00897b" font-weight="bold">Proper coverage ✓</text>
+                </g>
+                
+                <defs>
+                    <marker id="arrowG" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+                        <polygon points="0 0, 10 3.5, 0 7" fill="#666"/>
+                    </marker>
+                </defs>
+            </svg>
+        </div>
+        <div class="figure-caption">
+            <strong>Figure 1:</strong> Variance collapse in deterministic SVGD. Particles start well-spread (left), but after SVGD iterations they cluster too tightly (center), underestimating the true posterior variance. SVLD maintains proper spread (right) through stochastic diffusion.
+        </div>
+    </div>
+    
+    <h2>2. The SVLD Solution</h2>
+    
+    <p>
+        SVLD converts the deterministic SVGD update into a stochastic differential equation by adding Langevin diffusion noise:
+    </p>
+    
+    <div class="comparison-row">
+        <div class="comparison-panel panel-svgd">
+            <div class="panel-title">Deterministic SVGD</div>
+            <div class="equation">
+                $$\frac{dh}{dt} = \phi(h)$$
+            </div>
+            <p style="font-size: 10pt; color: #666; margin-top: 10px;">
+                Particles follow gradient flow deterministically. No randomness → eventual collapse.
+            </p>
+        </div>
+        
+        <div class="comparison-panel panel-svld">
+            <div class="panel-title">SVLD (Langevin Dynamics)</div>
+            <div class="equation">
+                $$dh = \phi(h) \, dt + \sqrt{2T} \, dW_t$$
+            </div>
+            <p style="font-size: 10pt; color: #666; margin-top: 10px;">
+                Adds Brownian noise $dW_t$ scaled by temperature $T$. Maintains exploration.
+            </p>
+        </div>
+    </div>
+    
+    <p>
+        In discrete time, the update becomes:
+    </p>
+    
+    <div class="equation">
+        $$h_{t+1} = h_t + \epsilon \cdot \phi(h_t) + \sqrt{2 \epsilon T} \cdot \xi_t, \quad \xi_t \sim \mathcal{N}(0, 1)$$
+    </div>
+    
+    <div class="solution">
+        <div class="solution-title">Why This Works</div>
+        <p>
+            The noise term $\sqrt{2T} \, dW_t$ provides continuous perturbation that prevents particles from settling into a collapsed configuration. The temperature $T$ controls the trade-off:
+        </p>
+        <ul>
+            <li><strong>Higher T:</strong> More exploration, better coverage, but noisier estimates</li>
+            <li><strong>Lower T:</strong> Less noise, tighter clustering, risk of under-coverage</li>
+        </ul>
+        <p style="margin-top: 10px;">
+            In the limit as iterations → ∞, SVLD samples from the <em>correct</em> posterior distribution, while deterministic SVGD converges to a point mass approximation.
+        </p>
+    </div>
+    
+    <h2>3. Visualizing the Difference</h2>
+    
+    <p>
+        The key difference is in particle trajectories. Deterministic SVGD moves particles along smooth paths that converge. SVLD adds stochastic "jitter" that maintains spread.
+    </p>
+    
+    <div class="figure">
+        <div class="figure-content" style="padding: 30px;">
+            <div class="comparison-row" style="margin: 0;">
+                <!-- SVGD trajectories -->
+                <div style="text-align: center;">
+                    <div style="font-weight: bold; color: var(--svgd-color); margin-bottom: 10px;">Deterministic SVGD</div>
+                    <svg width="280" height="180" viewBox="0 0 280 180">
+                        <rect x="0" y="0" width="280" height="180" fill="#fff8f0" rx="8"/>
+                        
+                        <!-- Target -->
+                        <ellipse cx="220" cy="90" rx="40" ry="50" fill="#ffecb3" stroke="#ffa000" stroke-width="1.5"/>
+                        <text x="220" y="95" text-anchor="middle" font-size="9" fill="#e65100">Target</text>
+                        
+                        <!-- Deterministic paths (converging) -->
+                        <path d="M40,40 Q100,45 160,70 T220,85" stroke="#e65100" stroke-width="2" fill="none" opacity="0.6"/>
+                        <path d="M40,70 Q100,72 160,80 T220,88" stroke="#e65100" stroke-width="2" fill="none" opacity="0.6"/>
+                        <path d="M40,90 Q100,90 160,90 T220,90" stroke="#e65100" stroke-width="2" fill="none" opacity="0.6"/>
+                        <path d="M40,110 Q100,108 160,100 T220,92" stroke="#e65100" stroke-width="2" fill="none" opacity="0.6"/>
+                        <path d="M40,140 Q100,135 160,110 T220,95" stroke="#e65100" stroke-width="2" fill="none" opacity="0.6"/>
+                        
+                        <!-- Particles at end (collapsed) -->
+                        <circle cx="218" cy="86" r="5" fill="#e65100"/>
+                        <circle cx="222" cy="89" r="5" fill="#e65100"/>
+                        <circle cx="220" cy="92" r="5" fill="#e65100"/>
+                        <circle cx="217" cy="91" r="5" fill="#e65100"/>
+                        <circle cx="223" cy="94" r="5" fill="#e65100"/>
+                        
+                        <!-- Start particles -->
+                        <circle cx="40" cy="40" r="4" fill="#e65100" opacity="0.5"/>
+                        <circle cx="40" cy="70" r="4" fill="#e65100" opacity="0.5"/>
+                        <circle cx="40" cy="90" r="4" fill="#e65100" opacity="0.5"/>
+                        <circle cx="40" cy="110" r="4" fill="#e65100" opacity="0.5"/>
+                        <circle cx="40" cy="140" r="4" fill="#e65100" opacity="0.5"/>
+                        
+                        <text x="140" y="170" text-anchor="middle" font-size="9" fill="#e65100">Smooth paths → collapse</text>
+                    </svg>
+                </div>
+                
+                <!-- SVLD trajectories -->
+                <div style="text-align: center;">
+                    <div style="font-weight: bold; color: var(--svld-color); margin-bottom: 10px;">SVLD (with noise)</div>
+                    <svg width="280" height="180" viewBox="0 0 280 180">
+                        <rect x="0" y="0" width="280" height="180" fill="#e0f2f1" rx="8"/>
+                        
+                        <!-- Target -->
+                        <ellipse cx="220" cy="90" rx="40" ry="50" fill="#b2dfdb" stroke="#00897b" stroke-width="1.5"/>
+                        <text x="220" y="95" text-anchor="middle" font-size="9" fill="#00695c">Target</text>
+                        
+                        <!-- Stochastic paths (wiggly, spread) -->
+                        <path d="M40,40 Q60,45 80,38 Q100,50 120,42 Q140,55 160,48 Q180,60 200,55 T220,60" stroke="#00897b" stroke-width="2" fill="none" opacity="0.6"/>
+                        <path d="M40,70 Q60,68 80,75 Q100,65 120,72 Q140,78 160,70 Q180,82 200,78 T220,75" stroke="#00897b" stroke-width="2" fill="none" opacity="0.6"/>
+                        <path d="M40,90 Q60,95 80,85 Q100,92 120,88 Q140,95 160,90 Q180,85 200,92 T220,90" stroke="#00897b" stroke-width="2" fill="none" opacity="0.6"/>
+                        <path d="M40,110 Q60,105 80,115 Q100,108 120,118 Q140,105 160,112 Q180,100 200,108 T220,105" stroke="#00897b" stroke-width="2" fill="none" opacity="0.6"/>
+                        <path d="M40,140 Q60,135 80,145 Q100,130 120,138 Q140,125 160,135 Q180,120 200,130 T220,125" stroke="#00897b" stroke-width="2" fill="none" opacity="0.6"/>
+                        
+                        <!-- Particles at end (spread with jitter) -->
+                        <circle cx="220" cy="60" r="5" fill="#00897b" style="animation: jitter 0.4s ease-in-out infinite;"/>
+                        <circle cx="220" cy="75" r="5" fill="#00897b" style="animation: jitter 0.4s ease-in-out infinite 0.1s;"/>
+                        <circle cx="220" cy="90" r="5" fill="#00897b" style="animation: jitter 0.4s ease-in-out infinite 0.2s;"/>
+                        <circle cx="220" cy="105" r="5" fill="#00897b" style="animation: jitter 0.4s ease-in-out infinite 0.15s;"/>
+                        <circle cx="220" cy="125" r="5" fill="#00897b" style="animation: jitter 0.4s ease-in-out infinite 0.25s;"/>
+                        
+                        <!-- Start particles -->
+                        <circle cx="40" cy="40" r="4" fill="#00897b" opacity="0.5"/>
+                        <circle cx="40" cy="70" r="4" fill="#00897b" opacity="0.5"/>
+                        <circle cx="40" cy="90" r="4" fill="#00897b" opacity="0.5"/>
+                        <circle cx="40" cy="110" r="4" fill="#00897b" opacity="0.5"/>
+                        <circle cx="40" cy="140" r="4" fill="#00897b" opacity="0.5"/>
+                        
+                        <text x="140" y="170" text-anchor="middle" font-size="9" fill="#00695c">Noisy paths → proper spread</text>
+                    </svg>
+                </div>
+            </div>
+        </div>
+        <div class="figure-caption">
+            <strong>Figure 2:</strong> Particle trajectories comparison. <strong>Left:</strong> Deterministic SVGD follows smooth paths that converge to a tight cluster. <strong>Right:</strong> SVLD trajectories are perturbed by noise, maintaining spread throughout and arriving at the target with proper coverage.
+        </div>
+    </div>
+    
+    <h2>4. Temperature Selection</h2>
+    
+    <p>
+        The temperature parameter $T$ is critical. Too low, and you get deterministic behavior with variance collapse. Too high, and particles become too noisy to provide useful estimates.
+    </p>
+    
+    <div class="figure">
+        <div class="figure-content">
+            <svg width="600" height="160" viewBox="0 0 600 160">
+                <!-- Temperature spectrum -->
+                <defs>
+                    <linearGradient id="tempGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+                        <stop offset="0%" style="stop-color:#e65100"/>
+                        <stop offset="50%" style="stop-color:#00897b"/>
+                        <stop offset="100%" style="stop-color:#1565c0"/>
+                    </linearGradient>
+                </defs>
+                
+                <!-- Spectrum bar -->
+                <rect x="50" y="50" width="500" height="20" rx="10" fill="url(#tempGrad)"/>
+                
+                <!-- Labels -->
+                <text x="50" y="40" text-anchor="start" font-size="10" fill="#e65100" font-weight="bold">T → 0</text>
+                <text x="300" y="40" text-anchor="middle" font-size="10" fill="#00897b" font-weight="bold">T ≈ 0.45</text>
+                <text x="550" y="40" text-anchor="end" font-size="10" fill="#1565c0" font-weight="bold">T → ∞</text>
+                
+                <!-- Descriptions -->
+                <text x="50" y="95" text-anchor="start" font-size="9" fill="#e65100">Deterministic</text>
+                <text x="50" y="108" text-anchor="start" font-size="9" fill="#e65100">Variance collapse</text>
+                
+                <text x="300" y="95" text-anchor="middle" font-size="9" fill="#00897b">Optimal trade-off</text>
+                <text x="300" y="108" text-anchor="middle" font-size="9" fill="#00897b">Good coverage + accuracy</text>
+                
+                <text x="550" y="95" text-anchor="end" font-size="9" fill="#1565c0">Pure diffusion</text>
+                <text x="550" y="108" text-anchor="end" font-size="9" fill="#1565c0">Too noisy, slow mixing</text>
+                
+                <!-- Marker for optimal -->
+                <line x1="300" y1="50" x2="300" y2="70" stroke="#00897b" stroke-width="3"/>
+                <polygon points="300,75 295,70 305,70" fill="#00897b"/>
+                
+                <!-- Particle illustrations -->
+                <g transform="translate(50, 125)">
+                    <circle cx="0" cy="0" r="3" fill="#e65100"/>
+                    <circle cx="4" cy="2" r="3" fill="#e65100"/>
+                    <circle cx="2" cy="-1" r="3" fill="#e65100"/>
+                </g>
+                
+                <g transform="translate(300, 125)">
+                    <circle cx="-8" cy="0" r="3" fill="#00897b"/>
+                    <circle cx="0" cy="5" r="3" fill="#00897b"/>
+                    <circle cx="8" cy="-3" r="3" fill="#00897b"/>
+                </g>
+                
+                <g transform="translate(550, 125)">
+                    <circle cx="-15" cy="5" r="3" fill="#1565c0"/>
+                    <circle cx="5" cy="-10" r="3" fill="#1565c0"/>
+                    <circle cx="12" cy="8" r="3" fill="#1565c0"/>
+                </g>
+            </svg>
+        </div>
+        <div class="figure-caption">
+            <strong>Figure 3:</strong> Temperature spectrum. The optimal value balances exploration (avoiding collapse) with exploitation (accurate tracking). For stochastic volatility, $T \approx 0.45$ works well empirically.
+        </div>
+    </div>
+    
+    <h3>4.1 Implementation</h3>
+    
+    <p>
+        In our SVPF implementation:
+    </p>
+    
+    <div style="background: #f5f5f5; border: 1px solid #ddd; border-radius: 6px; padding: 15px; margin: 15px 0; font-family: monospace; font-size: 10pt;">
+        <div style="color: #666;">// Configuration</div>
+        <div>use_svld = 1;</div>
+        <div>temperature = 0.45f;&nbsp;&nbsp;<span style="color: #666;">// Tuned for SV model</span></div>
+        <br/>
+        <div style="color: #666;">// Update step</div>
+        <div>h_new = h + step * φ(h) + sqrt(2 * step * T) * randn();</div>
+    </div>
+    
+    <p>
+        The noise is sampled fresh at each timestep using a fast GPU-friendly RNG (PCG32 or cuRAND).
+    </p>
+    
+    <h2>5. SVLD in the Full SVPF Stack</h2>
+    
+    <p>
+        SVLD complements the other techniques we've discussed:
+    </p>
+    
+    <div class="insight">
+        <div class="insight-title">The Complete Picture</div>
+        <table style="margin: 15px 0;">
+            <thead>
+                <tr>
+                    <th>Technique</th>
+                    <th>Problem Solved</th>
+                    <th>Mechanism</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td><strong>Adaptive Annealing</strong></td>
+                    <td>Particle collapse during crashes</td>
+                    <td>KL-constrained β stepping</td>
+                </tr>
+                <tr>
+                    <td><strong>Newton Preconditioning</strong></td>
+                    <td>Slow convergence</td>
+                    <td>Curvature-adapted step sizes</td>
+                </tr>
+                <tr>
+                    <td><strong>Full Newton</strong></td>
+                    <td>Particles left behind</td>
+                    <td>Kernel-coupled Hessians</td>
+                </tr>
+                <tr style="background: #e0f2f1;">
+                    <td><strong>SVLD</strong></td>
+                    <td>Variance collapse / under-coverage</td>
+                    <td>Langevin diffusion noise</td>
+                </tr>
+            </tbody>
+        </table>
+        <p>
+            Together, these form a robust filtering system: annealing prevents collapse during likelihood shocks, Newton methods ensure fast convergence, and SVLD maintains proper uncertainty quantification throughout.
+        </p>
+    </div>
+    
+    <h2>6. When SVLD Matters Most</h2>
+    
+    <p>
+        SVLD is most important when:
+    </p>
+    
+    <ul>
+        <li><strong>Uncertainty quantification is critical</strong> — risk management, option pricing, confidence intervals</li>
+        <li><strong>Multi-modal posteriors</strong> — noise helps particles escape local modes</li>
+        <li><strong>Long tracking sequences</strong> — variance collapse accumulates over time</li>
+        <li><strong>Low particle counts</strong> — fewer particles collapse faster</li>
+    </ul>
+    
+    <p>
+        For pure point estimation (just the mean), deterministic SVGD may suffice. But for any application requiring calibrated uncertainty, SVLD is essential.
+    </p>
+    
+    <div class="references">
+        <h2>References</h2>
+        <ol>
+            <li>Ba, J., Erdogdu, M. A., Ghassemi, M., Suzuki, T., & Wu, D. (2021). Understanding the Variance Collapse of SVGD in High Dimensions. <em>ICLR</em>.</li>
+            <li>Liu, Q. & Wang, D. (2016). Stein Variational Gradient Descent: A General Purpose Bayesian Inference Algorithm. <em>NeurIPS</em>.</li>
+            <li>Welling, M. & Teh, Y. W. (2011). Bayesian Learning via Stochastic Gradient Langevin Dynamics. <em>ICML</em>.</li>
+        </ol>
+    </div>
+    
+    <div class="footer">
+        <p>Document generated February 2025. For research purposes only.</p>
+    </div>
+    
+    <script>
+        document.addEventListener("DOMContentLoaded", function() {
+            renderMathInElement(document.body, {
+                delimiters: [
+                    {left: "$$", right: "$$", display: true},
+                    {left: "$", right: "$", display: false}
+                ]
+            });
+        });
+    </script>
+</body>
+</html>
