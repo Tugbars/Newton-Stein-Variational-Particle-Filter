@@ -608,6 +608,10 @@ static Metrics run_svpf_on_scenario(
 
         //filter->use_heun = 1;
 
+        filter->use_adaptive_anneal = 1; // Already default
+        filter->anneal_kl_threshold = 0.9f;
+        filter->anneal_steps_per_beta = 3;
+
     } else {
         filter->use_svld = 0;
         filter->use_annealing = 0;

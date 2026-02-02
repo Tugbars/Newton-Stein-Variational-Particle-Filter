@@ -240,6 +240,10 @@ typedef struct {
     // Stored between svpf_step_async() and svpf_sync_outputs()
     float pending_y_t;
     const void* pending_params;  // Actually SVPFParams*, but void* avoids forward decl
+
+        // === Adaptive Annealing Buffers ===
+    float* d_anneal_stats;       // [4]: mean_ll, var_ll, mean_grad, h_std
+    float* h_anneal_stats_pinned; // Pinned host for fast D2H
 } SVPFOptimizedState;
 
 /**
@@ -525,6 +529,18 @@ typedef struct {
     int use_heun;  // 0 = Euler (default), 1 = Heun's method
 
     int use_antithetic;
+
+    // === Adaptive Annealing (KL-based beta stepping) ===
+    int use_adaptive_anneal;      // 0 = fixed stages, 1 = KL-adaptive (default: 1)
+    float anneal_kl_threshold;    // KL constraint (default: 0.5, lower = more conservative)
+    int anneal_steps_per_beta;    // Stein steps per beta update (default: 2)
+    int anneal_max_stages;        // Safety cap (default: 50)
+    
+    // Adaptive anneal diagnostics (updated each timestep)
+    int anneal_stages_used;       // How many beta updates occurred
+    float anneal_final_var_ll;    // Final variance of log-likelihood
+    float anneal_final_h_std;     // Final particle spread
+
 
 } SVPFState;
 
