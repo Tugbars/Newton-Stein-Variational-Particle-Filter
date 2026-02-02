@@ -767,24 +767,12 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
                 n
             );
         }
-    } else if (state->use_mim) {
-        svpf_predict_mim_kernel<<<nb, BLOCK_SIZE, 0, cs>>>(
-            state->h, state->h_prev, state->rng_states,
-            opt->d_y_single, opt->d_h_mean_prev, 1,
-            rho_up, rho_down, effective_sigma_z, effective_mu, params->gamma,
-            state->mim_jump_prob, state->mim_jump_scale,
-            delta_rho, delta_sigma,
-            state->use_student_t_state, state->nu_state,
-            n
-        );
-    } else {
-        svpf_predict_kernel<<<nb, BLOCK_SIZE, 0, cs>>>(
-            state->h, state->h_prev, state->rng_states,
-            opt->d_y_single, 1, params->rho, effective_sigma_z, effective_mu, params->gamma,
-            state->use_student_t_state, state->nu_state,
-            n
-        );
+    } 
+    else
+    {
+       // alternative to guided has been superseded by guided. 
     }
+
     
     // =========================================================================
     // GUIDE
