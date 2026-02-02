@@ -842,100 +842,80 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
     
     if (state->use_adaptive_anneal) {
         // =====================================================================
-        // ADAPTIVE ANNEALING (KL-based beta stepping)
-        // Variable number of stages, beta adapts to particle disagreement
+        // ADAPTIVE ANNEALING (Single-Sync Version)
+        // Compute stats ONCE at beta=0, estimate all betas upfront, no more syncs
         // =====================================================================
         
-        float beta = 0.0f;
-        int stage = 0;
+        // -----------------------------------------------------------------
+        // 1. Compute initial gradient and stats at beta=0
+        // -----------------------------------------------------------------
+        svpf_fused_gradient_kernel<<<nb, BLOCK_SIZE, grad_smem, cs>>>(
+            state->h, state->h_prev, state->grad_log_p, state->log_weights,
+            state->use_newton ? opt->d_precond_grad : nullptr,
+            state->use_newton ? opt->d_inv_hessian : nullptr,
+            opt->d_y_single, 1, params->rho, effective_sigma_z, effective_mu,
+            0.0f, state->nu, student_t_const, state->lik_offset,
+            params->gamma, state->use_exact_gradient, state->use_newton,
+            state->use_fan_mode,
+            state->use_student_t_state, state->nu_state,
+            n
+        );
         
-        while (beta < 1.0f && stage < state->anneal_max_stages) {
-            
-            // -----------------------------------------------------------------
-            // 1. Compute gradient at current beta
-            // -----------------------------------------------------------------
-            svpf_fused_gradient_kernel<<<nb, BLOCK_SIZE, grad_smem, cs>>>(
-                state->h, state->h_prev, state->grad_log_p, state->log_weights,
-                state->use_newton ? opt->d_precond_grad : nullptr,
-                state->use_newton ? opt->d_inv_hessian : nullptr,
-                opt->d_y_single, 1, params->rho, effective_sigma_z, effective_mu,
-                beta, state->nu, student_t_const, state->lik_offset,
-                params->gamma, state->use_exact_gradient, state->use_newton,
-                state->use_fan_mode,
-                state->use_student_t_state, state->nu_state,
-                n
-            );
-            
-            // -----------------------------------------------------------------
-            // 2. Compute stats for adaptive beta decision
-            // -----------------------------------------------------------------
-            svpf_anneal_stats_kernel<<<1, 256, 0, cs>>>(
-                state->log_weights, state->grad_log_p, state->h,
-                opt->d_anneal_stats, n
-            );
-            
-            // -----------------------------------------------------------------
-            // 3. D2H transfer and CPU decision
-            // -----------------------------------------------------------------
-            cudaMemcpyAsync(opt->h_anneal_stats_pinned, opt->d_anneal_stats,
-                            4 * sizeof(float), cudaMemcpyDeviceToHost, cs);
-            cudaStreamSynchronize(cs);
-            
-            float mean_ll = opt->h_anneal_stats_pinned[0];
-            float var_ll = opt->h_anneal_stats_pinned[1];
-            float mean_grad = opt->h_anneal_stats_pinned[2];
-            float h_std = opt->h_anneal_stats_pinned[3];
-            
-            // Compute delta_beta with safety interlocks
-            // 1. KL-based step (distribution stability)
-            float d_beta_kl = sqrtf(2.0f * state->anneal_kl_threshold / (var_ll + 1e-6f));
-            
-            // 2. Gradient-based step (physical stability)
-            float d_beta_grad = 2.0f / (mean_grad + 1e-6f);
-            
-            // 3. Spatial diversity check (anti-collapse)
-            float d_beta_spatial = 0.25f;  // Default max
-            if (h_std < 0.05f) {
-                // Particles collapsed! Force tiny steps
-                d_beta_spatial = 0.02f;
-            }
-            
-            // Take minimum (most conservative)
-            float d_beta = fminf(d_beta_kl, fminf(d_beta_grad, d_beta_spatial));
-            
-            // Clamps
-            d_beta = fmaxf(d_beta, 0.01f);  // Anti-stall
-            d_beta = fminf(d_beta, 0.25f);  // Anti-collapse
-            
-            // Update beta
-            beta = fminf(beta + d_beta, 1.0f);
+        svpf_anneal_stats_kernel<<<1, 256, 0, cs>>>(
+            state->log_weights, state->grad_log_p, state->h,
+            opt->d_anneal_stats, n
+        );
+        
+        // SINGLE D2H sync for the entire annealing
+        cudaMemcpyAsync(opt->h_anneal_stats_pinned, opt->d_anneal_stats,
+                        4 * sizeof(float), cudaMemcpyDeviceToHost, cs);
+        cudaStreamSynchronize(cs);
+        
+        float var_ll = opt->h_anneal_stats_pinned[1];
+        float mean_grad = opt->h_anneal_stats_pinned[2];
+        float h_std = opt->h_anneal_stats_pinned[3];
+        
+        // -----------------------------------------------------------------
+        // 2. Compute delta_beta and number of stages UPFRONT
+        // -----------------------------------------------------------------
+        float d_beta_kl = sqrtf(2.0f * state->anneal_kl_threshold / (var_ll + 1e-6f));
+        float d_beta_grad = 2.0f / (mean_grad + 1e-6f);
+        float d_beta_spatial = (h_std < 0.05f) ? 0.02f : 0.25f;
+        
+        float d_beta = fminf(d_beta_kl, fminf(d_beta_grad, d_beta_spatial));
+        d_beta = fmaxf(d_beta, 0.05f);   // Higher min for speed
+        d_beta = fminf(d_beta, 0.35f);   // Allow bigger steps
+        
+        // Calculate stages needed (uniform spacing)
+        int n_stages = (int)ceilf(1.0f / d_beta);
+        n_stages = max(2, min(n_stages, state->anneal_max_stages));
+        
+        // -----------------------------------------------------------------
+        // 3. Run all stages WITHOUT any more syncs
+        // -----------------------------------------------------------------
+        for (int stage = 0; stage < n_stages; stage++) {
+            float beta = fminf((float)(stage + 1) / (float)n_stages, 1.0f);
             float beta_factor = sqrtf(beta);
             
-            // -----------------------------------------------------------------
-            // 4. Run Stein transport steps at this beta
-            // -----------------------------------------------------------------
             for (int s = 0; s < state->anneal_steps_per_beta; s++) {
                 total_steps++;
-                bool is_last_iteration = (beta >= 1.0f) && (s == state->anneal_steps_per_beta - 1);
+                bool is_last_iteration = (stage == n_stages - 1) && (s == state->anneal_steps_per_beta - 1);
                 
-                // Recompute gradient for Stein (needed after first step in this stage)
-                if (s > 0) {
-                    svpf_fused_gradient_kernel<<<nb, BLOCK_SIZE, grad_smem, cs>>>(
-                        state->h, state->h_prev, state->grad_log_p, state->log_weights,
-                        state->use_newton ? opt->d_precond_grad : nullptr,
-                        state->use_newton ? opt->d_inv_hessian : nullptr,
-                        opt->d_y_single, 1, params->rho, effective_sigma_z, effective_mu,
-                        beta, state->nu, student_t_const, state->lik_offset,
-                        params->gamma, state->use_exact_gradient, state->use_newton,
-                        state->use_fan_mode,
-                        state->use_student_t_state, state->nu_state,
-                        n
-                    );
-                }
+                // Gradient
+                svpf_fused_gradient_kernel<<<nb, BLOCK_SIZE, grad_smem, cs>>>(
+                    state->h, state->h_prev, state->grad_log_p, state->log_weights,
+                    state->use_newton ? opt->d_precond_grad : nullptr,
+                    state->use_newton ? opt->d_inv_hessian : nullptr,
+                    opt->d_y_single, 1, params->rho, effective_sigma_z, effective_mu,
+                    beta, state->nu, student_t_const, state->lik_offset,
+                    params->gamma, state->use_exact_gradient, state->use_newton,
+                    state->use_fan_mode,
+                    state->use_student_t_state, state->nu_state,
+                    n
+                );
                 
-                // Stein transport (same kernel selection as fixed loop)
+                // Stein transport
                 if (is_last_iteration) {
-                    // Last iteration: compute KSD
                     if (state->use_newton) {
                         if (state->use_full_newton) {
                             svpf_fused_stein_transport_full_newton_ksd_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
@@ -968,7 +948,6 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
                         opt->d_ksd_partial, opt->d_ksd, n
                     );
                 } else {
-                    // Not last iteration: skip KSD
                     if (state->use_newton) {
                         if (state->use_full_newton) {
                             svpf_fused_stein_transport_full_newton_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
@@ -995,14 +974,12 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
                     }
                 }
             }
-            
-            stage++;
         }
         
         // Store diagnostics
-        state->anneal_stages_used = stage;
-        state->anneal_final_var_ll = opt->h_anneal_stats_pinned[1];
-        state->anneal_final_h_std = opt->h_anneal_stats_pinned[3];
+        state->anneal_stages_used = n_stages;
+        state->anneal_final_var_ll = var_ll;
+        state->anneal_final_h_std = h_std;
         
     } else {
         // =====================================================================

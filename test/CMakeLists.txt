@@ -263,49 +263,6 @@ set_tests_properties(StudentTABTest PROPERTIES
     LABELS "student-t;state-dynamics;ab-test"
 )
 
-# Fully Fused Kernel
-add_executable(test_fully_fused_v2
-    test_fully_fused_v2.cu
-)
-
-target_include_directories(test_fully_fused_v2
-    PRIVATE
-        ${CMAKE_SOURCE_DIR}/include
-        ${CUDAToolkit_INCLUDE_DIRS}
-)
-
-target_link_libraries(test_fully_fused_v2
-    PRIVATE
-        svpf
-        CUDA::cudart
-        CUDA::curand
-)
-
-set_target_properties(test_fully_fused_v2 PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
-)
-
-
-# Fully Fused Kernel
-add_executable(test_fused_v2_scenario test_fused_v2_scenario.cu)
-
-target_include_directories(test_fused_v2_scenario
-    PRIVATE
-        ${CMAKE_SOURCE_DIR}/include
-        ${CUDAToolkit_INCLUDE_DIRS}
-)
-
-target_link_libraries(test_fused_v2_scenario
-    PRIVATE
-        svpf
-        CUDA::cudart
-        CUDA::curand
-)
-
-set_target_properties(test_fused_v2_scenario PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
-)
-
 # Profile Multi Stream
 add_executable(tet_profile_multi_stream profile_multi_stream.cu)
 
@@ -343,26 +300,6 @@ target_link_libraries(test_extreme_crypto_stress
 )
 
 set_target_properties(test_extreme_crypto_stress PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
-)
-
-# Profile Multi Stream
-add_executable(test_stein_parallel test_stein_parallel.cu)
-
-target_include_directories(test_stein_parallel
-    PRIVATE
-        ${CMAKE_SOURCE_DIR}/include
-        ${CUDAToolkit_INCLUDE_DIRS}
-)
-
-target_link_libraries(test_stein_parallel
-    PRIVATE
-        svpf
-        CUDA::cudart
-        CUDA::curand
-)
-
-set_target_properties(test_stein_parallel PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
 )
 
