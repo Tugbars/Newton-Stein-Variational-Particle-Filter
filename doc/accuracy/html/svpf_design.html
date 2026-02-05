@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>SVPF Design Philosophy</title>
+<title>SVPF Design Notes</title>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Source+Serif+4:ital,wght@0,300;0,400;0,600;0,700;1,300;1,400&display=swap" rel="stylesheet">
 <style>
 :root {
@@ -835,16 +835,15 @@ footer {
 <div class="hero">
   <div class="container hero-content">
     <h1>
-      <span>Design Philosophy</span>
+      <span>Design Notes</span>
       Stein Variational<br>Particle Filter
     </h1>
     <p class="hero-subtitle">
-      Computation solves the problem, not heuristics. Every component exists 
-      to help the likelihood gradient do its job — nothing more.
+      Architecture, modeling choices, and how the components fit together.
     </p>
     <div class="hero-principle">
-      The only thing that should shape the posterior is ∇ log p(y | x)<br>
-      evaluated on real data. Everything else is infrastructure.
+      State model · Observation model · Newton–Stein transport<br>
+      Adaptive annealing · EKF guide · SVLD · Mixture prior
     </div>
   </div>
 </div>
@@ -889,7 +888,7 @@ footer {
           <span class="tag">Antithetic</span>
           <p>Spread particles forward in time. Honest about magnitude uncertainty, 
           silent about direction. Symmetric ±z pairs guarantee well-formed cloud.</p>
-          <div class="role">"I don't know which direction vol is going."</div>
+          <div class="role">Symmetric, directionless. Magnitude uncertainty only.</div>
         </div>
       </div>
 
@@ -903,7 +902,7 @@ footer {
           <span class="tag">Preserving</span>
           <p>Cheap linearized Bayesian update. Shifts particle cloud toward analytically 
           implied vol without collapsing spread. Warm start for Newton-Stein.</p>
-          <div class="role">"The data suggests vol is roughly here — start nearby."</div>
+          <div class="role">Cheap directional correction. First-order approximation of the target.</div>
         </div>
       </div>
 
@@ -920,7 +919,7 @@ footer {
           <p>Deterministic transport of particles to the true posterior. Hessian-scaled 
           gradient steps with KL-constrained beta scheduling and O(N²) mixture prior 
           gradient. The computational core — where accuracy comes from.</p>
-          <div class="role">"Here is the exact posterior, computed from the actual likelihood and the correct prior."</div>
+          <div class="role">Where the compute budget goes. ~95% of total latency.</div>
         </div>
       </div>
 
@@ -934,7 +933,7 @@ footer {
           <p>Stein Variational Langevin Dynamics — calibrated noise injection 
           during transport. Guarantees ergodicity: particles can always escape 
           local traps. Vanishes as beta → 1.</p>
-          <div class="role">"Never get permanently stuck."</div>
+          <div class="role">Ergodicity guarantee. Prevents particle collapse.</div>
         </div>
       </div>
 
@@ -949,7 +948,7 @@ footer {
           <p>Single kernel computes all output statistics. Adaptive mu Kalman 
           filter updates long-run mean from particle centroid. One pinned D2H 
           transfer — 32 bytes.</p>
-          <div class="role">"Here is what the data says. State updated for next tick."</div>
+          <div class="role">Single fused kernel. One 32-byte D2H transfer.</div>
         </div>
       </div>
     </div>
@@ -983,13 +982,12 @@ footer {
     </div>
 
     <div class="callout philosophy">
-      <div class="callout-title">Design Principle</div>
+      <div class="callout-title">Note</div>
       <p style="margin-bottom:0;">
-        95% of compute is in Newton–Stein transport. This is deliberate. The predict 
-        step is intentionally dumb — symmetric, directionless. The guide is intentionally 
-        cheap — first-order approximation. All accuracy comes from the Stein loop iterating 
-        on the real likelihood gradient with the real Hessian. <strong>Computation solves 
-        the problem, not heuristics.</strong>
+        95% of compute is in Newton–Stein transport. The predict step is intentionally 
+        simple — symmetric, directionless. The guide is intentionally cheap — first-order 
+        approximation. Accuracy comes from iterating on the likelihood gradient with the 
+        Hessian. The other components exist to make those iterations converge faster.
       </p>
     </div>
   </div>
@@ -1961,8 +1959,8 @@ h_i ← h_i + ε · φ(h_i) + √(2ε · temperature) · η_i
 <!-- ===== PHILOSOPHY ===== -->
 <section id="philosophy">
   <div class="container">
-    <div class="section-label">First Principles</div>
-    <h2>Design Philosophy</h2>
+    <div class="section-label">Design Choices</div>
+    <h2>Recurring Patterns</h2>
 
     <h3>Principle 1: Computation Over Heuristics</h3>
     <p>
@@ -1978,7 +1976,7 @@ h_i ← h_i + ε · φ(h_i) + √(2ε · temperature) · η_i
       of hardware.
     </p>
 
-    <h3>Principle 2: The Gradient is Sacred</h3>
+    <h3>Principle 2: The Gradient is the Only Information Channel</h3>
     <p>
       The observation score ∇<sub>h</sub> log p(y|h) is the only information channel from 
       data to posterior. Every component either computes this gradient (Stein), approximates 
@@ -2037,14 +2035,12 @@ h_i ← h_i + ε · φ(h_i) + √(2ε · temperature) · η_i
     </p>
 
     <div class="callout philosophy" style="margin-top: 48px;">
-      <div class="callout-title">The Meta-Principle</div>
+      <div class="callout-title">Summary</div>
       <p style="margin-bottom:0;">
-        A well-designed filter should be <strong>boring</strong>. No clever tricks, no 
-        surprising interactions, no emergent behavior. Each component does an obvious thing 
-        for an obvious reason. The sophistication is in the mathematics of Newton-Stein 
-        transport and the engineering of CUDA execution — not in the design of the system.
-        When the filter gives a wrong answer, you should be able to trace the error to 
-        exactly one component and fix it without touching anything else.
+        The goal is a filter where each component does one obvious thing for one obvious 
+        reason. No clever tricks, no surprising interactions. When the filter gives a wrong 
+        answer, the error should trace to exactly one component and be fixable without 
+        touching anything else.
       </p>
     </div>
   </div>
@@ -2052,7 +2048,7 @@ h_i ← h_i + ε · φ(h_i) + √(2ε · temperature) · η_i
 
 <footer>
   <div class="container">
-    SVPF Design Philosophy · Stein Variational Particle Filter
+    SVPF Design Notes · Stein Variational Particle Filter
   </div>
 </footer>
 
