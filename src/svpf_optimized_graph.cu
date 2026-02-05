@@ -9,6 +9,7 @@
  * - stein_smem: uses correct 2n/3n based on mode (was sometimes wrong)
  * - Anneal stats: d_anneal_stats sized to 5 floats for atomic kernel compat
  * - fused_gradient_stats kernel: smem also reduced to n
+ * - Host decode: proper Var(h) using 5th stat channel
  */
 
 #include "svpf_kernels.cuh"
@@ -387,7 +388,7 @@ static void svpf_optimized_init(SVPFOptimizedState* opt, int n) {
     
     cudaMallocHost(&opt->h_results_pinned, 4 * sizeof(float));
     
-    // v2: 5 floats for atomic stats kernel compat (was 4)
+    // v2: 5 floats — channels [0..4] for fused_gradient_stats atomic kernel
     cudaMalloc(&opt->d_anneal_stats, 5 * sizeof(float));
     cudaMallocHost(&opt->h_anneal_stats_pinned, 5 * sizeof(float));
     
@@ -588,8 +589,7 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
     // =========================================================================
     // v2: Corrected smem sizes
     // =========================================================================
-    // Gradient kernel: sh_h_prev was dead (loaded but never read) → removed
-    // Old: 2 * n * sizeof(float)   New: 1 * n * sizeof(float)
+    // Gradient kernel: sh_h_prev removed → only sh_mu_i remains
     size_t grad_smem = n * sizeof(float);
 
     // Stein kernel: STANDARD needs 2 arrays, NEWTON/FULL_NEWTON needs 3
@@ -698,11 +698,11 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
         // ADAPTIVE ANNEALING (Single-Sync Version)
         // =================================================================
         
-        // v2: Zero 4 floats (fused_gradient_stats uses atomicAdd for 4 values)
-        cudaMemsetAsync(opt->d_anneal_stats, 0, 4 * sizeof(float), cs);
+        // v2: Zero 5 floats — channel [4] is sum_h_diff for Var(h)
+        cudaMemsetAsync(opt->d_anneal_stats, 0, 5 * sizeof(float), cs);
         
         // Fused gradient + stats kernel
-        // v2: grad_smem is now n (not 2n) — matches gradient kernel change
+        // smem = n floats (sh_mu_i only — sh_h_prev removed in v2)
         svpf_fused_gradient_stats_kernel<<<nb, BLOCK_SIZE, grad_smem, cs>>>(
             state->h, state->h_prev, state->grad_log_p, state->log_weights,
             any_newton ? opt->d_precond_grad : nullptr,
@@ -717,25 +717,45 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
             n
         );
         
+        // v2: Copy 5 floats (was 4)
         cudaMemcpyAsync(opt->h_anneal_stats_pinned, opt->d_anneal_stats,
-                        4 * sizeof(float), cudaMemcpyDeviceToHost, cs);
+                        5 * sizeof(float), cudaMemcpyDeviceToHost, cs);
         cudaStreamSynchronize(cs);
         
+        // =================================================================
+        // v2: Host-side stats decode with proper Var(h)
+        // =================================================================
+        // Channel layout (raw sums, divide by n for means):
+        //   [0] sum of (log_w_clamped - CENTER_LL)
+        //   [1] sum of (log_w_clamped - CENTER_LL)²
+        //   [2] sum of |grad|
+        //   [3] sum of (h - CENTER_H)²
+        //   [4] sum of (h - CENTER_H)              ← v2 NEW
+        
         float inv_n = 1.0f / (float)n;
-        const float CENTER_LL = -50.0f;
         
-        float sum_ll_diff = opt->h_anneal_stats_pinned[0];
+        float sum_ll_diff    = opt->h_anneal_stats_pinned[0];
         float sum_ll_diff_sq = opt->h_anneal_stats_pinned[1];
-        float sum_grad = opt->h_anneal_stats_pinned[2];
-        float sum_h_diff_sq = opt->h_anneal_stats_pinned[3];
+        float sum_grad       = opt->h_anneal_stats_pinned[2];
+        float sum_h_diff_sq  = opt->h_anneal_stats_pinned[3];
+        float sum_h_diff     = opt->h_anneal_stats_pinned[4];  // v2 NEW
         
-        float mean_ll_diff = sum_ll_diff * inv_n;
+        // Log-likelihood variance (shift-invariant: center cancels)
+        float mean_ll_diff    = sum_ll_diff * inv_n;
         float mean_ll_diff_sq = sum_ll_diff_sq * inv_n;
         float var_ll = mean_ll_diff_sq - (mean_ll_diff * mean_ll_diff);
         var_ll = fmaxf(var_ll, 1e-6f);
         
+        // Mean absolute gradient
         float mean_grad = sum_grad * inv_n;
-        float h_std = sqrtf(fmaxf(sum_h_diff_sq * inv_n, 1e-8f));
+        
+        // v2: Proper Var(h) = E[(h-c)²] - E[h-c]²
+        // Old code: h_std = sqrt(E[h²]) — overestimates by ~|mean(h)| when
+        // mean(h) ≈ μ ≈ -3.5, causing spatial collapse check to never fire.
+        float mean_h_diff    = sum_h_diff * inv_n;
+        float mean_h_diff_sq = sum_h_diff_sq * inv_n;
+        float var_h = mean_h_diff_sq - (mean_h_diff * mean_h_diff);
+        float h_std = sqrtf(fmaxf(var_h, 1e-8f));
         
         // Compute delta_beta and stages upfront
         float d_beta_kl = sqrtf(2.0f * state->anneal_kl_threshold / (var_ll + 1e-6f));
@@ -773,12 +793,8 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
                     n
                 );
                 
-                // ==========================================================
                 // v2: Unified Stein transport dispatch
-                // Replaces 6-way if/else with template dispatch
-                // ==========================================================
                 if (is_last_iteration) {
-                    // Last iteration: compute KSD for diagnostics
                     launch_stein_dispatch<true>(
                         state->use_full_newton, state->use_newton,
                         state->h, state->grad_log_p, opt->d_precond_grad, opt->d_inv_hessian,
@@ -794,7 +810,6 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
                         opt->d_ksd_partial, opt->d_ksd, n
                     );
                 } else {
-                    // Interior iterations: skip KSD
                     launch_stein_dispatch<false>(
                         state->use_full_newton, state->use_newton,
                         state->h, state->grad_log_p, opt->d_precond_grad, opt->d_inv_hessian,

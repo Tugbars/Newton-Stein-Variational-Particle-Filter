@@ -673,12 +673,24 @@ __global__ void svpf_stein_transport_kernel(
 // These generate actual symbol definitions so the linker can find them.
 // The compiler optimizes away dead branches in each instantiation.
 
-template __global__ void svpf_stein_transport_kernel<SteinMode::STANDARD,    false>(float*, const float*, const float*, float*, curandStatePhilox4_32_10_t*, const float*, float*, float, float, float, float, float, int, int);
-template __global__ void svpf_stein_transport_kernel<SteinMode::STANDARD,    true >(float*, const float*, const float*, float*, curandStatePhilox4_32_10_t*, const float*, float*, float, float, float, float, float, int, int);
-template __global__ void svpf_stein_transport_kernel<SteinMode::NEWTON,      false>(float*, const float*, const float*, float*, curandStatePhilox4_32_10_t*, const float*, float*, float, float, float, float, float, int, int);
-template __global__ void svpf_stein_transport_kernel<SteinMode::NEWTON,      true >(float*, const float*, const float*, float*, curandStatePhilox4_32_10_t*, const float*, float*, float, float, float, float, float, int, int);
-template __global__ void svpf_stein_transport_kernel<SteinMode::FULL_NEWTON, false>(float*, const float*, const float*, float*, curandStatePhilox4_32_10_t*, const float*, float*, float, float, float, float, float, int, int);
-template __global__ void svpf_stein_transport_kernel<SteinMode::FULL_NEWTON, true >(float*, const float*, const float*, float*, curandStatePhilox4_32_10_t*, const float*, float*, float, float, float, float, float, int, int);
+// __restrict__ qualifiers must match the template definition exactly.
+// nvcc treats float* __restrict__ as a distinct type from float*.
+
+#define SVPF_STEIN_INSTANTIATE(MODE, KSD) \
+    template __global__ void svpf_stein_transport_kernel<MODE, KSD>( \
+        float* __restrict__, const float* __restrict__, const float* __restrict__, \
+        float* __restrict__, curandStatePhilox4_32_10_t* __restrict__, \
+        const float* __restrict__, float* __restrict__, \
+        float, float, float, float, float, int, int)
+
+SVPF_STEIN_INSTANTIATE(SteinMode::STANDARD,    false);
+SVPF_STEIN_INSTANTIATE(SteinMode::STANDARD,    true);
+SVPF_STEIN_INSTANTIATE(SteinMode::NEWTON,      false);
+SVPF_STEIN_INSTANTIATE(SteinMode::NEWTON,      true);
+SVPF_STEIN_INSTANTIATE(SteinMode::FULL_NEWTON, false);
+SVPF_STEIN_INSTANTIATE(SteinMode::FULL_NEWTON, true);
+
+#undef SVPF_STEIN_INSTANTIATE
 
 // =============================================================================
 // KSD Reduction Kernel
