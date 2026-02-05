@@ -538,13 +538,10 @@ static Metrics run_svpf_on_scenario(
         filter->use_svld = 1;
         filter->use_annealing = 1;
         filter->n_anneal_steps = 5;
-        filter->temperature = 0.45f;
+        filter->temperature = 0.40f;
         filter->rmsprop_rho = 0.7f;
         filter->rmsprop_eps = 1e-6f;
         
-        filter->use_mim = 0;
-        filter->mim_jump_prob = 0.25f;
-        filter->mim_jump_scale = 9.0f;
         filter->use_adaptive_beta = 1;  // ON by default, set 0 for A/B test
 
         filter->use_rejuvenation = 1;        // ON
@@ -591,13 +588,13 @@ static Metrics run_svpf_on_scenario(
          // === KSD-based Adaptive Stein Steps ===
         // Replaces fixed n_stein_steps with convergence-based early stopping
         // KSD (Kernel Stein Discrepancy) computed in same O(N²) pass - zero extra cost
-        filter->stein_min_steps = 8;              // Always run at least 4 (RMSProp warmup)
-        filter->stein_max_steps = 8;             // Cap at 12 (crisis budget)
+        filter->stein_min_steps = 4;              // Always run at least 4 (RMSProp warmup)
+        filter->stein_max_steps = 12;             // Cap at 12 (crisis budget)
         filter->ksd_improvement_threshold = 0.05; // Stop if <5% relative improvement
 
         // Enable Student-t state dynamics
         filter->use_student_t_state = 1;
-        filter->nu_state = 5.0f; // 5-7 recommended, lower = fatter tails
+        filter->nu_state = 3.0f; // 5-7 recommended, lower = fatter tails
 
         // Enable smoothing with 1-tick output lag
         filter->use_smoothing = 1;
