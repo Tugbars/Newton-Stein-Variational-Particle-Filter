@@ -2,24 +2,19 @@
  * @file svpf_optimized_graph.cu
  * @brief Consolidated SVPF Implementation with KSD-based Adaptive Stein Steps
  * 
- * Single implementation file containing:
- * - State management (svpf_create/destroy/initialize)
- * - Basic utility kernels
- * - Stein loop with KSD-based early stopping (now via CUDA Graphs)
- * - Public API (svpf_step_graph, svpf_step_adaptive, svpf_run_sequence)
- * - Diagnostics (svpf_get_particles, svpf_get_stats, svpf_get_ess)
- * 
- * KSD (Kernel Stein Discrepancy) is computed in the same O(N²) pass as Stein
- * transport at zero extra cost. Early stopping occurs when relative KSD
- * improvement drops below threshold.
- * 
- * CUDA GRAPHS: The Stein loop is now captured as a CUDA Graph to eliminate
- * kernel launch overhead. This reduces 16-64 kernel launches to 1 graph launch.
+ * v2 changes:
+ * - All Stein kernel launches replaced with launch_stein_dispatch<KSD>()
+ *   from svpf_stein_dispatch.cuh (12 call sites → 4 dispatch calls)
+ * - Gradient kernel smem: 2*n → 1*n (removed dead sh_h_prev)
+ * - stein_smem: uses correct 2n/3n based on mode (was sometimes wrong)
+ * - Anneal stats: d_anneal_stats sized to 5 floats for atomic kernel compat
+ * - fused_gradient_stats kernel: smem also reduced to n
  */
 
 #include "svpf_kernels.cuh"
-#include "svpf_adaptive_anneal.cuh"  // KL-based adaptive beta annealing
-#include "svpf_fused_gradient_stats.cuh"  // Fused gradient + stats kernel
+#include "svpf_adaptive_anneal.cuh"
+#include "svpf_fused_gradient_stats.cuh"
+#include "svpf_stein_dispatch.cuh"       // v2: unified Stein template dispatch
 
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
@@ -33,12 +28,10 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-// Maximum smoothing window size
 #ifndef SVPF_SMOOTH_MAX_LAG
 #define SVPF_SMOOTH_MAX_LAG 8
 #endif
 
-// Forward declarations
 static void svpf_optimized_init(SVPFOptimizedState* opt, int n);
 
 // =============================================================================
@@ -77,7 +70,6 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     
     int n = n_particles;
     
-    // Particle arrays
     cudaMalloc(&state->h, n * sizeof(float));
     cudaMalloc(&state->h_prev, n * sizeof(float));
     cudaMalloc(&state->h_pred, n * sizeof(float));
@@ -107,7 +99,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     
     state->use_svld = 1;
     state->use_annealing = 1;
-    state->use_adaptive_beta = 1;  // KSD-adaptive beta (Maken 2022)
+    state->use_adaptive_beta = 1;
     state->n_anneal_steps = 3;
     state->temperature = 1.0f;
     state->rmsprop_rho = 0.9f;
@@ -135,11 +127,10 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     state->guide_innovation_threshold = 1.0f;
     state->vol_prev = 0.05f;
     
-    // Partial rejuvenation (Maken 2022)
-    state->use_rejuvenation = 1;        // ON by default
-    state->rejuv_ksd_threshold = 0.30f; // Trigger when KSD > 0.3
-    state->rejuv_prob = 0.30f;          // Nudge 30% of particles
-    state->rejuv_blend = 0.30f;         // 30% toward guide, 70% stay
+    state->use_rejuvenation = 1;
+    state->rejuv_ksd_threshold = 0.30f;
+    state->rejuv_prob = 0.30f;
+    state->rejuv_blend = 0.30f;
     
     state->use_newton = 0;
     state->use_full_newton = 0;
@@ -166,51 +157,32 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     state->sigma_boost_max = 3.0f;
     state->sigma_z_effective = 0.10f;
     
-    // === Stein operator sign mode ===
-    // 0 = legacy (subtract, attraction) - production-tested with MIM/SVLD/guide
-    // 1 = paper (add, repulsion) - mathematically correct per Fan et al. 2021
     state->stein_repulsive_sign = SVPF_STEIN_SIGN_DEFAULT;
-    
-    // === Fan mode (weightless SVGD) ===
-    // 0 = hybrid (default), 1 = pure Stein without importance weights
     state->use_fan_mode = 0;
     
-    // === Student-t state dynamics ===
-    // 0 = Gaussian AR(1) (default), 1 = Student-t AR(1) with bounded gradients
     state->use_student_t_state = 0;
-    state->nu_state = 5.0f;  // Degrees of freedom for state dynamics (recommended: 5-7, min: 3)
-    // Note: nu_state is clamped to >= 2.5 in svpf_initialize to ensure finite variance
+    state->nu_state = 5.0f;
     
-    // === KSD-based Adaptive Stein Steps ===
-    state->stein_min_steps = 4;              // Always run at least this many
-    state->stein_max_steps = 12;             // Never exceed this
-    state->ksd_improvement_threshold = 0.05f; // Stop if relative improvement < 5%
-    state->ksd_prev = 1e10f;                 // Initialize high
-    state->stein_steps_used = n_stein_steps; // Diagnostic
+    state->stein_min_steps = 4;
+    state->stein_max_steps = 12;
+    state->ksd_improvement_threshold = 0.05f;
+    state->ksd_prev = 1e10f;
+    state->stein_steps_used = n_stein_steps;
     
-    // === Heun's Method (Improved Euler) ===
-    // 0 = Euler (default), 1 = Heun's method (2nd order, 2× gradient evals)
     state->use_heun = 0;
+    state->use_antithetic = 1;
     
-    // === Antithetic Sampling ===
-    // Pairs particles (i, i+n/2) with (+z, -z) noise for variance reduction
-    state->use_antithetic = 1;  // ON by default (reduces variance ~2×)
-    
-    // === Adaptive Annealing (KL-based beta stepping) ===
-    // Replaces fixed beta schedule with variance-constrained adaptive stepping
-    state->use_adaptive_anneal = 1;           // ON by default
-    state->anneal_kl_threshold = 0.5f;        // KL constraint (0.5 ≈ ESS=N/2)
-    state->anneal_steps_per_beta = 2;         // Stein steps per beta update
-    state->anneal_max_stages = 50;            // Safety cap
+    state->use_adaptive_anneal = 1;
+    state->anneal_kl_threshold = 0.5f;
+    state->anneal_steps_per_beta = 2;
+    state->anneal_max_stages = 50;
     state->anneal_stages_used = 0;
     state->anneal_final_var_ll = 0.0f;
     state->anneal_final_h_std = 0.0f;
     
-    // === Backward Smoothing (Fan et al. 2021 sliding window, lightweight) ===
-    // Applies RTS-style correction to past estimates using recent observations
-    state->use_smoothing = 0;                // OFF by default
-    state->smooth_lag = 3;                   // Window size (1-5 recommended)
-    state->smooth_output_lag = 1;            // Output h[t-1] instead of h[t]
+    state->use_smoothing = 0;
+    state->smooth_lag = 3;
+    state->smooth_output_lag = 1;
     for (int i = 0; i < SVPF_SMOOTH_MAX_LAG; i++) {
         state->smooth_h_mean[i] = 0.0f;
         state->smooth_h_var[i] = 1.0f;
@@ -218,7 +190,6 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     }
     state->smooth_head = 0;
     
-    // Device scalars
     cudaMalloc(&state->d_scalar_max, sizeof(float));
     cudaMalloc(&state->d_scalar_sum, sizeof(float));
     cudaMalloc(&state->d_scalar_mean, sizeof(float));
@@ -228,7 +199,6 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     cudaMalloc(&state->d_result_vol_mean, sizeof(float));
     cudaMalloc(&state->d_result_h_mean, sizeof(float));
     
-    // CUB temp storage
     state->cub_temp_bytes = 0;
     cub::DeviceReduce::Sum(NULL, state->cub_temp_bytes, state->h, state->d_scalar_sum, n);
     state->cub_temp_bytes += 1024;
@@ -299,18 +269,13 @@ void svpf_initialize(SVPFState* state, const SVPFParams* params, unsigned long l
     float rho = params->rho;
     float sigma_z = params->sigma_z;
     
-    // Clamp nu_state to ensure finite variance (requires nu > 2)
     float nu_state_clamped = fmaxf(state->nu_state, 2.5f);
     state->nu_state = nu_state_clamped;
     
-    // Compute stationary variance
-    // Gaussian: sigma²/(1-rho²)
-    // Student-t: (nu/(nu-2)) * sigma²/(1-rho²)  for nu > 2
     float base_var = (sigma_z * sigma_z) / (1.0f - rho * rho + 1e-6f);
     float stationary_var;
     
     if (state->use_student_t_state) {
-        // Student-t has larger variance due to heavier tails
         float var_scale = nu_state_clamped / (nu_state_clamped - 2.0f);
         stationary_var = var_scale * base_var;
     } else {
@@ -340,7 +305,6 @@ void svpf_initialize(SVPFState* state, const SVPFParams* params, unsigned long l
         state->sigma_z_effective = params->sigma_z;
     }
     
-    // Reset KSD tracking
     state->ksd_prev = 1e10f;
     state->stein_steps_used = state->n_stein_steps;
     
@@ -406,17 +370,14 @@ static void svpf_optimized_init(SVPFOptimizedState* opt, int n) {
     
     cudaMalloc(&opt->d_params_staging, SVPF_GRAPH_PARAMS_SIZE * sizeof(float));
     
-    // === KSD buffers ===
     cudaMalloc(&opt->d_ksd_partial, n * sizeof(float));
     cudaMalloc(&opt->d_ksd, sizeof(float));
     
-    // === Heun's method buffers ===
     cudaMalloc(&opt->d_phi_orig, n * sizeof(float));
     cudaMalloc(&opt->d_phi_pred, n * sizeof(float));
     cudaMalloc(&opt->d_h_orig, n * sizeof(float));
     
-    // === Consolidated output pack (single D2H transfer) ===
-    cudaMalloc(&opt->d_output_pack, 8 * sizeof(float));  // 32 bytes aligned
+    cudaMalloc(&opt->d_output_pack, 8 * sizeof(float));
     cudaMallocHost(&opt->h_output_pinned, 8 * sizeof(float));
     
     cudaStreamCreateWithFlags(&opt->graph_stream, cudaStreamNonBlocking);
@@ -426,9 +387,9 @@ static void svpf_optimized_init(SVPFOptimizedState* opt, int n) {
     
     cudaMallocHost(&opt->h_results_pinned, 4 * sizeof(float));
     
-    // === Adaptive Annealing Buffers ===
-    cudaMalloc(&opt->d_anneal_stats, 4 * sizeof(float));
-    cudaMallocHost(&opt->h_anneal_stats_pinned, 4 * sizeof(float));
+    // v2: 5 floats for atomic stats kernel compat (was 4)
+    cudaMalloc(&opt->d_anneal_stats, 5 * sizeof(float));
+    cudaMallocHost(&opt->h_anneal_stats_pinned, 5 * sizeof(float));
     
     opt->allocated_n = n;
     opt->initialized = true;
@@ -455,16 +416,13 @@ static void svpf_optimized_cleanup(SVPFOptimizedState* opt) {
     cudaFree(opt->d_vol_single);
     cudaFree(opt->d_params_staging);
     
-    // === KSD buffers ===
     cudaFree(opt->d_ksd_partial);
     cudaFree(opt->d_ksd);
     
-    // === Heun's method buffers ===
     cudaFree(opt->d_phi_orig);
     cudaFree(opt->d_phi_pred);
     cudaFree(opt->d_h_orig);
     
-    // === Consolidated output pack ===
     cudaFree(opt->d_output_pack);
     if (opt->h_output_pinned) {
         cudaFreeHost(opt->h_output_pinned);
@@ -476,7 +434,6 @@ static void svpf_optimized_cleanup(SVPFOptimizedState* opt) {
         opt->h_results_pinned = nullptr;
     }
     
-    // === Adaptive Annealing Buffers ===
     if (opt->d_anneal_stats) {
         cudaFree(opt->d_anneal_stats);
         opt->d_anneal_stats = nullptr;
@@ -522,34 +479,18 @@ static void svpf_adaptive_mu_update(
     
     float mu_pred = state->mu_state;
     float P_pred = state->mu_var + state->mu_process_var;
-    
     float R = state->mu_obs_var_scale * bandwidth * bandwidth;
-    
     float K = P_pred / (P_pred + R + 1e-8f);
-    
     float innovation = h_mean - mu_pred;
-    
     float mu_new = mu_pred + K * innovation;
     float P_new = (1.0f - K) * P_pred;
-    
     mu_new = fminf(fmaxf(mu_new, state->mu_min), state->mu_max);
-    
     state->mu_state = mu_new;
     state->mu_var = P_new;
 }
 
 // =============================================================================
-// BACKWARD SMOOTHING: Lightweight RTS-style correction
-// =============================================================================
-// 
-// Implements a simplified Rauch-Tung-Striebel smoother on stored summary stats.
-// After each forward filter step, we:
-// 1. Store h_mean, h_var, y in circular buffer
-// 2. Run backward pass to refine past estimates using "future" observations
-// 3. Output lagged smoothed estimate instead of raw filtered estimate
-// 
-// This is NOT true joint inference over trajectories (like full sliding window),
-// but captures most of the benefit at minimal cost (O(k) scalar ops per step).
+// BACKWARD SMOOTHING
 // =============================================================================
 
 static void svpf_smooth_backward(
@@ -565,26 +506,18 @@ static void svpf_smooth_backward(
     if (k > SVPF_SMOOTH_MAX_LAG) k = SVPF_SMOOTH_MAX_LAG;
     if (k < 1) k = 1;
     
-    // Store current estimate in buffer
     int head = state->smooth_head;
     state->smooth_h_mean[head] = h_mean_new;
     state->smooth_h_var[head] = h_var_new;
     state->smooth_y[head] = y_t;
-    
-    // Advance head (circular)
     state->smooth_head = (head + 1) % k;
     
-    // Skip backward pass until buffer is full
     if (state->timestep < k) return;
     
-    // Get AR(1) parameters
     float rho = params->rho;
     float mu = state->use_adaptive_mu ? state->mu_state : params->mu;
     float sigma_z_sq = params->sigma_z * params->sigma_z;
     
-    // Backward pass: newest to oldest
-    // At index idx_next is the "future" estimate, at idx_curr is current
-    // We correct idx_curr using information from idx_next
     for (int lag = 1; lag < k; lag++) {
         int idx_curr = (state->smooth_head - lag - 1 + k) % k;
         int idx_next = (state->smooth_head - lag + k) % k;
@@ -593,67 +526,34 @@ static void svpf_smooth_backward(
         float h_next = state->smooth_h_mean[idx_next];
         float var_curr = state->smooth_h_var[idx_curr];
         
-        // What did h_curr predict for h_next?
         float h_pred = mu + rho * (h_curr - mu);
-        
-        // Prediction variance
         float pred_var = rho * rho * var_curr + sigma_z_sq;
-        
-        // Innovation: how far was the prediction off?
         float innovation = h_next - h_pred;
-        
-        // Backward (RTS) gain: how much should past estimate adjust?
         float J = rho * var_curr / (pred_var + 1e-8f);
         
-        // Correct past estimate
         state->smooth_h_mean[idx_curr] = h_curr + J * innovation;
-        
-        // Reduce uncertainty (we've learned from future)
         state->smooth_h_var[idx_curr] = var_curr * (1.0f - J * rho);
     }
 }
 
-// Get smoothed output (with configured lag)
 static float svpf_get_smoothed_output(SVPFState* state, float h_mean_raw) {
     if (!state->use_smoothing) return h_mean_raw;
     
     int k = state->smooth_lag;
     if (k > SVPF_SMOOTH_MAX_LAG) k = SVPF_SMOOTH_MAX_LAG;
-    
-    // If not enough history yet, return raw
     if (state->timestep < k) return h_mean_raw;
     
     int output_lag = state->smooth_output_lag;
-    if (output_lag <= 0) return h_mean_raw;  // No lag = raw output
-    if (output_lag >= k) output_lag = k - 1;  // Cap at buffer size
+    if (output_lag <= 0) return h_mean_raw;
+    if (output_lag >= k) output_lag = k - 1;
     
-    // Get lagged smoothed estimate
-    // output_lag=1 means output h[t-1] which has seen y[t]
     int idx = (state->smooth_head - output_lag - 1 + k) % k;
     return state->smooth_h_mean[idx];
 }
 
 // =============================================================================
-// PUBLIC API: svpf_step_graph
-// =============================================================================
-// 
-// This is the main stepping function. It now uses:
-// - CUDA Graph for Stein loop (default) OR manual kernel launches (fallback)
-// - KSD-based step budget selection
-// 
-// Structure:
-// 1. Predict step
-// 2. Guide step (optional)
-// 3. Bandwidth computation
-// 4. Stein loop (CUDA Graph or manual)
-// 5. Output computation
-// =============================================================================
-
-// =============================================================================
 // ASYNC STEP: Launch all GPU work, return immediately
 // =============================================================================
-// Does NOT sync - call svpf_sync_outputs() later to get results.
-// For batch processing: call this on all filters, then sync all.
 
 void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams* params) {
     SVPFOptimizedState* opt = get_opt(state);
@@ -662,7 +562,6 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
     
     svpf_optimized_init(opt, n);
     
-    // Determine effective parameters
     float effective_mu = state->use_adaptive_mu ? state->mu_state : params->mu;
     float effective_sigma_z = params->sigma_z;
     
@@ -680,21 +579,28 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
         state->sigma_z_effective = effective_sigma_z;
     }
     
-    // Precompute constants
     float student_t_const = lgammaf((state->nu + 1.0f) / 2.0f)
                           - lgammaf(state->nu / 2.0f)
                           - 0.5f * logf((float)M_PI * state->nu);
     
     int nb = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    size_t grad_smem = 2 * n * sizeof(float);
-    size_t stein_smem = state->use_newton ? 3 * n * sizeof(float) : 2 * n * sizeof(float);
+
+    // =========================================================================
+    // v2: Corrected smem sizes
+    // =========================================================================
+    // Gradient kernel: sh_h_prev was dead (loaded but never read) → removed
+    // Old: 2 * n * sizeof(float)   New: 1 * n * sizeof(float)
+    size_t grad_smem = n * sizeof(float);
+
+    // Stein kernel: STANDARD needs 2 arrays, NEWTON/FULL_NEWTON needs 3
+    bool any_newton = state->use_newton || state->use_full_newton;
+    size_t stein_smem = (any_newton ? 3 : 2) * n * sizeof(float);
     
     float rho_up = state->use_asymmetric_rho ? state->rho_up : params->rho;
     float rho_down = state->use_asymmetric_rho ? state->rho_down : params->rho;
     float delta_rho = state->use_local_params ? state->delta_rho : 0.0f;
     float delta_sigma = state->use_local_params ? state->delta_sigma : 0.0f;
     
-    // Upload y values
     float y_arr[2] = {y_prev, y_t};
     cudaMemcpyAsync(opt->d_y_single, y_arr, 2 * sizeof(float), cudaMemcpyHostToDevice, cs);
     
@@ -703,7 +609,6 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
     // =========================================================================
     if (state->use_guided) {
         if (state->use_antithetic) {
-            // Antithetic version: each thread handles 2 particles (i, i+n/2) with (+z, -z)
             int nb_half = ((n / 2) + BLOCK_SIZE - 1) / BLOCK_SIZE;
             svpf_predict_guided_antithetic_kernel<<<nb_half, BLOCK_SIZE, 0, cs>>>(
                 state->h, state->h_prev, state->rng_states,
@@ -715,7 +620,7 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
                 state->guided_innovation_threshold,
                 state->student_t_implied_offset,
                 state->use_student_t_state, state->nu_state,
-                n  // Full n, kernel internally handles the pairing
+                n
             );
         } else {
             svpf_predict_guided_kernel<<<nb, BLOCK_SIZE, 0, cs>>>(
@@ -731,12 +636,7 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
                 n
             );
         }
-    } 
-    else
-    {
-       // alternative to guided has been superseded by guided. 
     }
-
     
     // =========================================================================
     // GUIDE
@@ -794,39 +694,33 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
     float temp = state->use_svld ? state->temperature : 0.0f;
     
     if (state->use_adaptive_anneal) {
-        // =====================================================================
+        // =================================================================
         // ADAPTIVE ANNEALING (Single-Sync Version)
-        // Compute stats ONCE at beta=0, estimate all betas upfront, no more syncs
-        // =====================================================================
+        // =================================================================
         
-        // -----------------------------------------------------------------
-        // 1. Compute initial gradient and stats at beta=0 (FUSED)
-        // -----------------------------------------------------------------
-        
-        // Zero stats buffer (atomic adds accumulate into this)
+        // v2: Zero 4 floats (fused_gradient_stats uses atomicAdd for 4 values)
         cudaMemsetAsync(opt->d_anneal_stats, 0, 4 * sizeof(float), cs);
         
-        // Fused gradient + stats kernel - one launch instead of two
+        // Fused gradient + stats kernel
+        // v2: grad_smem is now n (not 2n) — matches gradient kernel change
         svpf_fused_gradient_stats_kernel<<<nb, BLOCK_SIZE, grad_smem, cs>>>(
             state->h, state->h_prev, state->grad_log_p, state->log_weights,
-            state->use_newton ? opt->d_precond_grad : nullptr,
-            state->use_newton ? opt->d_inv_hessian : nullptr,
+            any_newton ? opt->d_precond_grad : nullptr,
+            any_newton ? opt->d_inv_hessian : nullptr,
             opt->d_y_single, 
-            opt->d_anneal_stats,  // Stats output
+            opt->d_anneal_stats,
             1, params->rho, effective_sigma_z, effective_mu,
             0.0f, state->nu, student_t_const, state->lik_offset,
-            params->gamma, state->use_exact_gradient, state->use_newton,
+            params->gamma, state->use_exact_gradient, any_newton,
             state->use_fan_mode,
             state->use_student_t_state, state->nu_state,
             n
         );
         
-        // SINGLE D2H sync for the entire annealing
         cudaMemcpyAsync(opt->h_anneal_stats_pinned, opt->d_anneal_stats,
                         4 * sizeof(float), cudaMemcpyDeviceToHost, cs);
         cudaStreamSynchronize(cs);
         
-        // Convert raw sums to stats (CPU side)
         float inv_n = 1.0f / (float)n;
         const float CENTER_LL = -50.0f;
         
@@ -843,24 +737,21 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
         float mean_grad = sum_grad * inv_n;
         float h_std = sqrtf(fmaxf(sum_h_diff_sq * inv_n, 1e-8f));
         
-        // -----------------------------------------------------------------
-        // 2. Compute delta_beta and number of stages UPFRONT
-        // -----------------------------------------------------------------
+        // Compute delta_beta and stages upfront
         float d_beta_kl = sqrtf(2.0f * state->anneal_kl_threshold / (var_ll + 1e-6f));
         float d_beta_grad = 2.0f / (mean_grad + 1e-6f);
         float d_beta_spatial = (h_std < 0.05f) ? 0.02f : 0.25f;
         
         float d_beta = fminf(d_beta_kl, fminf(d_beta_grad, d_beta_spatial));
-        d_beta = fmaxf(d_beta, 0.05f);   // Higher min for speed
-        d_beta = fminf(d_beta, 0.35f);   // Allow bigger steps
+        d_beta = fmaxf(d_beta, 0.05f);
+        d_beta = fminf(d_beta, 0.35f);
         
-        // Calculate stages needed (uniform spacing)
         int n_stages = (int)ceilf(1.0f / d_beta);
         n_stages = max(2, min(n_stages, state->anneal_max_stages));
         
-        // -----------------------------------------------------------------
-        // 3. Run all stages WITHOUT any more syncs
-        // -----------------------------------------------------------------
+        // =================================================================
+        // Run all stages WITHOUT any more syncs
+        // =================================================================
         for (int stage = 0; stage < n_stages; stage++) {
             float beta = fminf((float)(stage + 1) / (float)n_stages, 1.0f);
             float beta_factor = sqrtf(beta);
@@ -872,95 +763,65 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
                 // Gradient
                 svpf_fused_gradient_kernel<<<nb, BLOCK_SIZE, grad_smem, cs>>>(
                     state->h, state->h_prev, state->grad_log_p, state->log_weights,
-                    state->use_newton ? opt->d_precond_grad : nullptr,
-                    state->use_newton ? opt->d_inv_hessian : nullptr,
+                    any_newton ? opt->d_precond_grad : nullptr,
+                    any_newton ? opt->d_inv_hessian : nullptr,
                     opt->d_y_single, 1, params->rho, effective_sigma_z, effective_mu,
                     beta, state->nu, student_t_const, state->lik_offset,
-                    params->gamma, state->use_exact_gradient, state->use_newton,
+                    params->gamma, state->use_exact_gradient, any_newton,
                     state->use_fan_mode,
                     state->use_student_t_state, state->nu_state,
                     n
                 );
                 
-                // Stein transport
+                // ==========================================================
+                // v2: Unified Stein transport dispatch
+                // Replaces 6-way if/else with template dispatch
+                // ==========================================================
                 if (is_last_iteration) {
-                    if (state->use_newton) {
-                        if (state->use_full_newton) {
-                            svpf_fused_stein_transport_full_newton_ksd_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
-                                state->h, state->grad_log_p, opt->d_inv_hessian,
-                                state->d_grad_v, state->rng_states, opt->d_bandwidth,
-                                opt->d_ksd_partial,
-                                base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps,
-                                state->stein_repulsive_sign, n
-                            );
-                        } else {
-                            svpf_fused_stein_transport_newton_ksd_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
-                                state->h, opt->d_precond_grad, opt->d_inv_hessian,
-                                state->d_grad_v, state->rng_states, opt->d_bandwidth,
-                                opt->d_ksd_partial,
-                                base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps,
-                                state->stein_repulsive_sign, n
-                            );
-                        }
-                    } else {
-                        svpf_fused_stein_transport_ksd_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
-                            state->h, state->grad_log_p, state->d_grad_v,
-                            state->rng_states, opt->d_bandwidth,
-                            opt->d_ksd_partial,
-                            base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps,
-                            state->stein_repulsive_sign, n
-                        );
-                    }
+                    // Last iteration: compute KSD for diagnostics
+                    launch_stein_dispatch<true>(
+                        state->use_full_newton, state->use_newton,
+                        state->h, state->grad_log_p, opt->d_precond_grad, opt->d_inv_hessian,
+                        state->d_grad_v, state->rng_states, opt->d_bandwidth,
+                        opt->d_ksd_partial,
+                        base_step, beta_factor, temp,
+                        state->rmsprop_rho, state->rmsprop_eps,
+                        state->stein_repulsive_sign,
+                        n, BLOCK_SIZE, stein_smem, cs
+                    );
                     
                     svpf_ksd_reduce_kernel<<<1, BLOCK_SIZE, 0, cs>>>(
                         opt->d_ksd_partial, opt->d_ksd, n
                     );
                 } else {
-                    if (state->use_newton) {
-                        if (state->use_full_newton) {
-                            svpf_fused_stein_transport_full_newton_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
-                                state->h, state->grad_log_p, opt->d_inv_hessian,
-                                state->d_grad_v, state->rng_states, opt->d_bandwidth,
-                                base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps,
-                                state->stein_repulsive_sign, n
-                            );
-                        } else {
-                            svpf_fused_stein_transport_newton_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
-                                state->h, opt->d_precond_grad, opt->d_inv_hessian,
-                                state->d_grad_v, state->rng_states, opt->d_bandwidth,
-                                base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps,
-                                state->stein_repulsive_sign, n
-                            );
-                        }
-                    } else {
-                        svpf_fused_stein_transport_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
-                            state->h, state->grad_log_p, state->d_grad_v,
-                            state->rng_states, opt->d_bandwidth,
-                            base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps,
-                            state->stein_repulsive_sign, n
-                        );
-                    }
+                    // Interior iterations: skip KSD
+                    launch_stein_dispatch<false>(
+                        state->use_full_newton, state->use_newton,
+                        state->h, state->grad_log_p, opt->d_precond_grad, opt->d_inv_hessian,
+                        state->d_grad_v, state->rng_states, opt->d_bandwidth,
+                        opt->d_ksd_partial,
+                        base_step, beta_factor, temp,
+                        state->rmsprop_rho, state->rmsprop_eps,
+                        state->stein_repulsive_sign,
+                        n, BLOCK_SIZE, stein_smem, cs
+                    );
                 }
             }
         }
         
-        // Store diagnostics
         state->anneal_stages_used = n_stages;
         state->anneal_final_var_ll = var_ll;
         state->anneal_final_h_std = h_std;
         
     } else {
-        // =====================================================================
-        // FIXED ANNEALING (Legacy - for comparison/fallback)
-        // =====================================================================
+        // =================================================================
+        // FIXED ANNEALING (Legacy)
+        // =================================================================
         
         int n_anneal = state->use_annealing ? state->n_anneal_steps : 1;
         
-        // KSD-ADAPTIVE BETA TEMPERING (Maken et al. 2022)
         auto compute_adaptive_beta = [](float ksd_prev, int anneal_idx, int n_anneal_steps) -> float {
-            if (anneal_idx == n_anneal_steps - 1) {
-                return 1.0f;
-            }
+            if (anneal_idx == n_anneal_steps - 1) return 1.0f;
             
             const float ksd_high = 0.50f;
             const float ksd_low = 0.05f;
@@ -983,7 +844,6 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
             return fminf(fmaxf(beta, 0.1f), 1.0f);
         };
         
-        // Determine step budget from PREVIOUS timestep's KSD
         int stein_budget;
         if (state->timestep < 10) {
             stein_budget = state->stein_max_steps;
@@ -992,7 +852,6 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
             float ksd_high = 0.50f;
             float ksd_normalized = (state->ksd_prev - ksd_low) / (ksd_high - ksd_low);
             ksd_normalized = fminf(fmaxf(ksd_normalized, 0.0f), 1.0f);
-            
             stein_budget = state->stein_min_steps + 
                            (int)(ksd_normalized * (state->stein_max_steps - state->stein_min_steps));
         }
@@ -1016,24 +875,22 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
                 total_steps++;
                 bool is_last_iteration = (ai == n_anneal - 1) && (s == si - 1);
                 
-                // =============================================================
-                // HEUN'S METHOD (Improved Euler, 2nd order)
-                // =============================================================
                 if (state->use_heun) {
-                    // --- Gradient at original h ---
+                    // ==========================================================
+                    // HEUN'S METHOD (unchanged — uses separate phi kernels)
+                    // ==========================================================
                     svpf_fused_gradient_kernel<<<nb, BLOCK_SIZE, grad_smem, cs>>>(
                         state->h, state->h_prev, state->grad_log_p, state->log_weights,
-                        state->use_newton ? opt->d_precond_grad : nullptr,
-                        state->use_newton ? opt->d_inv_hessian : nullptr,
+                        any_newton ? opt->d_precond_grad : nullptr,
+                        any_newton ? opt->d_inv_hessian : nullptr,
                         opt->d_y_single, 1, params->rho, effective_sigma_z, effective_mu,
                         beta, state->nu, student_t_const, state->lik_offset,
-                        params->gamma, state->use_exact_gradient, state->use_newton,
+                        params->gamma, state->use_exact_gradient, any_newton,
                         state->use_fan_mode,
                         state->use_student_t_state, state->nu_state,
                         n
                     );
                     
-                    // --- Compute phi(h) at original position ---
                     if (state->use_full_newton) {
                         svpf_stein_operator_full_newton_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
                             state->h, state->grad_log_p, opt->d_inv_hessian,
@@ -1047,34 +904,30 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
                         );
                     }
                     
-                    // --- Pointer swap ---
                     {
                         float* tmp = state->h;
                         state->h = opt->d_h_orig;
                         opt->d_h_orig = tmp;
                     }
                     
-                    // --- Heun predictor: h_tilde = h_orig + eps*phi ---
                     svpf_heun_predictor_kernel<<<nb, BLOCK_SIZE, 0, cs>>>(
                         state->h, opt->d_h_orig, opt->d_phi_orig,
                         state->d_grad_v, base_step, beta_factor,
                         state->rmsprop_eps, n
                     );
                     
-                    // --- Gradient at predicted h_tilde ---
                     svpf_fused_gradient_kernel<<<nb, BLOCK_SIZE, grad_smem, cs>>>(
                         state->h, state->h_prev, state->grad_log_p, state->log_weights,
-                        state->use_newton ? opt->d_precond_grad : nullptr,
-                        state->use_newton ? opt->d_inv_hessian : nullptr,
+                        any_newton ? opt->d_precond_grad : nullptr,
+                        any_newton ? opt->d_inv_hessian : nullptr,
                         opt->d_y_single, 1, params->rho, effective_sigma_z, effective_mu,
                         beta, state->nu, student_t_const, state->lik_offset,
-                        params->gamma, state->use_exact_gradient, state->use_newton,
+                        params->gamma, state->use_exact_gradient, any_newton,
                         state->use_fan_mode,
                         state->use_student_t_state, state->nu_state,
                         n
                     );
                     
-                    // --- Compute phi(h_tilde) at predicted position ---
                     if (state->use_full_newton) {
                         svpf_stein_operator_full_newton_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
                             state->h, state->grad_log_p, opt->d_inv_hessian,
@@ -1088,7 +941,6 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
                         );
                     }
                     
-                    // --- Heun corrector: h = h_orig + (eps/2)(phi1 + phi2) + noise ---
                     if (is_last_iteration) {
                         svpf_heun_corrector_ksd_kernel<<<nb, BLOCK_SIZE, 0, cs>>>(
                             state->h, opt->d_h_orig, opt->d_phi_orig, opt->d_phi_pred,
@@ -1110,92 +962,59 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
                     }
                     
                 } else {
-                    // =============================================================
-                    // EULER METHOD (Standard, 1st order)
-                    // =============================================================
+                    // ==========================================================
+                    // EULER METHOD — v2: unified dispatch
+                    // ==========================================================
                     
                     svpf_fused_gradient_kernel<<<nb, BLOCK_SIZE, grad_smem, cs>>>(
                         state->h, state->h_prev, state->grad_log_p, state->log_weights,
-                        state->use_newton ? opt->d_precond_grad : nullptr,
-                        state->use_newton ? opt->d_inv_hessian : nullptr,
+                        any_newton ? opt->d_precond_grad : nullptr,
+                        any_newton ? opt->d_inv_hessian : nullptr,
                         opt->d_y_single, 1, params->rho, effective_sigma_z, effective_mu,
                         beta, state->nu, student_t_const, state->lik_offset,
-                        params->gamma, state->use_exact_gradient, state->use_newton,
+                        params->gamma, state->use_exact_gradient, any_newton,
                         state->use_fan_mode,
                         state->use_student_t_state, state->nu_state,
                         n
                     );
                     
-                    // Stein transport
+                    // v2: Replaces 6 separate kernel calls with 1 dispatch
                     if (is_last_iteration) {
-                        if (state->use_newton) {
-                            if (state->use_full_newton) {
-                                svpf_fused_stein_transport_full_newton_ksd_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
-                                    state->h, state->grad_log_p, opt->d_inv_hessian,
-                                    state->d_grad_v, state->rng_states, opt->d_bandwidth,
-                                    opt->d_ksd_partial,
-                                    base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps,
-                                    state->stein_repulsive_sign, n
-                                );
-                            } else {
-                                svpf_fused_stein_transport_newton_ksd_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
-                                    state->h, opt->d_precond_grad, opt->d_inv_hessian,
-                                    state->d_grad_v, state->rng_states, opt->d_bandwidth,
-                                    opt->d_ksd_partial,
-                                    base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps,
-                                    state->stein_repulsive_sign, n
-                                );
-                            }
-                        } else {
-                            svpf_fused_stein_transport_ksd_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
-                                state->h, state->grad_log_p, state->d_grad_v,
-                                state->rng_states, opt->d_bandwidth,
-                                opt->d_ksd_partial,
-                                base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps,
-                                state->stein_repulsive_sign, n
-                            );
-                        }
+                        launch_stein_dispatch<true>(
+                            state->use_full_newton, state->use_newton,
+                            state->h, state->grad_log_p, opt->d_precond_grad, opt->d_inv_hessian,
+                            state->d_grad_v, state->rng_states, opt->d_bandwidth,
+                            opt->d_ksd_partial,
+                            base_step, beta_factor, temp,
+                            state->rmsprop_rho, state->rmsprop_eps,
+                            state->stein_repulsive_sign,
+                            n, BLOCK_SIZE, stein_smem, cs
+                        );
                         
                         svpf_ksd_reduce_kernel<<<1, BLOCK_SIZE, 0, cs>>>(
                             opt->d_ksd_partial, opt->d_ksd, n
                         );
                     } else {
-                        if (state->use_newton) {
-                            if (state->use_full_newton) {
-                                svpf_fused_stein_transport_full_newton_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
-                                    state->h, state->grad_log_p, opt->d_inv_hessian,
-                                    state->d_grad_v, state->rng_states, opt->d_bandwidth,
-                                    base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps,
-                                    state->stein_repulsive_sign, n
-                                );
-                            } else {
-                                svpf_fused_stein_transport_newton_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
-                                    state->h, opt->d_precond_grad, opt->d_inv_hessian,
-                                    state->d_grad_v, state->rng_states, opt->d_bandwidth,
-                                    base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps,
-                                    state->stein_repulsive_sign, n
-                                );
-                            }
-                        } else {
-                            svpf_fused_stein_transport_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
-                                state->h, state->grad_log_p, state->d_grad_v,
-                                state->rng_states, opt->d_bandwidth,
-                                base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps,
-                                state->stein_repulsive_sign, n
-                            );
-                        }
+                        launch_stein_dispatch<false>(
+                            state->use_full_newton, state->use_newton,
+                            state->h, state->grad_log_p, opt->d_precond_grad, opt->d_inv_hessian,
+                            state->d_grad_v, state->rng_states, opt->d_bandwidth,
+                            opt->d_ksd_partial,
+                            base_step, beta_factor, temp,
+                            state->rmsprop_rho, state->rmsprop_eps,
+                            state->stein_repulsive_sign,
+                            n, BLOCK_SIZE, stein_smem, cs
+                        );
                     }
                 }
             }
         }
     }
     
-    
-    // Store diagnostic
     state->stein_steps_used = total_steps;
     
     // =========================================================================
-    // PARTIAL REJUVENATION (Maken et al. 2022)
+    // PARTIAL REJUVENATION
     // =========================================================================
     if (state->use_rejuvenation && state->use_guide && state->timestep > 10) {
         if (state->ksd_prev > state->rejuv_ksd_threshold) {
@@ -1213,7 +1032,7 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
     }
     
     // =========================================================================
-    // OUTPUTS (consolidated D2H transfer)
+    // OUTPUTS
     // =========================================================================
     svpf_fused_outputs_kernel<<<1, BLOCK_SIZE, 0, cs>>>(
         state->h, state->log_weights,
@@ -1223,17 +1042,15 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
         0, n
     );
     
-    // Single D2H transfer (5 floats packed, 32 bytes)
     cudaMemcpyAsync(opt->h_output_pinned, opt->d_output_pack, 
                     5 * sizeof(float), cudaMemcpyDeviceToHost, cs);
     
-    // Store params needed for post-sync processing
     opt->pending_y_t = y_t;
     opt->pending_params = (const void*)params;
 }
 
 // =============================================================================
-// SYNC AND FINALIZE: Wait for GPU, read outputs, update state
+// SYNC AND FINALIZE
 // =============================================================================
 
 void svpf_sync_outputs(SVPFState* state, 
@@ -1243,23 +1060,18 @@ void svpf_sync_outputs(SVPFState* state,
     
     cudaStreamSynchronize(cs);
     
-    // Unpack results: [loglik, vol, h_mean, bandwidth, ksd]
     float* results = opt->h_output_pinned;
     float h_mean_local = results[2];
     float bandwidth_local = results[3];
     float vol_local = results[1];
     float ksd_local = results[4];
     
-    // =========================================================================
-    // BACKWARD SMOOTHING (Optional)
-    // =========================================================================
     float h_var_est = bandwidth_local * bandwidth_local;
     const SVPFParams* params = (const SVPFParams*)opt->pending_params;
     svpf_smooth_backward(state, h_mean_local, h_var_est, opt->pending_y_t, params);
     
     float h_mean_output = svpf_get_smoothed_output(state, h_mean_local);
     
-    // Return outputs
     if (h_loglik_out) *h_loglik_out = results[0];
     if (h_vol_out) *h_vol_out = vol_local;
     if (h_mean_out) *h_mean_out = h_mean_output;
@@ -1275,7 +1087,7 @@ void svpf_sync_outputs(SVPFState* state,
 }
 
 // =============================================================================
-// SYNCHRONOUS STEP (Original API - calls async + sync)
+// SYNCHRONOUS STEP
 // =============================================================================
 
 void svpf_step_graph(SVPFState* state, float y_t, float y_prev, const SVPFParams* params,
@@ -1378,10 +1190,6 @@ float svpf_get_ess(const SVPFState* state) {
     free(lw);
     return (sw * sw) / (sw2 + 1e-10f);
 }
-
-// =============================================================================
-// DIAGNOSTIC: Get KSD and Stein steps used
-// =============================================================================
 
 void svpf_get_ksd_stats(const SVPFState* state, float* ksd_out, int* steps_used_out) {
     if (ksd_out) *ksd_out = state->ksd_prev;
