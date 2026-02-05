@@ -1,0 +1,2385 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SVPF Design Philosophy</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Source+Serif+4:ital,wght@0,300;0,400;0,600;0,700;1,300;1,400&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0a0a0f;
+  --bg-elevated: #12121a;
+  --bg-card: #16161f;
+  --border: #1e1e2a;
+  --border-accent: #2a2a3a;
+  --text: #c8c8d4;
+  --text-bright: #e8e8f0;
+  --text-dim: #6a6a7a;
+  --text-muted: #4a4a5a;
+  --accent-blue: #4a7fff;
+  --accent-cyan: #3ecfcf;
+  --accent-orange: #e8944a;
+  --accent-red: #e85a5a;
+  --accent-green: #4abe7a;
+  --accent-purple: #8a6aef;
+  --accent-yellow: #d4b84a;
+  --glow-blue: rgba(74, 127, 255, 0.15);
+  --glow-cyan: rgba(62, 207, 207, 0.1);
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html { scroll-behavior: smooth; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Source Serif 4', Georgia, serif;
+  font-size: 17px;
+  line-height: 1.75;
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection {
+  background: var(--accent-blue);
+  color: white;
+}
+
+/* ========== LAYOUT ========== */
+.container {
+  max-width: 920px;
+  margin: 0 auto;
+  padding: 0 32px;
+}
+
+/* ========== HERO ========== */
+.hero {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  position: relative;
+  overflow: hidden;
+}
+
+.hero::before {
+  content: '';
+  position: absolute;
+  top: -50%;
+  left: -50%;
+  width: 200%;
+  height: 200%;
+  background: 
+    radial-gradient(ellipse at 30% 50%, rgba(74, 127, 255, 0.04) 0%, transparent 50%),
+    radial-gradient(ellipse at 70% 30%, rgba(62, 207, 207, 0.03) 0%, transparent 40%);
+  animation: heroGlow 20s ease-in-out infinite alternate;
+}
+
+@keyframes heroGlow {
+  0% { transform: translate(0, 0) rotate(0deg); }
+  100% { transform: translate(-2%, 1%) rotate(1deg); }
+}
+
+.hero-content {
+  position: relative;
+  z-index: 1;
+}
+
+.hero h1 {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: clamp(2.4rem, 5vw, 3.6rem);
+  font-weight: 700;
+  color: var(--text-bright);
+  letter-spacing: -1px;
+  line-height: 1.15;
+  margin-bottom: 24px;
+}
+
+.hero h1 span {
+  display: block;
+  font-size: 0.45em;
+  font-weight: 300;
+  color: var(--text-dim);
+  letter-spacing: 3px;
+  text-transform: uppercase;
+  margin-bottom: 12px;
+}
+
+.hero-subtitle {
+  font-size: 1.25rem;
+  color: var(--text-dim);
+  font-style: italic;
+  max-width: 640px;
+  margin-bottom: 48px;
+}
+
+.hero-principle {
+  border-left: 2px solid var(--accent-blue);
+  padding: 16px 24px;
+  background: var(--glow-blue);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.95rem;
+  color: var(--accent-cyan);
+  max-width: 680px;
+}
+
+/* ========== NAVIGATION ========== */
+.nav-bar {
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  background: rgba(10, 10, 15, 0.9);
+  backdrop-filter: blur(16px);
+  border-bottom: 1px solid var(--border);
+  padding: 14px 0;
+}
+
+.nav-inner {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.nav-inner::-webkit-scrollbar { display: none; }
+
+.nav-link {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  text-decoration: none;
+  padding: 6px 14px;
+  border-radius: 4px;
+  white-space: nowrap;
+  transition: all 0.2s;
+  border: 1px solid transparent;
+  letter-spacing: 0.5px;
+}
+
+.nav-link:hover {
+  color: var(--text-bright);
+  background: var(--bg-card);
+  border-color: var(--border);
+}
+
+/* ========== SECTIONS ========== */
+section {
+  padding: 100px 0 60px;
+  border-bottom: 1px solid var(--border);
+}
+
+section:last-of-type { border-bottom: none; }
+
+.section-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 3px;
+  text-transform: uppercase;
+  color: var(--accent-blue);
+  margin-bottom: 16px;
+}
+
+h2 {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 1.8rem;
+  font-weight: 600;
+  color: var(--text-bright);
+  margin-bottom: 32px;
+  letter-spacing: -0.5px;
+}
+
+h3 {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 1.15rem;
+  font-weight: 500;
+  color: var(--text-bright);
+  margin: 40px 0 16px;
+}
+
+p { margin-bottom: 20px; }
+
+/* ========== ARCHITECTURE DIAGRAM ========== */
+.arch-flow {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  margin: 48px 0;
+}
+
+.arch-stage {
+  display: grid;
+  grid-template-columns: 140px 1fr;
+  gap: 0;
+  position: relative;
+}
+
+.arch-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.8rem;
+  font-weight: 600;
+  padding: 20px 16px 20px 0;
+  text-align: right;
+  position: relative;
+  color: var(--text-dim);
+}
+
+.arch-label::after {
+  content: '';
+  position: absolute;
+  right: -1px;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--border-accent);
+}
+
+.arch-stage:first-child .arch-label::after { top: 50%; }
+.arch-stage:last-child .arch-label::after { bottom: 50%; }
+
+.arch-label .dot {
+  position: absolute;
+  right: -6px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 2px solid;
+  background: var(--bg);
+  z-index: 2;
+}
+
+.arch-body {
+  padding: 16px 0 16px 28px;
+  border-bottom: 1px solid var(--border);
+}
+
+.arch-stage:last-child .arch-body { border-bottom: none; }
+
+.arch-body .tag {
+  display: inline-block;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.68rem;
+  padding: 2px 8px;
+  border-radius: 3px;
+  margin-right: 6px;
+  margin-bottom: 4px;
+}
+
+.arch-body p {
+  font-size: 0.92rem;
+  margin-bottom: 8px;
+  color: var(--text);
+}
+
+.arch-body .role {
+  font-size: 0.82rem;
+  color: var(--text-dim);
+  font-style: italic;
+}
+
+/* Stage colors */
+.stage-predict .dot { border-color: var(--accent-orange); }
+.stage-predict .arch-label { color: var(--accent-orange); }
+.stage-predict .tag { background: rgba(232, 148, 74, 0.15); color: var(--accent-orange); border: 1px solid rgba(232, 148, 74, 0.25); }
+
+.stage-guide .dot { border-color: var(--accent-green); }
+.stage-guide .arch-label { color: var(--accent-green); }
+.stage-guide .tag { background: rgba(74, 190, 122, 0.15); color: var(--accent-green); border: 1px solid rgba(74, 190, 122, 0.25); }
+
+.stage-stein .dot { border-color: var(--accent-blue); }
+.stage-stein .arch-label { color: var(--accent-blue); }
+.stage-stein .tag { background: rgba(74, 127, 255, 0.15); color: var(--accent-blue); border: 1px solid rgba(74, 127, 255, 0.25); }
+
+.stage-explore .dot { border-color: var(--accent-purple); }
+.stage-explore .arch-label { color: var(--accent-purple); }
+.stage-explore .tag { background: rgba(138, 106, 239, 0.15); color: var(--accent-purple); border: 1px solid rgba(138, 106, 239, 0.25); }
+
+.stage-output .dot { border-color: var(--accent-cyan); }
+.stage-output .arch-label { color: var(--accent-cyan); }
+.stage-output .tag { background: rgba(62, 207, 207, 0.15); color: var(--accent-cyan); border: 1px solid rgba(62, 207, 207, 0.25); }
+
+/* ========== MODEL CARDS ========== */
+.model-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 20px;
+  margin: 32px 0;
+}
+
+@media (max-width: 700px) {
+  .model-grid { grid-template-columns: 1fr; }
+}
+
+.model-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 28px;
+  position: relative;
+  overflow: hidden;
+  transition: border-color 0.3s;
+}
+
+.model-card:hover { border-color: var(--border-accent); }
+
+.model-card.active-choice {
+  border-color: var(--accent-green);
+  box-shadow: 0 0 30px rgba(74, 190, 122, 0.08);
+}
+
+.model-card.active-choice::before {
+  content: 'ACTIVE';
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.6rem;
+  font-weight: 700;
+  letter-spacing: 2px;
+  color: var(--accent-green);
+  background: rgba(74, 190, 122, 0.12);
+  padding: 3px 10px;
+  border-radius: 3px;
+  border: 1px solid rgba(74, 190, 122, 0.25);
+}
+
+.model-card.future-choice {
+  border-color: var(--accent-cyan);
+  box-shadow: 0 0 30px rgba(62, 207, 207, 0.05);
+}
+
+.model-card.future-choice::before {
+  content: 'PLANNED';
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.6rem;
+  font-weight: 700;
+  letter-spacing: 2px;
+  color: var(--accent-cyan);
+  background: rgba(62, 207, 207, 0.12);
+  padding: 3px 10px;
+  border-radius: 3px;
+  border: 1px solid rgba(62, 207, 207, 0.25);
+}
+
+.model-card.rejected-choice {
+  opacity: 0.55;
+}
+
+.model-card.rejected-choice::before {
+  content: 'REJECTED';
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.6rem;
+  font-weight: 700;
+  letter-spacing: 2px;
+  color: var(--accent-red);
+  background: rgba(232, 90, 90, 0.12);
+  padding: 3px 10px;
+  border-radius: 3px;
+  border: 1px solid rgba(232, 90, 90, 0.2);
+}
+
+.model-card h4 {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--text-bright);
+  margin-bottom: 12px;
+}
+
+.model-card .formula {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.78rem;
+  color: var(--accent-cyan);
+  background: rgba(62, 207, 207, 0.06);
+  padding: 10px 14px;
+  border-radius: 4px;
+  margin: 12px 0;
+  border-left: 2px solid rgba(62, 207, 207, 0.3);
+  overflow-x: auto;
+  white-space: pre;
+  line-height: 1.6;
+}
+
+.model-card .description {
+  font-size: 0.88rem;
+  color: var(--text);
+  line-height: 1.65;
+}
+
+.model-card .why {
+  font-size: 0.82rem;
+  color: var(--text-dim);
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+  font-style: italic;
+}
+
+/* ========== PARTICLE VISUALIZATION ========== */
+.particle-viz {
+  position: relative;
+  height: 340px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin: 32px 0;
+  overflow: hidden;
+}
+
+.particle-viz canvas {
+  width: 100%;
+  height: 100%;
+}
+
+.viz-label {
+  position: absolute;
+  bottom: 12px;
+  left: 16px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  letter-spacing: 1px;
+}
+
+.viz-legend {
+  position: absolute;
+  top: 12px;
+  right: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.viz-legend-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.65rem;
+  color: var(--text-dim);
+}
+
+.viz-legend-item .swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+}
+
+/* ========== INTERACTION MATRIX ========== */
+.interaction-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 32px 0;
+  font-size: 0.85rem;
+}
+
+.interaction-table th {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--text-dim);
+  padding: 12px 16px;
+  text-align: left;
+  border-bottom: 2px solid var(--border-accent);
+  background: var(--bg-elevated);
+}
+
+.interaction-table td {
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+
+.interaction-table tr:hover td {
+  background: var(--bg-elevated);
+}
+
+.interaction-table .comp-name {
+  font-family: 'JetBrains Mono', monospace;
+  font-weight: 600;
+  color: var(--text-bright);
+  white-space: nowrap;
+}
+
+.cell-strong { color: var(--accent-green); }
+.cell-moderate { color: var(--accent-yellow); }
+.cell-minimal { color: var(--text-muted); }
+
+/* ========== CALLOUT ========== */
+.callout {
+  border-left: 3px solid;
+  padding: 20px 24px;
+  margin: 32px 0;
+  border-radius: 0 6px 6px 0;
+  font-size: 0.92rem;
+}
+
+.callout.philosophy {
+  border-color: var(--accent-blue);
+  background: var(--glow-blue);
+}
+
+.callout.warning {
+  border-color: var(--accent-orange);
+  background: rgba(232, 148, 74, 0.06);
+}
+
+.callout.key {
+  border-color: var(--accent-cyan);
+  background: var(--glow-cyan);
+}
+
+.callout-title {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  margin-bottom: 8px;
+}
+
+.callout.philosophy .callout-title { color: var(--accent-blue); }
+.callout.warning .callout-title { color: var(--accent-orange); }
+.callout.key .callout-title { color: var(--accent-cyan); }
+
+/* ========== CODE BLOCKS ========== */
+.code-block {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.78rem;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 20px 24px;
+  margin: 20px 0;
+  overflow-x: auto;
+  line-height: 1.7;
+  color: var(--text);
+}
+
+.code-block .comment { color: var(--text-muted); }
+.code-block .keyword { color: var(--accent-blue); }
+.code-block .type { color: var(--accent-cyan); }
+.code-block .string { color: var(--accent-green); }
+.code-block .number { color: var(--accent-orange); }
+
+/* ========== COMPARISON VISUAL ========== */
+.compare-strip {
+  display: flex;
+  gap: 2px;
+  margin: 32px 0;
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.compare-cell {
+  flex: 1;
+  padding: 20px 16px;
+  text-align: center;
+  position: relative;
+}
+
+.compare-cell .label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  margin-bottom: 8px;
+}
+
+.compare-cell .value {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 1.4rem;
+  font-weight: 700;
+  color: var(--text-bright);
+}
+
+.compare-cell .sub {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  margin-top: 4px;
+}
+
+.compare-cell.c-orange { background: rgba(232, 148, 74, 0.08); }
+.compare-cell.c-orange .label { color: var(--accent-orange); }
+.compare-cell.c-green { background: rgba(74, 190, 122, 0.08); }
+.compare-cell.c-green .label { color: var(--accent-green); }
+.compare-cell.c-blue { background: rgba(74, 127, 255, 0.08); }
+.compare-cell.c-blue .label { color: var(--accent-blue); }
+.compare-cell.c-purple { background: rgba(138, 106, 239, 0.08); }
+.compare-cell.c-purple .label { color: var(--accent-purple); }
+
+/* ========== FLOW DIAGRAMS ========== */
+.flow-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 16px 0;
+  flex-wrap: wrap;
+}
+
+.flow-box {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.75rem;
+  padding: 8px 16px;
+  border-radius: 5px;
+  border: 1px solid;
+  white-space: nowrap;
+}
+
+.flow-arrow {
+  color: var(--text-muted);
+  font-size: 1.2rem;
+}
+
+.flow-box.f-orange { border-color: rgba(232, 148, 74, 0.4); background: rgba(232, 148, 74, 0.08); color: var(--accent-orange); }
+.flow-box.f-green { border-color: rgba(74, 190, 122, 0.4); background: rgba(74, 190, 122, 0.08); color: var(--accent-green); }
+.flow-box.f-blue { border-color: rgba(74, 127, 255, 0.4); background: rgba(74, 127, 255, 0.08); color: var(--accent-blue); }
+.flow-box.f-purple { border-color: rgba(138, 106, 239, 0.4); background: rgba(138, 106, 239, 0.08); color: var(--accent-purple); }
+.flow-box.f-cyan { border-color: rgba(62, 207, 207, 0.4); background: rgba(62, 207, 207, 0.08); color: var(--accent-cyan); }
+
+/* ========== GRADIENT VIS ========== */
+.gradient-demo {
+  position: relative;
+  height: 220px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin: 32px 0;
+  overflow: hidden;
+}
+
+.gradient-demo canvas {
+  width: 100%;
+  height: 100%;
+}
+
+/* ========== PHILOSOPHY BLOCKS ========== */
+.philosophy-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 20px;
+  margin: 32px 0;
+}
+
+@media (max-width: 700px) {
+  .philosophy-grid { grid-template-columns: 1fr; }
+}
+
+.phil-card {
+  padding: 28px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+}
+
+.phil-card.do {
+  background: rgba(74, 190, 122, 0.04);
+  border-color: rgba(74, 190, 122, 0.2);
+}
+
+.phil-card.dont {
+  background: rgba(232, 90, 90, 0.04);
+  border-color: rgba(232, 90, 90, 0.2);
+}
+
+.phil-card h4 {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.8rem;
+  font-weight: 700;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  margin-bottom: 16px;
+}
+
+.phil-card.do h4 { color: var(--accent-green); }
+.phil-card.dont h4 { color: var(--accent-red); }
+
+.phil-card li {
+  font-size: 0.88rem;
+  margin-bottom: 10px;
+  margin-left: 16px;
+  color: var(--text);
+}
+
+/* ========== FOOTER ========== */
+footer {
+  padding: 60px 0;
+  text-align: center;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  letter-spacing: 1px;
+}
+
+/* ========== ANIMATION: Particle sim ========== */
+@keyframes particleDrift {
+  0% { transform: translateX(0) translateY(0); }
+  25% { transform: translateX(2px) translateY(-1px); }
+  50% { transform: translateX(-1px) translateY(2px); }
+  75% { transform: translateX(1px) translateY(-2px); }
+  100% { transform: translateX(0) translateY(0); }
+}
+
+/* ========== RESPONSIVE ========== */
+@media (max-width: 700px) {
+  .arch-stage { grid-template-columns: 100px 1fr; }
+  .compare-strip { flex-direction: column; }
+  .hero h1 { font-size: 2rem; }
+  .container { padding: 0 20px; }
+}
+
+/* ========== TIMELINE ========== */
+.timeline-strip {
+  display: flex;
+  align-items: stretch;
+  margin: 32px 0;
+  border-radius: 6px;
+  overflow: hidden;
+  min-height: 120px;
+}
+
+.timeline-phase {
+  flex: 1;
+  padding: 20px 16px;
+  border-right: 1px solid rgba(255,255,255,0.05);
+  position: relative;
+}
+
+.timeline-phase:last-child { border-right: none; }
+
+.timeline-phase .phase-time {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.65rem;
+  font-weight: 600;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  margin-bottom: 8px;
+}
+
+.timeline-phase .phase-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--text-bright);
+  margin-bottom: 6px;
+}
+
+.timeline-phase .phase-desc {
+  font-size: 0.78rem;
+  color: var(--text-dim);
+  line-height: 1.5;
+}
+
+.tp-predict { background: rgba(232, 148, 74, 0.06); }
+.tp-predict .phase-time { color: var(--accent-orange); }
+.tp-guide { background: rgba(74, 190, 122, 0.06); }
+.tp-guide .phase-time { color: var(--accent-green); }
+.tp-stein { background: rgba(74, 127, 255, 0.06); }
+.tp-stein .phase-time { color: var(--accent-blue); }
+.tp-svld { background: rgba(138, 106, 239, 0.06); }
+.tp-svld .phase-time { color: var(--accent-purple); }
+.tp-output { background: rgba(62, 207, 207, 0.06); }
+.tp-output .phase-time { color: var(--accent-cyan); }
+
+/* Score comparison animation */
+.score-comparison {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 20px;
+  margin: 32px 0;
+}
+
+@media (max-width: 700px) {
+  .score-comparison { grid-template-columns: 1fr; }
+  .timeline-strip { flex-direction: column; }
+}
+
+.score-panel {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.score-panel-header {
+  padding: 14px 20px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.78rem;
+  font-weight: 600;
+  border-bottom: 1px solid var(--border);
+}
+
+.score-panel canvas {
+  width: 100%;
+  height: 180px;
+  display: block;
+}
+
+.sp-student .score-panel-header { color: var(--accent-orange); background: rgba(232, 148, 74, 0.06); }
+.sp-ocsn .score-panel-header { color: var(--accent-cyan); background: rgba(62, 207, 207, 0.06); }
+</style>
+</head>
+<body>
+
+<!-- ===== HERO ===== -->
+<div class="hero">
+  <div class="container hero-content">
+    <h1>
+      <span>Design Philosophy</span>
+      Stein Variational<br>Particle Filter
+    </h1>
+    <p class="hero-subtitle">
+      Computation solves the problem, not heuristics. Every component exists 
+      to help the likelihood gradient do its job — nothing more.
+    </p>
+    <div class="hero-principle">
+      The only thing that should shape the posterior is ∇ log p(y | x)<br>
+      evaluated on real data. Everything else is infrastructure.
+    </div>
+  </div>
+</div>
+
+<!-- ===== NAV ===== -->
+<nav class="nav-bar">
+  <div class="container nav-inner">
+    <a href="#architecture" class="nav-link">Architecture</a>
+    <a href="#state" class="nav-link">State Models</a>
+    <a href="#observation" class="nav-link">Observation Models</a>
+    <a href="#newton-stein" class="nav-link">Newton–Stein</a>
+    <a href="#mixture-prior" class="nav-link">Mixture Prior</a>
+    <a href="#annealing" class="nav-link">Annealing</a>
+    <a href="#ekf" class="nav-link">EKF Guide</a>
+    <a href="#svld" class="nav-link">SVLD</a>
+    <a href="#interactions" class="nav-link">Interactions</a>
+    <a href="#philosophy" class="nav-link">Philosophy</a>
+  </div>
+</nav>
+
+<!-- ===== ARCHITECTURE OVERVIEW ===== -->
+<section id="architecture">
+  <div class="container">
+    <div class="section-label">System Architecture</div>
+    <h2>The Pipeline</h2>
+    
+    <p>
+      Each timestep processes a single observation — a market return y<sub>t</sub> — and 
+      produces a posterior distribution over latent log-volatility h<sub>t</sub>. The pipeline 
+      has four stages, each with a single clearly-defined responsibility. No stage duplicates 
+      another's function. No stage injects opinions about what the answer should be.
+    </p>
+
+    <div class="arch-flow">
+      <div class="arch-stage stage-predict">
+        <div class="arch-label">
+          Predict
+          <div class="dot"></div>
+        </div>
+        <div class="arch-body">
+          <span class="tag">Student-t AR(1)</span>
+          <span class="tag">Antithetic</span>
+          <p>Spread particles forward in time. Honest about magnitude uncertainty, 
+          silent about direction. Symmetric ±z pairs guarantee well-formed cloud.</p>
+          <div class="role">"I don't know which direction vol is going."</div>
+        </div>
+      </div>
+
+      <div class="arch-stage stage-guide">
+        <div class="arch-label">
+          Guide
+          <div class="dot"></div>
+        </div>
+        <div class="arch-body">
+          <span class="tag">EKF Update</span>
+          <span class="tag">Preserving</span>
+          <p>Cheap linearized Bayesian update. Shifts particle cloud toward analytically 
+          implied vol without collapsing spread. Warm start for Newton-Stein.</p>
+          <div class="role">"The data suggests vol is roughly here — start nearby."</div>
+        </div>
+      </div>
+
+      <div class="arch-stage stage-stein">
+        <div class="arch-label">
+          Stein Loop
+          <div class="dot"></div>
+        </div>
+        <div class="arch-body">
+          <span class="tag">Full Newton</span>
+          <span class="tag">Adaptive Anneal</span>
+          <span class="tag">O(N²) Mixture Prior</span>
+          <span class="tag">KSD Monitor</span>
+          <p>Deterministic transport of particles to the true posterior. Hessian-scaled 
+          gradient steps with KL-constrained beta scheduling and O(N²) mixture prior 
+          gradient. The computational core — where accuracy comes from.</p>
+          <div class="role">"Here is the exact posterior, computed from the actual likelihood and the correct prior."</div>
+        </div>
+      </div>
+
+      <div class="arch-stage stage-explore">
+        <div class="arch-label">
+          Explore
+          <div class="dot"></div>
+        </div>
+        <div class="arch-body">
+          <span class="tag">SVLD Noise</span>
+          <p>Stein Variational Langevin Dynamics — calibrated noise injection 
+          during transport. Guarantees ergodicity: particles can always escape 
+          local traps. Vanishes as beta → 1.</p>
+          <div class="role">"Never get permanently stuck."</div>
+        </div>
+      </div>
+
+      <div class="arch-stage stage-output">
+        <div class="arch-label">
+          Output
+          <div class="dot"></div>
+        </div>
+        <div class="arch-body">
+          <span class="tag">Fused Kernel</span>
+          <span class="tag">Adaptive μ</span>
+          <p>Single kernel computes all output statistics. Adaptive mu Kalman 
+          filter updates long-run mean from particle centroid. One pinned D2H 
+          transfer — 32 bytes.</p>
+          <div class="role">"Here is what the data says. State updated for next tick."</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="timeline-strip">
+      <div class="timeline-phase tp-predict">
+        <div class="phase-time">~5 μs</div>
+        <div class="phase-label">Predict</div>
+        <div class="phase-desc">512 particles × AR(1) + antithetic pairs</div>
+      </div>
+      <div class="timeline-phase tp-guide">
+        <div class="phase-time">~2 μs</div>
+        <div class="phase-label">Guide</div>
+        <div class="phase-desc">EKF + preserving shift</div>
+      </div>
+      <div class="timeline-phase tp-stein" style="flex: 4;">
+        <div class="phase-time">~330 μs</div>
+        <div class="phase-label">Newton–Stein + Annealing</div>
+        <div class="phase-desc">8 steps × (gradient + O(N²) transport). ~95% of total compute.</div>
+      </div>
+      <div class="timeline-phase tp-svld">
+        <div class="phase-time">incl.</div>
+        <div class="phase-label">SVLD</div>
+        <div class="phase-desc">Fused into Stein kernel</div>
+      </div>
+      <div class="timeline-phase tp-output">
+        <div class="phase-time">~3 μs</div>
+        <div class="phase-label">Output</div>
+        <div class="phase-desc">Stats + D2H sync</div>
+      </div>
+    </div>
+
+    <div class="callout philosophy">
+      <div class="callout-title">Design Principle</div>
+      <p style="margin-bottom:0;">
+        95% of compute is in Newton–Stein transport. This is deliberate. The predict 
+        step is intentionally dumb — symmetric, directionless. The guide is intentionally 
+        cheap — first-order approximation. All accuracy comes from the Stein loop iterating 
+        on the real likelihood gradient with the real Hessian. <strong>Computation solves 
+        the problem, not heuristics.</strong>
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- ===== STATE MODELS ===== -->
+<section id="state">
+  <div class="container">
+    <div class="section-label">State Dynamics</div>
+    <h2>p(h<sub>t</sub> | h<sub>t-1</sub>)</h2>
+    
+    <p>
+      The state model determines how particles spread during the predict step. It answers 
+      one question: given yesterday's log-volatility h<sub>t-1</sub>, what is the 
+      distribution of possible values for today's h<sub>t</sub>? This is the <em>proposal</em> — 
+      it determines where particles start before Newton-Stein corrects them.
+    </p>
+
+    <div class="callout philosophy">
+      <div class="callout-title">Why the State Model Matters Less Than You Think</div>
+      <p style="margin-bottom:0;">
+        The Stein operator does not evaluate the transition density. It only needs 
+        ∇<sub>h</sub> log p(y|h). The state model affects where particles start, not where 
+        they end up. A better proposal means faster convergence (fewer Stein steps). A worse 
+        proposal means more steps. The posterior is determined by the likelihood gradient 
+        regardless. This is why we deliberately keep the state model simple.
+      </p>
+    </div>
+
+    <div class="model-grid">
+      <div class="model-card rejected-choice">
+        <h4>Gaussian AR(1)</h4>
+        <div class="formula">h_t = μ + ρ(h_{t-1} - μ) + σ_z · ε
+ε ~ N(0, 1)</div>
+        <div class="description">
+          Simplest possible state dynamics. Mean-reverting, symmetric, well-understood. 
+          Exponential forgetting of shocks.
+        </div>
+        <div class="why">
+          <strong>Rejected:</strong> Light tails underestimate magnitude of vol jumps. 
+          During crashes, no particles land far enough from the mean. The Stein loop 
+          can't correct if zero particles are in the right neighborhood.
+        </div>
+      </div>
+
+      <div class="model-card active-choice">
+        <h4>Student-t AR(1)</h4>
+        <div class="formula">h_t = μ + ρ(h_{t-1} - μ) + σ_z · ε
+ε ~ t(ν_state),  ν_state ≈ 5</div>
+        <div class="description">
+          Same AR(1) structure, but innovations are drawn from a Student-t distribution 
+          with ν ≈ 5 degrees of freedom. Naturally places more particle mass in the tails 
+          without any binary jump/no-jump decision.
+        </div>
+        <div class="why">
+          <strong>Chosen because:</strong> Heavy tails are continuous, not heuristic. No 
+          jump probability to tune, no jump scale to calibrate. Some particles naturally land 
+          far from the mean. When vol actually jumps, they're already there. When it doesn't, 
+          Newton-Stein pulls them back. One parameter (ν_state) with a clean interpretation.
+        </div>
+      </div>
+
+      <div class="model-card rejected-choice">
+        <h4>Jump-Diffusion (MIM)</h4>
+        <div class="formula">h_t = μ + ρ(h_{t-1} - μ) + σ_z · ε + J·Z
+J ~ Bernoulli(λ),  Z ~ N(μ_J, σ²_J)</div>
+        <div class="description">
+          Gaussian AR(1) plus discrete Poisson jumps. Mixture Innovation Model — 
+          particles are occasionally perturbed by large random kicks.
+        </div>
+        <div class="why">
+          <strong>Rejected:</strong> Three extra parameters (λ, μ_J, σ_J) that are 
+          heuristics. Jump probability is a guess. Jump scale is a guess. When these 
+          guesses are wrong, the jumps fight the Stein correction instead of helping it.
+          Student-t achieves the same tail coverage with one parameter and no binary decisions.
+        </div>
+      </div>
+
+      <div class="model-card rejected-choice">
+        <h4>Asymmetric ρ</h4>
+        <div class="formula">ρ_effective = ρ_up   if h_t > h_{t-1}
+             = ρ_down if h_t ≤ h_{t-1}
+
+(ρ_up > ρ_down: vol rises faster than it falls)</div>
+        <div class="description">
+          Different persistence for upward vs downward moves. Captures the asymmetric 
+          nature of vol dynamics — fast spike, slow recovery.
+        </div>
+        <div class="why">
+          <strong>Rejected:</strong> Encodes directional opinion in the proposal. The 
+          predict step should not decide whether vol is going up or down — that's the Stein 
+          loop's job after seeing the observation. Conflates shock magnitude (innovation 
+          variance) with mean-reversion speed (persistence), which are separate phenomena.
+        </div>
+      </div>
+    </div>
+
+    <h3>Antithetic Sampling</h3>
+    <p>
+      Regardless of the innovation distribution, particles are generated in antithetic pairs. 
+      For each random draw z, two particles are created: one at μ + ρ(h-μ) + σ·z and one at 
+      μ + ρ(h-μ) - σ·z. This guarantees that the empirical variance of the particle cloud 
+      exactly matches the theoretical variance — no sampling noise in the spread estimate.
+    </p>
+    <p>
+      The benefit cascades: clean particle spread → accurate bandwidth computation → 
+      well-calibrated Stein kernel → fewer wasted iterations. Variance reduction in the 
+      proposal improves efficiency of every downstream computation.
+    </p>
+
+    <!-- Particle Spread Visualization -->
+    <div class="particle-viz" id="particleViz">
+      <canvas id="particleCanvas"></canvas>
+      <div class="viz-label">PARTICLE SPREAD: STUDENT-t vs GAUSSIAN PREDICT</div>
+      <div class="viz-legend">
+        <div class="viz-legend-item"><div class="swatch" style="background: #e8944a;"></div>Student-t (ν=5)</div>
+        <div class="viz-legend-item"><div class="swatch" style="background: #4a7fff;"></div>Gaussian</div>
+        <div class="viz-legend-item"><div class="swatch" style="background: #e85a5a;"></div>True h (jump event)</div>
+      </div>
+    </div>
+
+    <div class="callout key">
+      <div class="callout-title">Key Insight</div>
+      <p style="margin-bottom:0;">
+        The Student-t predict doesn't "know" about jumps. It doesn't decide "this tick 
+        is a jump." It simply acknowledges that large innovations happen more often than 
+        Gaussian predicts. This honest statement about tail behavior — combined with 
+        antithetic variance reduction — is all the predict step needs. The Stein loop 
+        does the rest.
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- ===== OBSERVATION MODELS ===== -->
+<section id="observation">
+  <div class="container">
+    <div class="section-label">Observation Model</div>
+    <h2>p(y<sub>t</sub> | h<sub>t</sub>)</h2>
+
+    <p>
+      The observation model is where accuracy lives. Unlike the state model, which only 
+      affects the proposal, the observation model directly shapes the posterior through 
+      its score function ∇<sub>h</sub> log p(y|h). Every Newton-Stein iteration evaluates 
+      this gradient. Every annealing stage scales it. If this score is biased, the entire 
+      posterior is biased. There is no downstream correction.
+    </p>
+
+    <div class="callout warning">
+      <div class="callout-title">Critical Distinction</div>
+      <p style="margin-bottom:0;">
+        State model errors → particles start in the wrong place → Newton-Stein corrects.
+        <br>
+        Observation model errors → Newton-Stein converges to the wrong place → <strong>nothing corrects.</strong>
+      </p>
+    </div>
+
+    <div class="model-grid">
+      <div class="model-card active-choice">
+        <h4>Student-t Observation</h4>
+        <div class="formula">y_t | h_t  ~  scale × t(ν)
+
+σ_t = exp(h_t / 2)
+
+Score:
+∇_h = -1/2 + (ν+1)/2 · z²/(ν + z²)
+where z² = y² · exp(-h)</div>
+        <div class="description">
+          Returns are Student-t distributed conditional on latent vol. Heavy tails handle 
+          microstructure noise, tick quantization, and occasional extreme observations 
+          without distorting the vol estimate.
+        </div>
+        <div class="why">
+          <strong>Current choice. Problem:</strong> The score has a systematic bias. For 
+          typical observations (z²≈1), the gradient pushes toward a vol level that depends 
+          on ν. Requires a manual <code>lik_offset = 0.45</code> to correct. This offset 
+          interacts with ν and market conditions — another knob that can be wrong.
+        </div>
+      </div>
+
+      <div class="model-card future-choice">
+        <h4>OCSN Observation</h4>
+        <div class="formula">y_t | h_t  ~  (1-α)·N(0, exp(h_t))
+             + α·N(0, κ²·exp(h_t))
+
+r_n = (1-α)·φ_n / [(1-α)·φ_n + α·φ_c]
+
+Score:
+∇_h = -1/2 + 1/2·[r_n·z² + (1-r_n)·z²/κ²]</div>
+        <div class="description">
+          Observation-Contaminated Scale Normal. Most observations (1-α) are clean 
+          Gaussian; a fraction (α) are contaminated with κ× wider variance. The filter 
+          automatically classifies each observation as clean or contaminated.
+        </div>
+        <div class="why">
+          <strong>Planned upgrade because:</strong> The normal component is exactly Gaussian — 
+          zero bias by construction. No lik_offset needed. α and κ have direct market 
+          interpretations ("fraction of ticks that are garbage" and "how much wider the 
+          garbage variance is"). Outliers are <em>ignored</em>, not <em>down-weighted</em>.
+        </div>
+      </div>
+    </div>
+
+    <h3>Score Behavior Under Extreme Returns</h3>
+    <p>
+      The critical difference between Student-t and OCSN emerges during crashes — returns 
+      of 5σ+. This is precisely when the vol estimate matters most, and where observation 
+      model bias has the largest impact.
+    </p>
+
+    <!-- Score comparison visualization -->
+    <div class="score-comparison">
+      <div class="score-panel sp-student">
+        <div class="score-panel-header">Student-t Score &nbsp;∇<sub>h</sub> log p(y|h)</div>
+        <canvas id="studentScoreCanvas"></canvas>
+      </div>
+      <div class="score-panel sp-ocsn">
+        <div class="score-panel-header">OCSN Score &nbsp;∇<sub>h</sub> log p(y|h)</div>
+        <canvas id="ocsnScoreCanvas"></canvas>
+      </div>
+    </div>
+
+    <p>
+      When z² is large (extreme return relative to current vol estimate):
+    </p>
+    <div class="compare-strip">
+      <div class="compare-cell c-orange">
+        <div class="label">Student-t</div>
+        <div class="value">ν/2</div>
+        <div class="sub">Gradient saturates at ν/2.<br>Bounded but <strong>nonzero</strong> — still pulls.</div>
+      </div>
+      <div class="compare-cell c-green">
+        <div class="label">OCSN</div>
+        <div class="value">≈ 0</div>
+        <div class="sub">r_c → 1, gradient → -½ + z²/(2κ²).<br>For large κ, effectively <strong>zero</strong>.</div>
+      </div>
+    </div>
+
+    <p>
+      The Student-t score always pulls particles toward higher vol to "explain" the extreme 
+      return. The OCSN score classifies the return as contamination and ignores it. This 
+      means Newton-Stein converges to the right answer under OCSN because the gradient 
+      itself is unbiased. Under Student-t, Newton-Stein converges to a biased answer that 
+      requires the manual offset to correct.
+    </p>
+
+    <h3>Hessian for Newton Step</h3>
+    <p>
+      The full Newton variant uses ∇²<sub>h</sub> log p(y|h) to scale the Stein operator. 
+      For Student-t, the Hessian is straightforward. For OCSN, the mixture responsibilities 
+      r<sub>n</sub> and r<sub>c</sub> themselves depend on h, adding cross-terms. However, 
+      the expected Fisher information provides a stable scalar approximation:
+    </p>
+    <div class="code-block">
+<span class="comment">// Fisher information (scalar, stable, never negative)</span>
+<span class="type">Student-t:</span>  I(h) = (ν+1)/(2(ν+3))
+<span class="type">OCSN:</span>      I(h) ≈ (1-α)·½ + α·1/(2κ²)
+
+<span class="comment">// Full observed Hessian (more accurate, can be negative)</span>
+<span class="type">OCSN:</span>  ∇²_h = -(½)·[r_n·z² + r_c·z²/κ²]
+              + (¼)·[r_n·z² + r_c·z²/κ²]²
+              - (¼)·[r_n·z⁴ + r_c·z⁴/κ⁴]
+              + cross terms from ∂r/∂h
+    </div>
+  </div>
+</section>
+
+<!-- ===== NEWTON-STEIN ===== -->
+<section id="newton-stein">
+  <div class="container">
+    <div class="section-label">Core Engine</div>
+    <h2>Newton–Stein Transport</h2>
+
+    <p>
+      This is where the posterior is computed. Everything else in the pipeline exists 
+      to make this step efficient. Newton-Stein is a deterministic transport operator 
+      that moves particles from the proposal distribution to the target posterior using 
+      the score function of the observation model.
+    </p>
+
+    <h3>The Stein Operator</h3>
+    <div class="code-block">
+<span class="comment">// For each particle i, the Stein update direction is:</span>
+
+φ(h_i) = <span class="number">1/N</span> Σ_j [ k(h_j, h_i) · ∇_h log p(y | h_j)     <span class="comment">← attraction to high-likelihood regions</span>
+              + ∇_{h_j} k(h_j, h_i) ]                 <span class="comment">← repulsion from other particles</span>
+
+<span class="comment">// Newton variant: scale by inverse Hessian</span>
+φ_newton(h_i) = H⁻¹(h_i) · φ(h_i)
+
+<span class="comment">// Full Newton variant: Hessian inside the operator</span>
+φ_full(h_i) = <span class="number">1/N</span> Σ_j [ k(h_j, h_i) · H⁻¹(h_j) · ∇_h log p(y | h_j)
+                   + ∇_{h_j} [ k(h_j, h_i) · H⁻¹(h_j) ] ]
+    </div>
+
+    <p>
+      The O(N²) kernel matrix k(h_i, h_j) computes pairwise interactions between all 
+      particles. Each particle feels two forces: the likelihood gradient pulls it toward 
+      regions where the observation is probable (attraction), and the kernel gradient 
+      pushes it away from other particles (repulsion). The balance between these forces 
+      shapes the posterior distribution.
+    </p>
+
+    <p>
+      The Hessian scaling is critical. Without it (standard SVGD), the step size must 
+      be conservative because the curvature of the log-posterior varies across the particle 
+      cloud. With Newton scaling, each particle's step is adapted to the local curvature — 
+      large steps in flat regions, small steps near the mode. This is the difference between 
+      first-order and second-order optimization, applied to distributional transport.
+    </p>
+
+    <div class="callout philosophy">
+      <div class="callout-title">Why Full Newton</div>
+      <p style="margin-bottom:0;">
+        Standard Newton applies H⁻¹ after computing the Stein operator — it rescales the 
+        direction. Full Newton applies H⁻¹ inside the operator — it changes the kernel 
+        geometry. The Stein operator with Full Newton defines a Riemannian metric on the 
+        particle space where distances are measured in units of posterior curvature. 
+        Particles don't just move toward the posterior — they move along the natural 
+        gradient of the KL divergence between the current particle distribution and the 
+        target.
+      </p>
+    </div>
+
+    <h3>RMSProp Momentum</h3>
+    <p>
+      Each particle maintains a running velocity estimate via RMSProp. This smooths the 
+      transport across Stein iterations and across timesteps — particles that have been 
+      consistently moving in one direction continue to do so with less oscillation. The 
+      momentum term acts as a low-pass filter on the gradient signal, reducing the number 
+      of iterations needed for convergence.
+    </p>
+    <div class="code-block">
+<span class="comment">// Per-particle velocity accumulator (persistent across timesteps)</span>
+v_i ← ρ · v_i + (1-ρ) · φ(h_i)²
+h_i ← h_i + ε · φ(h_i) / (√v_i + eps)
+    </div>
+
+    <h3>KSD: Convergence Diagnostic</h3>
+    <p>
+      Kernel Stein Discrepancy is computed in the same O(N²) pass as the Stein transport — 
+      zero extra cost. It measures how far the current particle distribution is from the 
+      target posterior. KSD drives adaptive step budgets: high KSD means particles haven't 
+      converged, allocate more Stein steps. Low KSD means the posterior is well-approximated, 
+      stop early.
+    </p>
+    <div class="code-block">
+<span class="comment">// KSD computed alongside Stein operator (free)</span>
+KSD² = <span class="number">1/N²</span> Σ_{i,j} [ ∇log p(h_i)·k(h_i,h_j)·∇log p(h_j)
+                    + ∇log p(h_i)·∇_{h_j}k(h_i,h_j)
+                    + ∇_{h_i}k(h_i,h_j)·∇log p(h_j)
+                    + ∇_{h_i}∇_{h_j}k(h_i,h_j) ]
+    </div>
+  </div>
+</section>
+
+<!-- ===== MIXTURE PRIOR ===== -->
+<section id="mixture-prior">
+  <div class="container">
+    <div class="section-label">Transition Gradient</div>
+    <h2>O(N²) Mixture Prior</h2>
+
+    <p>
+      The observation score ∇<sub>h</sub> log p(y|h) is only half the gradient. The full 
+      posterior score also includes the <em>prior gradient</em> — how likely is this particle's 
+      position given the previous timestep's particle cloud? Getting this gradient right 
+      turned out to be one of the largest accuracy improvements in the system.
+    </p>
+
+    <div class="callout warning">
+      <div class="callout-title">The Problem</div>
+      <p style="margin-bottom:0;">
+        SVPF does not resample. After Newton-Stein transport, particle i at time t has 
+        <strong>no special relationship</strong> to particle i at time t-1. The particles 
+        have been deterministically transported to new positions. Yet the original implementation 
+        computed the prior gradient per-particle — each particle only looked at "its own" 
+        previous position. This is mathematically incorrect.
+      </p>
+    </div>
+
+    <h3>Per-Particle vs Mixture Prior</h3>
+    <p>
+      The correct prior is a Gaussian mixture over ALL previous particles. The probability 
+      that particle h at time t arose from the previous cloud is not determined by any 
+      single ancestor — it's the sum over all possible origins:
+    </p>
+
+    <div class="code-block">
+<span class="comment">// The prior is a mixture over all N previous particles:</span>
+p(h_{t} | Z_{t-1}) = (<span class="number">1/N</span>) · Σ_j  N(h; μ_j, σ²_z)
+
+<span class="keyword">where</span>  μ_j = μ + ρ · (h_prev_j - μ)    <span class="comment">← AR(1) mean from particle j</span>
+</div>
+
+    <div class="model-grid">
+      <div class="model-card rejected-choice">
+        <h4>Per-Particle Prior (Wrong)</h4>
+        <div class="formula">// Each particle only looks at itself
+mean_i = μ + ρ · (h_prev[i] - μ)
+grad[i] = -(h[i] - mean_i) / σ²</div>
+        <div class="description">
+          Complexity: O(N). Each particle computes its gradient from a single previous 
+          position — the one that happens to share its index.
+        </div>
+        <div class="why">
+          <strong>Wrong because:</strong> After Stein transport, particle i may have been 
+          moved far from particle i's previous position. The per-particle gradient pulls it 
+          back toward a position that has no probabilistic justification. This fights the 
+          Newton-Stein correction.
+        </div>
+      </div>
+
+      <div class="model-card active-choice">
+        <h4>Mixture Prior (Correct)</h4>
+        <div class="formula">// Sum over ALL previous particles
+float grad = 0.0f;
+for (int j = 0; j < n; j++) {
+    float mean_j = mu + rho * (h_prev[j] - mu);
+    float r_j = responsibility(h[i], mean_j);
+    grad += r_j * (-(h[i] - mean_j) / sigma_sq);
+}</div>
+        <div class="description">
+          Complexity: O(N²). Each particle's gradient is a responsibility-weighted sum over 
+          all previous particles. Each ancestor contributes proportionally to how likely 
+          it is to have generated the current position.
+        </div>
+        <div class="why">
+          <strong>Correct because:</strong> This is the exact gradient of the Gaussian 
+          mixture log-density. It respects the fact that SVPF transports particles without 
+          resampling — any current particle could have originated from any previous particle.
+        </div>
+      </div>
+    </div>
+
+    <h3>Responsibility Weights</h3>
+    <p>
+      The key mathematical object is the responsibility weight — the posterior probability 
+      that previous particle j "generated" current particle i:
+    </p>
+
+    <div class="code-block">
+r_j(h_i) = N(h_i; μ_j, σ²) / Σ_k N(h_i; μ_k, σ²)
+
+<span class="comment">// "How likely is it that particle j at t-1 generated particle i at t?"</span>
+
+<span class="comment">// When h_i is near μ_j:  r_j → large  (strong contribution)</span>
+<span class="comment">// When h_i is far from all μ_k:  r_k → uniform  (uncertain origin)</span>
+<span class="comment">// When h_i is near one specific μ_j:  r_j → 1  (clear ancestor)</span>
+    </div>
+
+    <p>
+      This is structurally identical to the OCSN responsibility weights r<sub>n</sub> and 
+      r<sub>c</sub> at the observation level. Both replace a hard binary assignment with a 
+      soft probabilistic weighting. Same mathematics, same philosophy: don't make binary 
+      decisions, compute the mixture.
+    </p>
+
+    <div class="compare-strip">
+      <div class="compare-cell c-green">
+        <div class="label">Observation Level</div>
+        <div class="value">r<sub>n</sub>, r<sub>c</sub></div>
+        <div class="sub">Clean vs contaminated?<br>OCSN mixture weights</div>
+      </div>
+      <div class="compare-cell c-blue">
+        <div class="label">Transition Level</div>
+        <div class="value">r<sub>j</sub>(h<sub>i</sub>)</div>
+        <div class="sub">Which ancestor?<br>Mixture prior weights</div>
+      </div>
+      <div class="compare-cell c-purple">
+        <div class="label">Stein Level</div>
+        <div class="value">k(h<sub>i</sub>, h<sub>j</sub>)</div>
+        <div class="sub">Particle interaction?<br>Kernel weights</div>
+      </div>
+    </div>
+
+    <h3>Why the Accuracy Boost</h3>
+
+    <p>
+      Under the per-particle prior, a particle that Newton-Stein correctly transported to 
+      a new region receives a strong gradient pulling it back toward "its" AR(1) prediction. 
+      The prior fights the likelihood. Under the mixture prior, if the particle is near 
+      <em>any</em> previous particle's prediction, the transition gradient supports its 
+      current position. The prior cooperates with the likelihood.
+    </p>
+
+    <p>
+      The effect is amplified during annealing. At early stages (β &lt; 1), the likelihood 
+      is down-weighted but the prior gradient is at full strength. With the per-particle prior, 
+      early annealing stages are dominated by an incorrect prior pulling particles back to 
+      individual predictions. With the mixture prior, early stages have a correct prior that's 
+      already aware of the full cloud's support — particles can spread into the right region 
+      before the likelihood is fully turned on.
+    </p>
+
+    <p>
+      With Student-t state innovations, the effect compounds further. Heavy-tailed draws place 
+      tail particles far from the AR(1) mean. Under per-particle prior, those tail particles 
+      get a strong restoring gradient. Under mixture prior, if several particles landed in the 
+      tail (antithetic pairs guarantee symmetric coverage), they support each other through 
+      the responsibility weights. The tail is recognized as a legitimate region of the prior, 
+      not an accident to be corrected.
+    </p>
+
+    <h3>Computational Cost</h3>
+
+    <div class="callout key">
+      <div class="callout-title">O(N²) is Already the Price You're Paying</div>
+      <p style="margin-bottom:0;">
+        The Stein kernel matrix k(h<sub>i</sub>, h<sub>j</sub>) is already O(N²). The mixture 
+        prior gradient adds a second O(N²) pass with the same particle-pair loop structure. 
+        In practice, the responsibility weights can be computed in the same fused kernel as 
+        the Stein transport — one O(N²) pass computes both the mixture prior gradient and 
+        the kernel interactions. The correct computation is essentially free in asymptotic 
+        terms. O(N) but wrong, or O(N²) but correct — and O(N²) is already the cost floor.
+      </p>
+    </div>
+
+    <h3>Integration with the Pipeline</h3>
+    <p>
+      The mixture prior gradient enters the same fused gradient kernel that computes the 
+      likelihood score. The total gradient for each particle becomes:
+    </p>
+
+    <div class="code-block">
+<span class="comment">// Total score for particle i:</span>
+∇_h log π(h_i) = β · ∇_h log p(y | h_i)           <span class="comment">← observation (likelihood × β)</span>
+               + ∇_h log p_mixture(h_i | cloud_{t-1}) <span class="comment">← transition (mixture prior)</span>
+
+<span class="comment">// The observation score is what it always was.</span>
+<span class="comment">// The transition score is now the mixture gradient, not per-particle.</span>
+<span class="comment">// Newton-Stein transports particles using this corrected total gradient.</span>
+    </div>
+
+    <div class="flow-row">
+      <div class="flow-box f-orange">Predict (spread)</div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-box f-green">Guide (shift)</div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-box f-blue">∇log p(y|h) + ∇log p<sub>mix</sub>(h)</div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-box f-blue">Newton-Stein Transport</div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-box f-cyan">Posterior</div>
+    </div>
+
+    <div class="callout philosophy">
+      <div class="callout-title">Same Philosophy, Applied to the Prior</div>
+      <p style="margin-bottom:0;">
+        The per-particle prior was a hidden heuristic — an implicit assumption that each 
+        particle has a single ancestor, inherited from the resampling paradigm of standard 
+        particle filters. The mixture prior replaces that assumption with computation: 
+        evaluate the exact mixture density, compute the exact gradient, let Newton-Stein 
+        do the rest. No binary decisions, no index-based ancestry, no approximations. 
+        Computation solves the problem.
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- ===== ANNEALING ===== -->
+<section id="annealing">
+  <div class="container">
+    <div class="section-label">Temperature Schedule</div>
+    <h2>Adaptive Annealing</h2>
+
+    <p>
+      When the observation is surprising — a 5σ return during quiet markets — the posterior 
+      is far from the prior. Jumping directly to the full posterior (β=1) would require 
+      particles to traverse a large distance in parameter space in a single step. The Stein 
+      operator is local — it computes gradients at current particle positions. If particles 
+      are far from the target, the gradients may be weak, misleading, or cause instability.
+    </p>
+
+    <p>
+      Annealing solves this by introducing the likelihood gradually. Instead of the full 
+      posterior, the Stein operator targets a sequence of tempered distributions:
+    </p>
+
+    <div class="code-block">
+π_β(h) ∝ p(h | h_{t-1}) · p(y | h)^β
+
+β = 0:   pure prior (particles as predicted)
+β = 0.3: 30% likelihood influence
+β = 1:   full posterior
+
+<span class="comment">// Each β stage: run Stein steps against tempered target</span>
+<span class="comment">// Score at temperature β:</span>
+∇_h log π_β = ∇_h log p(h|h_{t-1}) + β · ∇_h log p(y|h)
+    </div>
+
+    <h3>KL-Constrained Beta Stepping</h3>
+    <p>
+      The adaptive annealing schedule is computed in a single GPU sync at β=0. The fused 
+      gradient-stats kernel evaluates the variance of log-likelihoods across particles. High 
+      variance means particles disagree about the observation's probability — the posterior 
+      is far from the prior, so beta must increase slowly. Low variance means the posterior 
+      is close to the prior, so large beta jumps are safe.
+    </p>
+
+    <div class="code-block">
+<span class="comment">// At β=0, compute stats in single fused kernel:</span>
+var_ll = Var_particles[ log p(y | h_i) ]
+
+<span class="comment">// KL-constrained step size:</span>
+Δβ = √(2 · KL_threshold / var_ll)
+
+<span class="comment">// Additional constraints:</span>
+Δβ_grad  = 2 / mean|∇log p|   <span class="comment">← don't overshoot based on gradient magnitude</span>
+Δβ_space = f(h_std)            <span class="comment">← tighter steps when particles are concentrated</span>
+
+Δβ_final = min(Δβ, Δβ_grad, Δβ_space)
+n_stages = ceil(1 / Δβ_final)
+
+<span class="comment">// Then fire all stages WITHOUT any more D2H syncs</span>
+    </div>
+
+    <div class="callout key">
+      <div class="callout-title">Single-Sync Design</div>
+      <p style="margin-bottom:0;">
+        The entire annealing schedule is determined from one D2H transfer at β=0. 
+        All subsequent stages run asynchronously on the GPU. This means the 
+        CPU is free during the ~330 μs of Stein computation. The single sync 
+        costs ~5 μs; multiple syncs would cost 5 μs × n_stages — unacceptable 
+        for a system that measures total latency in hundreds of microseconds.
+      </p>
+    </div>
+
+    <h3>Why Not Fixed Schedule</h3>
+    <p>
+      A fixed schedule (β = 0.3, 0.65, 1.0) wastes computation when the posterior is 
+      close to the prior (most ticks) and under-allocates when the posterior is far 
+      (surprise events). The adaptive schedule automatically uses 2 stages during quiet 
+      markets and 15+ stages during crashes. Computation is allocated where it's needed.
+    </p>
+
+    <div class="compare-strip">
+      <div class="compare-cell c-blue">
+        <div class="label">Quiet Market</div>
+        <div class="value">2-4</div>
+        <div class="sub">stages, ~100 μs<br>Prior ≈ posterior</div>
+      </div>
+      <div class="compare-cell c-orange">
+        <div class="label">Normal Vol</div>
+        <div class="value">5-8</div>
+        <div class="sub">stages, ~250 μs<br>Moderate correction</div>
+      </div>
+      <div class="compare-cell c-purple">
+        <div class="label">Surprise Event</div>
+        <div class="value">12-20</div>
+        <div class="sub">stages, ~500 μs<br>Large posterior shift</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===== EKF GUIDE ===== -->
+<section id="ekf">
+  <div class="container">
+    <div class="section-label">Warm Start</div>
+    <h2>EKF Guide</h2>
+
+    <p>
+      The Extended Kalman Filter guide is a linearized Bayesian update that runs before 
+      the Stein loop. It computes an analytical approximation of where the posterior should 
+      be, then softly shifts the particle cloud in that direction. The key word is 
+      <em>softly</em> — the guide doesn't collapse particles to a point, it translates 
+      the cloud while preserving its shape.
+    </p>
+
+    <div class="flow-row">
+      <div class="flow-box f-orange">Predicted Cloud</div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-box f-green">EKF Update (μ_guide, σ²_guide)</div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-box f-green">Preserving Shift</div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-box f-blue">Guided Cloud → Stein Loop</div>
+    </div>
+
+    <h3>Preserving vs Non-Preserving</h3>
+
+    <div class="model-grid">
+      <div class="model-card rejected-choice">
+        <h4>Non-Preserving Guide</h4>
+        <div class="formula">h_i ← (1-α)·h_i + α·μ_guide</div>
+        <div class="description">
+          Direct interpolation toward guide mean. Shrinks particle spread by factor (1-α).
+          After guide, particles are more concentrated — less diversity for Stein to work with.
+        </div>
+      </div>
+
+      <div class="model-card active-choice">
+        <h4>Preserving Guide</h4>
+        <div class="formula">cloud_mean = mean(h_i)
+shift = α · (μ_guide - cloud_mean)
+h_i ← h_i + shift</div>
+        <div class="description">
+          Translates the entire cloud toward the guide mean without changing the spread. 
+          Every particle moves by the same amount. The cloud's shape — its variance, 
+          skewness, tail particles — is perfectly preserved.
+        </div>
+        <div class="why">
+          <strong>Chosen because:</strong> The Stein operator needs diversity to represent 
+          the posterior. Collapsing particles before Stein runs defeats the purpose. The guide's 
+          job is directional correction, not posterior approximation. Preserving the shape 
+          gives Newton-Stein the best starting material.
+        </div>
+      </div>
+    </div>
+
+    <h3>The Two-Tier Architecture</h3>
+    <p>
+      The EKF guide produces a vol estimate in ~2 μs as a side effect of computing the 
+      guide parameters. This estimate is available immediately — before the Stein loop even 
+      starts. For latency-critical decisions (order routing, kill switch), the guide estimate 
+      is sufficient. For accuracy-critical decisions (position sizing, risk), the full 
+      Stein posterior arrives ~350 μs later.
+    </p>
+
+    <div class="compare-strip">
+      <div class="compare-cell c-green">
+        <div class="label">EKF Fast Path</div>
+        <div class="value">~2 μs</div>
+        <div class="sub">Guide mean as vol estimate<br>Good enough for execution</div>
+      </div>
+      <div class="compare-cell c-blue">
+        <div class="label">Full SVPF</div>
+        <div class="value">~350 μs</div>
+        <div class="sub">Full posterior via Newton-Stein<br>Required for risk management</div>
+      </div>
+    </div>
+
+    <div class="callout philosophy">
+      <div class="callout-title">Why the Guide is Not a Heuristic</div>
+      <p style="margin-bottom:0;">
+        The EKF computes a first-order Taylor expansion of the same log-likelihood 
+        that Newton-Stein evaluates exactly. It's not a separate model or an external 
+        opinion — it's a cheap approximation of the same target. The guide and the Stein 
+        loop agree on what the answer should be; they differ only in accuracy. This is why 
+        the guide never fights the correction — it's a rough draft of the same computation.
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- ===== SVLD ===== -->
+<section id="svld">
+  <div class="container">
+    <div class="section-label">Exploration</div>
+    <h2>Stein Variational Langevin Dynamics</h2>
+
+    <p>
+      SVLD injects calibrated noise into the Stein transport step. Without noise, 
+      the Stein operator is deterministic — particles follow the gradient field exactly. 
+      Deterministic transport can get stuck in local modes or fail to explore regions 
+      of the posterior that are separated by low-probability valleys.
+    </p>
+
+    <div class="code-block">
+<span class="comment">// Standard Stein step (deterministic):</span>
+h_i ← h_i + ε · φ(h_i)
+
+<span class="comment">// SVLD step (stochastic):</span>
+h_i ← h_i + ε · φ(h_i) + √(2ε · temperature) · η_i
+η_i ~ N(0, 1)
+
+<span class="comment">// Noise scale is proportional to:</span>
+<span class="comment">//   √ε      — vanishes as step size decreases</span>
+<span class="comment">//   √temp   — scales with annealing temperature</span>
+<span class="comment">//   β_factor — vanishes as β → 1 (final posterior)</span>
+    </div>
+
+    <h3>Ergodicity Guarantee</h3>
+    <p>
+      The SVLD noise guarantees that given enough iterations, particles will explore the 
+      entire support of the posterior. Without noise, if all particles start on one side 
+      of a bimodal posterior, they'll stay there forever — the deterministic Stein operator 
+      has no mechanism to jump across a low-probability valley. SVLD provides this mechanism.
+    </p>
+
+    <p>
+      In practice, the noise is most active during early annealing stages (low β, high 
+      temperature) when the tempered target is broad and exploration is cheap. As β → 1 
+      and the target sharpens, the noise scales down and the transport becomes increasingly 
+      deterministic. The final Stein steps are nearly pure Newton transport — precise 
+      positioning with minimal perturbation.
+    </p>
+
+    <div class="callout key">
+      <div class="callout-title">SVLD + Annealing Interaction</div>
+      <p style="margin-bottom:0;">
+        Early stages (low β): broad target, strong noise → exploration.
+        Late stages (β ≈ 1): sharp target, weak noise → exploitation.
+        The annealing schedule naturally implements the explore-then-exploit strategy 
+        without any explicit switch. Temperature is the control variable for both the 
+        target sharpness and the noise magnitude — they're coupled by construction.
+      </p>
+    </div>
+
+    <h3>Why Not Other Exploration Mechanisms</h3>
+    
+    <div class="philosophy-grid">
+      <div class="phil-card do">
+        <h4>SVLD ✓</h4>
+        <ul>
+          <li>Noise magnitude derived from theory (Langevin diffusion)</li>
+          <li>Couples naturally to annealing temperature</li>
+          <li>Fused into Stein kernel — zero extra compute</li>
+          <li>Vanishes at convergence — doesn't perturb final posterior</li>
+          <li>One parameter (temperature) with clear interpretation</li>
+        </ul>
+      </div>
+      <div class="phil-card dont">
+        <h4>MIM Jumps ✗</h4>
+        <ul>
+          <li>Jump probability is heuristic — no theoretical guidance</li>
+          <li>Jump scale is heuristic — wrong scale wastes particles</li>
+          <li>Binary decision: jump or don't — no gradual exploration</li>
+          <li>Active at all times — perturbs even converged posteriors</li>
+          <li>Three parameters, all requiring calibration</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===== INTERACTIONS ===== -->
+<section id="interactions">
+  <div class="container">
+    <div class="section-label">System Dynamics</div>
+    <h2>Component Interactions</h2>
+
+    <p>
+      The four components interact in specific, predictable ways. No component's behavior 
+      depends on a heuristic threshold or a tuned parameter of another component. The 
+      interactions are structural — they follow from the mathematics, not from calibration.
+    </p>
+
+    <table class="interaction-table">
+      <thead>
+        <tr>
+          <th>Interaction</th>
+          <th>Mechanism</th>
+          <th>Effect</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="comp-name">State → Stein</td>
+          <td>Student-t predict places tail particles far from mode</td>
+          <td class="cell-strong">Tail particles find posterior mode during crashes. Without them, 
+          Stein loop has no particles in the right neighborhood → more stages needed or convergence failure.</td>
+        </tr>
+        <tr>
+          <td class="comp-name">State → Guide</td>
+          <td>Wider predict spread → guide has more material to shift</td>
+          <td class="cell-moderate">Preserving guide shifts the wider cloud intact. Guide effectiveness 
+          is independent of predict width — same absolute shift regardless of spread.</td>
+        </tr>
+        <tr>
+          <td class="comp-name">Obs → Stein</td>
+          <td>Score ∇log p(y|h) is the gradient signal for transport</td>
+          <td class="cell-strong">This is THE critical interaction. Biased score → biased posterior. 
+          OCSN eliminates Student-t's lik_offset bias. Unbiased score means Newton-Stein 
+          converges to the correct target.</td>
+        </tr>
+        <tr>
+          <td class="comp-name">Obs → Newton</td>
+          <td>Hessian ∇²log p(y|h) scales the Stein operator</td>
+          <td class="cell-strong">Newton step size adapts to local curvature. Steep likelihood 
+          → small steps. Flat likelihood → large steps. OCSN Hessian has mixture cross-terms 
+          but Fisher information provides stable scalar approximation.</td>
+        </tr>
+        <tr>
+          <td class="comp-name">Anneal → Stein</td>
+          <td>β scales the likelihood contribution: β·∇log p(y|h)</td>
+          <td class="cell-strong">Gradual introduction prevents particle collapse. Early stages 
+          (low β) allow broad exploration; final stage (β=1) gives exact posterior.</td>
+        </tr>
+        <tr>
+          <td class="comp-name">Anneal → SVLD</td>
+          <td>Noise scales as √(β_factor · temperature)</td>
+          <td class="cell-strong">Exploration at low β, exploitation at high β. Coupled by 
+          construction — no separate schedule needed.</td>
+        </tr>
+        <tr>
+          <td class="comp-name">Guide → Stein</td>
+          <td>Cloud pre-shifted toward posterior mode</td>
+          <td class="cell-moderate">Reduces distance Stein must transport. ~1-2 fewer annealing 
+          stages needed. Guide step size (5%) is conservative — never overshoots.</td>
+        </tr>
+        <tr>
+          <td class="comp-name">Guide → Anneal</td>
+          <td>Better initial position → lower var_ll at β=0</td>
+          <td class="cell-moderate">Guide reduces the variance of log-likelihoods across 
+          particles, leading to larger Δβ steps → fewer annealing stages → faster convergence.</td>
+        </tr>
+        <tr>
+          <td class="comp-name">SVLD → Stein</td>
+          <td>Noise perturbation between gradient steps</td>
+          <td class="cell-moderate">Prevents premature collapse to single mode. Ensures KSD 
+          doesn't stall at a local minimum. Most impactful when posterior is multimodal or 
+          when particles start far from target.</td>
+        </tr>
+        <tr>
+          <td class="comp-name">KSD → Anneal</td>
+          <td>Previous timestep's KSD informs step budget</td>
+          <td class="cell-moderate">High KSD from t-1 → more conservative beta steps at t. 
+          Adapts computational budget to recent posterior difficulty.</td>
+        </tr>
+        <tr>
+          <td class="comp-name">Mix Prior → Stein</td>
+          <td>O(N²) mixture gradient replaces per-particle prior</td>
+          <td class="cell-strong">Correct transition gradient prevents prior from fighting 
+          likelihood. Particles transported to new regions are supported by nearest ancestors, 
+          not pulled back to arbitrary index-matched positions. Major accuracy improvement.</td>
+        </tr>
+        <tr>
+          <td class="comp-name">Mix Prior → Anneal</td>
+          <td>Correct prior at full strength during early β stages</td>
+          <td class="cell-strong">At low β, prior dominates. Per-particle prior pulls particles 
+          to wrong positions. Mixture prior allows correct spreading before likelihood activates. 
+          Fewer annealing stages needed — better starting point.</td>
+        </tr>
+        <tr>
+          <td class="comp-name">μ_adaptive → State</td>
+          <td>Kalman-filtered mean feeds back into AR(1) center</td>
+          <td class="cell-moderate">Long-run vol level drifts with market regime. Prevents 
+          particles from always reverting to a fixed μ that may be stale. Updated from particle 
+          centroid — the posterior informs the next prior.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>Information Flow</h3>
+    <div style="margin: 40px 0;">
+      <div class="flow-row" style="justify-content: center;">
+        <div class="flow-box f-orange">Student-t Predict</div>
+        <div class="flow-arrow">→</div>
+        <div class="flow-box f-green">EKF Guide</div>
+        <div class="flow-arrow">→</div>
+        <div class="flow-box f-blue" style="border-width: 2px;">Newton-Stein + Anneal + SVLD</div>
+        <div class="flow-arrow">→</div>
+        <div class="flow-box f-cyan">Posterior</div>
+      </div>
+      <div class="flow-row" style="justify-content: center; margin-top: 8px;">
+        <div class="flow-box f-cyan" style="margin-left: 0;">Posterior</div>
+        <div class="flow-arrow">→</div>
+        <div class="flow-box f-purple">Adaptive μ</div>
+        <div class="flow-arrow">→</div>
+        <div class="flow-box f-orange">Next Predict</div>
+      </div>
+    </div>
+
+    <div class="callout philosophy">
+      <div class="callout-title">No Circular Dependencies</div>
+      <p style="margin-bottom:0;">
+        Information flows in one direction within a timestep: predict → guide → Stein → output. 
+        The only feedback loop is between timesteps: the posterior at t informs the prior 
+        at t+1 through adaptive μ. This means each component can be understood, tested, and 
+        debugged in isolation. There are no coupled nonlinear interactions that create 
+        emergent behavior. The system is compositional — the whole is exactly the sum of 
+        its parts.
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- ===== PHILOSOPHY ===== -->
+<section id="philosophy">
+  <div class="container">
+    <div class="section-label">First Principles</div>
+    <h2>Design Philosophy</h2>
+
+    <h3>Principle 1: Computation Over Heuristics</h3>
+    <p>
+      Every tunable parameter is a liability. It encodes an assumption about market 
+      behavior that may be wrong tomorrow. The design minimizes parameters not out of 
+      elegance but out of robustness — fewer assumptions means fewer failure modes.
+    </p>
+    <p>
+      Where a problem can be solved by more computation (more Stein steps, finer annealing) 
+      or by a cleverer heuristic (jump detection, regime switching), always choose computation. 
+      Hardware improves every year — a 350 μs filter today is a 50 μs filter on next-gen 
+      GPUs without changing a line of code. Heuristics stay wrong at the same rate regardless 
+      of hardware.
+    </p>
+
+    <h3>Principle 2: The Gradient is Sacred</h3>
+    <p>
+      The observation score ∇<sub>h</sub> log p(y|h) is the only information channel from 
+      data to posterior. Every component either computes this gradient (Stein), approximates 
+      this gradient (EKF guide), or helps this gradient work effectively (annealing, SVLD, 
+      predict). Nothing in the system overrides or filters the gradient signal.
+    </p>
+    <p>
+      This is why the observation model matters more than the state model. A biased gradient 
+      propagates through every Stein iteration, every annealing stage. There is no downstream 
+      correction. Student-t's lik_offset is a band-aid for a biased gradient. OCSN eliminates 
+      the bias at the source.
+    </p>
+
+    <h3>Principle 3: Honest Uncertainty</h3>
+    <p>
+      The predict step should express genuine uncertainty, not confident guesses. Student-t 
+      innovations say "large moves are possible" without saying "this is a jump." Antithetic 
+      pairs say "the spread is exactly this wide" without saying "the mean is here." The guide 
+      says "the posterior is roughly here" without collapsing the spread.
+    </p>
+    <p>
+      Confidence should increase monotonically through the pipeline: the predict is maximally 
+      uncertain, the guide adds partial information, and Newton-Stein converges to the 
+      full posterior. No component should be more confident than the components that follow it.
+    </p>
+
+    <h3>Principle 4: Structural Motivation Over Calibration</h3>
+    <p>
+      Every modeling choice should have a structural justification — a reason derived from 
+      the nature of the problem, not from backtesting. The Student-t state model is motivated 
+      by the empirical fact that vol innovations are leptokurtic. OCSN observation noise is 
+      motivated by the physical reality that some ticks are microstructure garbage. Adaptive 
+      μ is motivated by the nonstationarity of long-run vol levels.
+    </p>
+    <p>
+      Contrast with heuristic choices: MIM jump probability calibrated to historical data, 
+      asymmetric ρ fit by grid search, lik_offset tuned to minimize bias on a specific 
+      dataset. These work until the market changes. Structural choices work because the 
+      structure of the problem doesn't change — returns will always have microstructure 
+      contamination, vol innovations will always be heavy-tailed, long-run vol will always 
+      drift.
+    </p>
+
+    <h3>Principle 5: Compositionality</h3>
+    <p>
+      Each component has one job. The predict step spreads particles. The guide shifts 
+      them directionally. Newton-Stein transports them to the posterior. SVLD prevents 
+      entrapment. Annealing controls the difficulty schedule. Adaptive μ tracks the 
+      long-run mean.
+    </p>
+    <p>
+      No component tries to do another's job. The guide doesn't try to be accurate — that's 
+      Stein's job. The predict doesn't try to be directional — that's the guide's job. 
+      SVLD doesn't try to find the posterior — that's Newton-Stein's job. This separation 
+      means you can modify, replace, or remove any component without understanding the others.
+    </p>
+
+    <div class="callout philosophy" style="margin-top: 48px;">
+      <div class="callout-title">The Meta-Principle</div>
+      <p style="margin-bottom:0;">
+        A well-designed filter should be <strong>boring</strong>. No clever tricks, no 
+        surprising interactions, no emergent behavior. Each component does an obvious thing 
+        for an obvious reason. The sophistication is in the mathematics of Newton-Stein 
+        transport and the engineering of CUDA execution — not in the design of the system.
+        When the filter gives a wrong answer, you should be able to trace the error to 
+        exactly one component and fix it without touching anything else.
+      </p>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="container">
+    SVPF Design Philosophy · Stein Variational Particle Filter
+  </div>
+</footer>
+
+<!-- ===== VISUALIZATIONS ===== -->
+<script>
+// ====== Particle Spread Visualization ======
+(function() {
+  const canvas = document.getElementById('particleCanvas');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  
+  function resize() {
+    const rect = canvas.parentElement.getBoundingClientRect();
+    canvas.width = rect.width * 2;
+    canvas.height = rect.height * 2;
+    ctx.scale(2, 2);
+  }
+  resize();
+  window.addEventListener('resize', resize);
+  
+  // Student-t random (approximation via ratio of normals)
+  function randNormal() {
+    let u = 0, v = 0;
+    while (u === 0) u = Math.random();
+    while (v === 0) v = Math.random();
+    return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+  }
+  
+  function randStudentT(nu) {
+    // Simple rejection-based approximation
+    const z = randNormal();
+    const chi2 = Array.from({length: Math.round(nu)}, () => { const x = randNormal(); return x*x; })
+                      .reduce((a,b) => a+b, 0) / nu;
+    return z / Math.sqrt(chi2 + 0.001);
+  }
+  
+  // Particles
+  const N = 80;
+  const mu = -3.5;
+  const rho = 0.98;
+  const sigma = 0.15;
+  const trueH = -1.5; // Jump event - true h is far from prediction
+  
+  let gaussianParticles = [];
+  let studentParticles = [];
+  let time = 0;
+  
+  function initParticles() {
+    gaussianParticles = [];
+    studentParticles = [];
+    for (let i = 0; i < N; i++) {
+      const z = randNormal();
+      gaussianParticles.push({
+        h: mu + sigma * z / Math.sqrt(1 - rho*rho),
+        drift: (Math.random() - 0.5) * 0.3,
+        phase: Math.random() * Math.PI * 2
+      });
+      
+      const zt = randStudentT(5);
+      studentParticles.push({
+        h: mu + sigma * zt / Math.sqrt(1 - rho*rho),
+        drift: (Math.random() - 0.5) * 0.3,
+        phase: Math.random() * Math.PI * 2
+      });
+    }
+  }
+  initParticles();
+  
+  function draw() {
+    time += 0.01;
+    const w = canvas.width / 2;
+    const h = canvas.height / 2;
+    
+    ctx.clearRect(0, 0, w, h);
+    
+    // Axes
+    const margin = { left: 60, right: 30, top: 30, bottom: 50 };
+    const plotW = w - margin.left - margin.right;
+    const plotH = h - margin.top - margin.bottom;
+    
+    const hMin = -8;
+    const hMax = 1;
+    
+    function hToX(val) { return margin.left + (val - hMin) / (hMax - hMin) * plotW; }
+    function yBand(band, offset) { return margin.top + plotH * (band + 0.5) / 3 + offset; }
+    
+    // Grid
+    ctx.strokeStyle = '#1e1e2a';
+    ctx.lineWidth = 0.5;
+    for (let v = -7; v <= 0; v++) {
+      const x = hToX(v);
+      ctx.beginPath();
+      ctx.moveTo(x, margin.top);
+      ctx.lineTo(x, h - margin.bottom);
+      ctx.stroke();
+    }
+    
+    // Axis labels
+    ctx.fillStyle = '#4a4a5a';
+    ctx.font = '10px JetBrains Mono';
+    ctx.textAlign = 'center';
+    for (let v = -7; v <= 0; v++) {
+      ctx.fillText(v.toString(), hToX(v), h - margin.bottom + 16);
+    }
+    ctx.fillText('log-volatility (h)', w/2, h - 8);
+    
+    // True h line
+    const trueX = hToX(trueH);
+    ctx.strokeStyle = 'rgba(232, 90, 90, 0.6)';
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([6, 4]);
+    ctx.beginPath();
+    ctx.moveTo(trueX, margin.top);
+    ctx.lineTo(trueX, h - margin.bottom);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    
+    ctx.fillStyle = '#e85a5a';
+    ctx.font = '9px JetBrains Mono';
+    ctx.textAlign = 'left';
+    ctx.fillText('true h (after jump)', trueX + 6, margin.top + 12);
+    
+    // AR(1) prediction center
+    const predX = hToX(mu);
+    ctx.strokeStyle = 'rgba(106, 106, 122, 0.4)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    ctx.moveTo(predX, margin.top);
+    ctx.lineTo(predX, h - margin.bottom);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    
+    ctx.fillStyle = '#6a6a7a';
+    ctx.textAlign = 'right';
+    ctx.fillText('AR(1) prediction', predX - 6, margin.top + 12);
+    
+    // Band labels
+    ctx.fillStyle = '#6a6a7a';
+    ctx.font = '9px JetBrains Mono';
+    ctx.textAlign = 'right';
+    ctx.fillText('Gaussian', margin.left - 8, yBand(0, 0) + 3);
+    ctx.fillText('Student-t', margin.left - 8, yBand(2, 0) + 3);
+    
+    // Draw Gaussian particles
+    gaussianParticles.forEach((p, i) => {
+      const x = hToX(p.h);
+      const y = yBand(0, Math.sin(time * 2 + p.phase) * 12 + p.drift * Math.sin(time * 0.7 + i));
+      const alpha = 0.7;
+      ctx.fillStyle = `rgba(74, 127, 255, ${alpha})`;
+      ctx.beginPath();
+      ctx.arc(x, y, 3, 0, Math.PI * 2);
+      ctx.fill();
+    });
+    
+    // Draw Student-t particles
+    let particlesNearTrue = 0;
+    studentParticles.forEach((p, i) => {
+      const x = hToX(p.h);
+      const y = yBand(2, Math.sin(time * 2 + p.phase) * 12 + p.drift * Math.sin(time * 0.7 + i));
+      
+      const distToTrue = Math.abs(p.h - trueH);
+      const nearTrue = distToTrue < 1.0;
+      if (nearTrue) particlesNearTrue++;
+      
+      const alpha = nearTrue ? 0.95 : 0.7;
+      const color = nearTrue ? `rgba(74, 190, 122, ${alpha})` : `rgba(232, 148, 74, ${alpha})`;
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.arc(x, y, nearTrue ? 4 : 3, 0, Math.PI * 2);
+      ctx.fill();
+      
+      if (nearTrue) {
+        ctx.strokeStyle = 'rgba(74, 190, 122, 0.3)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.arc(x, y, 7, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+    });
+    
+    // Count annotation
+    if (particlesNearTrue > 0) {
+      ctx.fillStyle = '#4abe7a';
+      ctx.font = '9px JetBrains Mono';
+      ctx.textAlign = 'left';
+      ctx.fillText(`${particlesNearTrue} particles within reach`, trueX + 6, yBand(2, 0) - 20);
+    }
+    
+    // Gaussian count near true
+    let gNear = gaussianParticles.filter(p => Math.abs(p.h - trueH) < 1.0).length;
+    ctx.fillStyle = gNear > 0 ? '#4a7fff' : '#4a4a5a';
+    ctx.textAlign = 'left';
+    ctx.fillText(`${gNear} particles within reach`, trueX + 6, yBand(0, 0) - 20);
+    
+    requestAnimationFrame(draw);
+  }
+  draw();
+})();
+
+// ====== Score Comparison Visualizations ======
+function drawScoreCanvas(canvasId, scoreFn, color, label) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  
+  function resize() {
+    const rect = canvas.parentElement.getBoundingClientRect();
+    canvas.width = rect.width * 2;
+    canvas.height = 180 * 2;
+    canvas.style.height = '180px';
+  }
+  resize();
+  window.addEventListener('resize', () => { resize(); draw(); });
+  
+  function draw() {
+    const w = canvas.width / 2;
+    const h = 180;
+    ctx.clearRect(0, 0, w * 2, h * 2);
+    ctx.save();
+    ctx.scale(2, 2);
+    
+    const margin = { left: 45, right: 15, top: 15, bottom: 35 };
+    const pw = w - margin.left - margin.right;
+    const ph = h - margin.top - margin.bottom;
+    
+    // z² range: 0 to 30
+    const zMin = 0, zMax = 30;
+    const sMin = -1, sMax = 4;
+    
+    function zToX(z) { return margin.left + (z - zMin) / (zMax - zMin) * pw; }
+    function sToY(s) { return margin.top + ph - (s - sMin) / (sMax - sMin) * ph; }
+    
+    // Grid
+    ctx.strokeStyle = '#1e1e2a';
+    ctx.lineWidth = 0.5;
+    for (let z = 0; z <= 30; z += 5) {
+      ctx.beginPath(); ctx.moveTo(zToX(z), margin.top); ctx.lineTo(zToX(z), h - margin.bottom); ctx.stroke();
+    }
+    for (let s = 0; s <= 3; s++) {
+      ctx.beginPath(); ctx.moveTo(margin.left, sToY(s)); ctx.lineTo(w - margin.right, sToY(s)); ctx.stroke();
+    }
+    
+    // Zero line
+    ctx.strokeStyle = '#2a2a3a';
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(margin.left, sToY(0)); ctx.lineTo(w - margin.right, sToY(0)); ctx.stroke();
+    
+    // Labels
+    ctx.fillStyle = '#4a4a5a';
+    ctx.font = '8px JetBrains Mono';
+    ctx.textAlign = 'center';
+    for (let z = 0; z <= 30; z += 10) ctx.fillText(z.toString(), zToX(z), h - margin.bottom + 12);
+    ctx.fillText('z² (standardized return²)', w / 2, h - 4);
+    
+    ctx.textAlign = 'right';
+    for (let s = 0; s <= 3; s++) ctx.fillText(s.toString(), margin.left - 6, sToY(s) + 3);
+    
+    // Score curve
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    let first = true;
+    for (let px = 0; px <= pw; px++) {
+      const z2 = zMin + (px / pw) * (zMax - zMin);
+      const s = scoreFn(z2);
+      const x = margin.left + px;
+      const y = sToY(s);
+      if (first) { ctx.moveTo(x, y); first = false; }
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+    
+    // Saturation line for Student-t
+    if (label === 'student') {
+      const satLevel = 5 / 2; // nu/2
+      ctx.strokeStyle = 'rgba(232, 148, 74, 0.3)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4, 3]);
+      ctx.beginPath();
+      ctx.moveTo(margin.left, sToY(satLevel));
+      ctx.lineTo(w - margin.right, sToY(satLevel));
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = 'rgba(232, 148, 74, 0.6)';
+      ctx.font = '8px JetBrains Mono';
+      ctx.textAlign = 'left';
+      ctx.fillText('saturates at ν/2 = 2.5', margin.left + 4, sToY(satLevel) - 5);
+    }
+    
+    // Near-zero annotation for OCSN
+    if (label === 'ocsn') {
+      ctx.fillStyle = 'rgba(62, 207, 207, 0.6)';
+      ctx.font = '8px JetBrains Mono';
+      ctx.textAlign = 'right';
+      const annotX = w - margin.right - 4;
+      const annotY = sToY(scoreFn(25)) - 8;
+      ctx.fillText('→ 0 (outlier ignored)', annotX, annotY);
+    }
+    
+    ctx.restore();
+  }
+  draw();
+}
+
+// Student-t score: -0.5 + (nu+1)/2 * z²/(nu + z²), nu=5
+drawScoreCanvas('studentScoreCanvas', function(z2) {
+  return -0.5 + (6/2) * z2 / (5 + z2);
+}, '#e8944a', 'student');
+
+// OCSN score: mixture-weighted
+drawScoreCanvas('ocsnScoreCanvas', function(z2) {
+  const alpha = 0.05;
+  const kappa2 = 100; // kappa=10
+  
+  // Log-space mixture weight computation
+  const log_w_n = Math.log(1 - alpha) - 0.5 * z2;
+  const log_w_c = Math.log(alpha) - 0.5 * z2 / kappa2 - 0.5 * Math.log(kappa2);
+  const log_max = Math.max(log_w_n, log_w_c);
+  const w_n = Math.exp(log_w_n - log_max);
+  const w_c = Math.exp(log_w_c - log_max);
+  const r_n = w_n / (w_n + w_c);
+  const r_c = 1 - r_n;
+  
+  return -0.5 + 0.5 * (r_n * z2 + r_c * z2 / kappa2);
+}, '#3ecfcf', 'ocsn');
+</script>
+
+</body>
+</html>
