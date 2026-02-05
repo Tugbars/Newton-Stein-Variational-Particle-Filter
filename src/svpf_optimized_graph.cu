@@ -18,7 +18,6 @@
  */
 
 #include "svpf_kernels.cuh"
-#include "svpf_adaptive_anneal.cuh"  // KL-based adaptive beta annealing
 #include "svpf_fused_gradient_stats.cuh"  // Fused gradient + stats kernel
 
 #include <cuda_runtime.h>
