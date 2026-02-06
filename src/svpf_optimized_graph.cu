@@ -101,7 +101,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     // =========================================================================
     
     state->use_exact_gradient = 1;
-    state->lik_offset = 0.345f;
+    state->lik_offset = 0.335f;
     
     // --- SVLD + Annealing ---
     state->use_svld = 1;
@@ -114,11 +114,11 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     
     // --- MIM (OFF by default — guided prediction supersedes) ---
     state->use_mim = 0;
-    state->mim_jump_prob = 0.25f;
+    state->mim_jump_prob = 0.35f;
     state->mim_jump_scale = 9.0f;
     
     // --- Asymmetric persistence ---
-    state->use_asymmetric_rho = 0;
+    state->use_asymmetric_rho = 9;
     state->rho_up = 0.98f;
     state->rho_down = 0.93f;
     
@@ -186,7 +186,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     
     // === KSD-based Adaptive Stein Steps ===
     state->stein_min_steps = 8;
-    state->stein_max_steps = 16;
+    state->stein_max_steps = 8;
     state->ksd_improvement_threshold = 0.05f;
     state->ksd_prev = 1e10f;
     state->stein_steps_used = n_stein_steps;
