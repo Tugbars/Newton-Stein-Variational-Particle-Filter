@@ -4,8 +4,8 @@
  * 
  * Fused kernels for low-latency execution:
  * - svpf_fused_gradient_kernel (prior + likelihood + combine + hessian)
- * - svpf_fused_stein_transport_kernel (stein + transport)
- * - svpf_fused_stein_transport_ksd_kernel (stein + transport + KSD)
+ * - svpf_fused_stein_transport_full_newton_kernel (stein + transport)
+ * - svpf_fused_stein_transport_full_newton_ksd_kernel (stein + transport + KSD)
  * - svpf_fused_bandwidth_kernel (bandwidth + adaptive)
  * - svpf_fused_outputs_kernel (logsumexp + vol + h_mean)
  */
@@ -49,76 +49,6 @@ __global__ void svpf_copy_kernel(const float* src, float* dst, int n) {
     if (idx < n) {
         dst[idx] = src[idx];
     }
-}
-
-__global__ void svpf_predict_guided_kernel(
-    float* __restrict__ h,
-    float* __restrict__ h_prev,
-    curandStatePhilox4_32_10_t* __restrict__ rng,
-    const float* __restrict__ d_y,
-    const float* __restrict__ d_h_mean,
-    int t,
-    float rho_up, float rho_down,
-    float sigma_z, float mu, float gamma,
-    float jump_prob, float jump_scale,
-    float delta_rho, float delta_sigma,
-    float alpha_base, float alpha_shock,
-    float innovation_threshold,
-    float implied_offset,
-    int use_student_t_state, float nu_state,
-    int n
-) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-
-    float h_i = h[i];
-    float h_prev_i = h_prev[i];
-    h_prev[i] = h_i;
-
-    float h_bar = *d_h_mean;
-    float dev = h_i - h_bar;
-    float abs_dev = fabsf(dev);
-    float tanh_dev = tanhf(dev);
-
-    float rho_adjust = delta_rho * tanh_dev;
-    float sigma_scale = 1.0f + delta_sigma * abs_dev;
-
-    // Sample innovation: Gaussian or Student-t
-    float noise;
-    if (use_student_t_state) {
-        noise = sample_student_t(&rng[i], nu_state);
-    } else {
-        noise = curand_normal(&rng[i]);
-    }
-    float selector = curand_uniform(&rng[i]);
-    float scale = (selector < jump_prob) ? jump_scale : 1.0f;
-
-    float base_rho = (h_i > h_prev_i) ? rho_up : rho_down;
-    float rho = fminf(fmaxf(base_rho + rho_adjust, 0.0f), 0.999f);
-    float sigma_local = sigma_z * sigma_scale;
-
-    float y_prev = (t > 0) ? d_y[t - 1] : 0.0f;
-    float vol_prev = safe_exp(h_i / 2.0f);
-    float leverage = gamma * y_prev / (vol_prev + 1e-8f);
-    float mean_prior = mu + rho * (h_i - mu) + leverage;
-
-    float y_curr = d_y[t];
-    float log_y2 = __logf(y_curr * y_curr + 1e-10f);
-    float mean_implied = fmaxf(log_y2 + implied_offset, -5.0f);
-
-    float innovation = mean_implied - mean_prior;
-    float total_std = 2.5f;
-    float z_score = innovation / total_std;
-
-    float activation = 0.0f;
-    if (z_score > innovation_threshold) {
-        activation = tanhf(z_score - innovation_threshold);
-    }
-
-    float guided_alpha = alpha_base + (alpha_shock - alpha_base) * activation;
-    float mean_proposal = (1.0f - guided_alpha) * mean_prior + guided_alpha * mean_implied;
-    
-    h[i] = clamp_logvol(mean_proposal + sigma_local * scale * noise);
 }
 
 // =============================================================================
@@ -247,34 +177,6 @@ __global__ void svpf_predict_guided_antithetic_kernel(
 // Guide Kernels
 // =============================================================================
 
-__global__ void svpf_apply_guide_kernel(
-    float* __restrict__ h,
-    float guide_mean,
-    float guide_strength,
-    int n
-) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    
-    float delta = guide_mean - h[i];
-    h[i] = clamp_logvol(h[i] + guide_strength * delta);
-}
-
-__global__ void svpf_apply_guide_kernel_graph(
-    float* __restrict__ h,
-    const float* __restrict__ d_guide_mean,
-    const float* __restrict__ d_guide_strength,
-    int n
-) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    
-    float guide_mean = *d_guide_mean;
-    float guide_strength = *d_guide_strength;
-    float delta = guide_mean - h[i];
-    h[i] = clamp_logvol(h[i] + guide_strength * delta);
-}
-
 __global__ void svpf_apply_guide_preserving_kernel(
     float* __restrict__ h,
     const float* __restrict__ d_h_mean,
@@ -286,27 +188,6 @@ __global__ void svpf_apply_guide_preserving_kernel(
     if (i >= n) return;
     
     float current_mean = *d_h_mean;
-    float h_val = h[i];
-    
-    float deviation = h_val - current_mean;
-    float new_mean = (1.0f - guide_strength) * current_mean + guide_strength * guide_mean;
-    
-    h[i] = clamp_logvol(new_mean + deviation);
-}
-
-__global__ void svpf_apply_guide_preserving_kernel_graph(
-    float* __restrict__ h,
-    const float* __restrict__ d_h_mean,
-    const float* __restrict__ d_guide_mean,
-    const float* __restrict__ d_guide_strength,
-    int n
-) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    
-    float current_mean = *d_h_mean;
-    float guide_mean = *d_guide_mean;
-    float guide_strength = *d_guide_strength;
     float h_val = h[i];
     
     float deviation = h_val - current_mean;
@@ -373,8 +254,6 @@ __global__ void svpf_fused_gradient_kernel(
     
     if (use_student_t_state) {
         // Student-t prior: bounded gradient
-        // log p(h|mu) = const - ((nu_state+1)/2) * log(1 + (h-mu)²/(nu_state*sigma²))
-        // grad = -(nu_state+1) * (h-mu) / (nu_state*sigma² + (h-mu)²)
         float nu_sigma_sq = nu_state * sigma_z_sq;
         float nu_plus_1 = nu_state + 1.0f;
         float half_nu_plus_1 = 0.5f * nu_plus_1;
@@ -384,7 +263,6 @@ __global__ void svpf_fused_gradient_kernel(
         for (int i = 0; i < n; i++) {
             float diff = h_j - sh_mu_i[i];
             float diff_sq = diff * diff;
-            // log r_i = -((nu+1)/2) * log(1 + diff²/(nu*sigma²))
             float log_r_i = -half_nu_plus_1 * __logf(1.0f + diff_sq / nu_sigma_sq);
             log_r_max = fmaxf(log_r_max, log_r_i);
         }
@@ -402,11 +280,7 @@ __global__ void svpf_fused_gradient_kernel(
             float r_i = __expf(log_r_i - log_r_max);
             sum_r += r_i;
             
-            // Bounded gradient: -(nu+1) * diff / (nu*sigma² + diff²)
             weighted_grad -= r_i * nu_plus_1 * diff / denom;
-            
-            // Hessian for Student-t: d²/dh² log p
-            // = -(nu+1) * (nu*sigma² - diff²) / (nu*sigma² + diff²)²
             float hess_i = -nu_plus_1 * (nu_sigma_sq - diff_sq) / (denom * denom);
             weighted_hess += r_i * hess_i;
         }
@@ -447,8 +321,6 @@ __global__ void svpf_fused_gradient_kernel(
     float A = scaled_y_sq / nu;
     float one_plus_A = 1.0f + A;
     
-    // Fan mode: uniform weights (log_w = 0)
-    // Hybrid mode: importance weights from likelihood
     if (use_fan_mode) {
         log_w[j] = 0.0f;
     } else {
@@ -467,8 +339,6 @@ __global__ void svpf_fused_gradient_kernel(
     }
     
     // ===== COMBINE =====
-    // Fan mode: full likelihood (beta effectively 1.0)
-    // Hybrid mode: annealed likelihood
     float effective_beta = use_fan_mode ? 1.0f : beta;
     float g = grad_prior + effective_beta * grad_lik;
     g = fminf(fmaxf(g, -10.0f), 10.0f);
@@ -489,398 +359,6 @@ __global__ void svpf_fused_gradient_kernel(
 }
 
 // =============================================================================
-// FUSED: Stein + Transport (Standard, no KSD)
-// =============================================================================
-
-__global__ void svpf_fused_stein_transport_kernel(
-    float* __restrict__ h,
-    const float* __restrict__ grad,
-    float* __restrict__ v_rmsprop,
-    curandStatePhilox4_32_10_t* __restrict__ rng,
-    const float* __restrict__ d_bandwidth,
-    float step_size,
-    float beta_factor,
-    float temperature,
-    float rho_rmsprop,
-    float epsilon,
-    int stein_sign_mode,
-    int n
-) {
-    extern __shared__ float smem[];
-    float* sh_h = smem;
-    float* sh_grad = smem + n;
-    
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    
-    // Issue async loads to shared memory
-    for (int k = threadIdx.x; k < n; k += blockDim.x) {
-        __pipeline_memcpy_async(&sh_h[k], &h[k], sizeof(float));
-        __pipeline_memcpy_async(&sh_grad[k], &grad[k], sizeof(float));
-    }
-    __pipeline_commit();
-    
-    // Independent work while loads are in flight
-    float global_bw = *d_bandwidth;
-    float bw_sq = global_bw * global_bw;
-    float inv_bw_sq = 1.0f / bw_sq;
-    float inv_n = 1.0f / (float)n;
-    float sign_mult = (stein_sign_mode == 1) ? 1.0f : -1.0f;
-    float effective_step = step_size * beta_factor;
-    float v_prev = (i < n) ? v_rmsprop[i] : 0.0f;
-    
-    // Wait for shared memory loads
-    __pipeline_wait_prior(0);
-    __syncthreads();
-    
-    if (i >= n) return;
-    
-    float h_i = sh_h[i];
-    
-    // ===== STEIN OPERATOR with IMQ Kernel =====
-    float k_sum = 0.0f;
-    float gk_sum = 0.0f;
-    
-    #pragma unroll 8
-    for (int j = 0; j < n; j++) {
-        float diff = h_i - sh_h[j];
-        float dist_sq = diff * diff * inv_bw_sq;
-        
-        float base = 1.0f + dist_sq;
-        float K = 1.0f / base;
-        float K_sq = K * K;
-        
-        k_sum += K * sh_grad[j];
-        gk_sum += sign_mult * 2.0f * diff * inv_bw_sq * K_sq;
-    }
-    
-    float phi_i = (k_sum + gk_sum) * inv_n;
-    
-    // ===== RMSPROP =====
-    float v_new = rho_rmsprop * v_prev + (1.0f - rho_rmsprop) * phi_i * phi_i;
-    v_rmsprop[i] = v_new;
-    
-    // ===== TRANSPORT =====
-    float precond = rsqrtf(v_new + epsilon);
-    float drift = effective_step * phi_i * precond;
-    
-    float diffusion = 0.0f;
-    if (temperature > 1e-6f) {
-        float noise = curand_normal(&rng[i]);
-        diffusion = sqrtf(2.0f * effective_step * temperature) * noise;
-    }
-    
-    h[i] = clamp_logvol(h_i + drift + diffusion);
-}
-
-// =============================================================================
-// FUSED: Stein + Transport + KSD (computes KSD in same O(N²) pass)
-// =============================================================================
-// 
-// KSD (Kernel Stein Discrepancy) measures how far particles are from target.
-// KSD² = (1/N²) Σᵢ Σⱼ u_p(xᵢ, xⱼ)
-// where u_p is the Stein kernel:
-//   u_p(x,y) = k(x,y)·s(x)·s(y) + s(x)·∇ₓk + s(y)·∇ᵧk + ∇ₓ∇ᵧk
-//
-// For IMQ kernel k(x,y) = (1 + ||x-y||²/h²)^(-1):
-//   ∇ₓk = -2(x-y)/h² · k²
-//   ∇ᵧk = +2(x-y)/h² · k²
-//   ∇ₓ∇ᵧk = 2k²/h² · (4(x-y)²k/h² - 1)
-//
-// This can be computed in the SAME O(N²) loop as Stein operator at zero cost.
-// =============================================================================
-
-__global__ void svpf_fused_stein_transport_ksd_kernel(
-    float* __restrict__ h,
-    const float* __restrict__ grad,
-    float* __restrict__ v_rmsprop,
-    curandStatePhilox4_32_10_t* __restrict__ rng,
-    const float* __restrict__ d_bandwidth,
-    float* __restrict__ d_ksd_partial,
-    float step_size,
-    float beta_factor,
-    float temperature,
-    float rho_rmsprop,
-    float epsilon,
-    int stein_sign_mode,
-    int n
-) {
-    extern __shared__ float smem[];
-    float* sh_h = smem;
-    float* sh_grad = smem + n;
-    
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    
-    // Issue async loads to shared memory
-    for (int k = threadIdx.x; k < n; k += blockDim.x) {
-        __pipeline_memcpy_async(&sh_h[k], &h[k], sizeof(float));
-        __pipeline_memcpy_async(&sh_grad[k], &grad[k], sizeof(float));
-    }
-    __pipeline_commit();
-    
-    // Independent work while loads are in flight
-    float global_bw = *d_bandwidth;
-    float bw_sq = global_bw * global_bw;
-    float inv_bw_sq = 1.0f / bw_sq;
-    float inv_n = 1.0f / (float)n;
-    float sign_mult = (stein_sign_mode == 1) ? 1.0f : -1.0f;
-    float effective_step = step_size * beta_factor;
-    float v_prev = (i < n) ? v_rmsprop[i] : 0.0f;
-    
-    // Wait for shared memory loads
-    __pipeline_wait_prior(0);
-    __syncthreads();
-    
-    if (i >= n) return;
-    
-    float h_i = sh_h[i];
-    float s_i = sh_grad[i];
-    
-    // ===== FUSED: Stein operator + KSD =====
-    float k_sum = 0.0f;
-    float gk_sum = 0.0f;
-    float ksd_sum = 0.0f;
-    
-    #pragma unroll 8
-    for (int j = 0; j < n; j++) {
-        float h_j = sh_h[j];
-        float s_j = sh_grad[j];
-        float diff = h_i - h_j;
-        float diff_sq = diff * diff;
-        float dist_sq = diff_sq * inv_bw_sq;
-        
-        float base = 1.0f + dist_sq;
-        float K = 1.0f / base;
-        float K_sq = K * K;
-        
-        k_sum += K * s_j;
-        gk_sum += sign_mult * 2.0f * diff * inv_bw_sq * K_sq;
-        
-        float grad_x_k = -2.0f * diff * inv_bw_sq * K_sq;
-        float grad_y_k = -grad_x_k;
-        float hess_xy_k = 2.0f * inv_bw_sq * K_sq * (4.0f * dist_sq * K - 1.0f);
-        
-        float u_ij = K * s_i * s_j + s_i * grad_y_k + s_j * grad_x_k + hess_xy_k;
-        ksd_sum += u_ij;
-    }
-    
-    float phi_i = (k_sum + gk_sum) * inv_n;
-    d_ksd_partial[i] = ksd_sum;
-    
-    // ===== RMSPROP =====
-    float v_new = rho_rmsprop * v_prev + (1.0f - rho_rmsprop) * phi_i * phi_i;
-    v_rmsprop[i] = v_new;
-    
-    // ===== TRANSPORT =====
-    float precond = rsqrtf(v_new + epsilon);
-    float drift = effective_step * phi_i * precond;
-    
-    float diffusion = 0.0f;
-    if (temperature > 1e-6f) {
-        float noise = curand_normal(&rng[i]);
-        diffusion = sqrtf(2.0f * effective_step * temperature) * noise;
-    }
-    
-    h[i] = clamp_logvol(h_i + drift + diffusion);
-}
-
-// =============================================================================
-// KSD Reduction Kernel
-// =============================================================================
-// Reduces partial sums to final KSD² value
-// KSD² = (1/N²) * Σᵢ partial[i]
-
-__global__ void svpf_ksd_reduce_kernel(
-    const float* __restrict__ d_ksd_partial,
-    float* __restrict__ d_ksd,
-    int n
-) {
-    float local_sum = 0.0f;
-    
-    for (int i = threadIdx.x; i < n; i += blockDim.x) {
-        local_sum += d_ksd_partial[i];
-    }
-    
-    local_sum = block_reduce_sum(local_sum);
-    
-    if (threadIdx.x == 0) {
-        float inv_n_sq = 1.0f / ((float)n * (float)n);
-        float ksd_sq = local_sum * inv_n_sq;
-        // Return sqrt(KSD²) = KSD for easier interpretation
-        *d_ksd = sqrtf(fmaxf(ksd_sq, 0.0f));
-    }
-}
-
-// =============================================================================
-// FUSED: Stein + Transport (Newton, no KSD)
-// =============================================================================
-
-__global__ void svpf_fused_stein_transport_newton_kernel(
-    float* __restrict__ h,
-    const float* __restrict__ precond_grad,
-    const float* __restrict__ inv_hessian,
-    float* __restrict__ v_rmsprop,
-    curandStatePhilox4_32_10_t* __restrict__ rng,
-    const float* __restrict__ d_bandwidth,
-    float step_size,
-    float beta_factor,
-    float temperature,
-    float rho_rmsprop,
-    float epsilon,
-    int stein_sign_mode,  // 0=legacy(subtract), 1=paper(add)
-    int n
-) {
-    extern __shared__ float smem[];
-    float* sh_h = smem;
-    float* sh_precond_grad = smem + n;
-    float* sh_inv_hess = smem + 2 * n;
-    
-    for (int k = threadIdx.x; k < n; k += blockDim.x) {
-        sh_h[k] = h[k];
-        sh_precond_grad[k] = precond_grad[k];
-        sh_inv_hess[k] = 1.0f / inv_hessian[k];
-    }
-    __syncthreads();
-    
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    
-    float h_i = sh_h[i];
-    float global_bw = *d_bandwidth;
-    float bw_sq = global_bw * global_bw;
-    float inv_bw_sq = 1.0f / bw_sq;
-    float inv_n = 1.0f / (float)n;
-    
-    // Sign multiplier: -1 for legacy (attraction), +1 for paper (repulsion)
-    float sign_mult = (stein_sign_mode == 1) ? 1.0f : -1.0f;
-    
-    float k_sum = 0.0f;
-    float gk_sum = 0.0f;
-    
-    #pragma unroll 8
-    for (int j = 0; j < n; j++) {
-        float diff = h_i - sh_h[j];
-        float dist_sq = diff * diff * inv_bw_sq;
-        
-        float base = 1.0f + dist_sq;
-        float K = 1.0f / base;
-        float K_sq = K * K;
-        
-        k_sum += K * sh_precond_grad[j];
-        gk_sum += sign_mult * 2.0f * diff * inv_bw_sq * K_sq * sh_inv_hess[j];
-    }
-    
-    float phi_i = (k_sum + gk_sum) * inv_n;
-    
-    float v_prev = v_rmsprop[i];
-    float v_new = rho_rmsprop * v_prev + (1.0f - rho_rmsprop) * phi_i * phi_i;
-    v_rmsprop[i] = v_new;
-    
-    float effective_step = step_size * beta_factor;
-    float precond = rsqrtf(v_new + epsilon);
-    float drift = effective_step * phi_i * precond;
-    
-    float diffusion = 0.0f;
-    if (temperature > 1e-6f) {
-        float noise = curand_normal(&rng[i]);
-        diffusion = sqrtf(2.0f * effective_step * temperature) * noise;
-    }
-    
-    h[i] = clamp_logvol(h_i + drift + diffusion);
-}
-
-// =============================================================================
-// FUSED: Stein + Transport + KSD (Newton variant)
-// =============================================================================
-
-__global__ void svpf_fused_stein_transport_newton_ksd_kernel(
-    float* __restrict__ h,
-    const float* __restrict__ precond_grad,
-    const float* __restrict__ inv_hessian,
-    float* __restrict__ v_rmsprop,
-    curandStatePhilox4_32_10_t* __restrict__ rng,
-    const float* __restrict__ d_bandwidth,
-    float* __restrict__ d_ksd_partial,
-    float step_size,
-    float beta_factor,
-    float temperature,
-    float rho_rmsprop,
-    float epsilon,
-    int stein_sign_mode,  // 0=legacy(subtract), 1=paper(add)
-    int n
-) {
-    extern __shared__ float smem[];
-    float* sh_h = smem;
-    float* sh_precond_grad = smem + n;
-    float* sh_inv_hess = smem + 2 * n;
-    
-    for (int k = threadIdx.x; k < n; k += blockDim.x) {
-        sh_h[k] = h[k];
-        sh_precond_grad[k] = precond_grad[k];
-        sh_inv_hess[k] = 1.0f / inv_hessian[k];
-    }
-    __syncthreads();
-    
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    
-    float h_i = sh_h[i];
-    float s_i = sh_precond_grad[i];
-    float global_bw = *d_bandwidth;
-    float bw_sq = global_bw * global_bw;
-    float inv_bw_sq = 1.0f / bw_sq;
-    float inv_n = 1.0f / (float)n;
-    
-    // Sign multiplier: -1 for legacy (attraction), +1 for paper (repulsion)
-    float sign_mult = (stein_sign_mode == 1) ? 1.0f : -1.0f;
-    
-    float k_sum = 0.0f;
-    float gk_sum = 0.0f;
-    float ksd_sum = 0.0f;
-    
-    #pragma unroll 8
-    for (int j = 0; j < n; j++) {
-        float h_j = sh_h[j];
-        float s_j = sh_precond_grad[j];
-        float diff = h_i - h_j;
-        float diff_sq = diff * diff;
-        float dist_sq = diff_sq * inv_bw_sq;
-        
-        float base = 1.0f + dist_sq;
-        float K = 1.0f / base;
-        float K_sq = K * K;
-        
-        k_sum += K * s_j;
-        gk_sum += sign_mult * 2.0f * diff * inv_bw_sq * K_sq * sh_inv_hess[j];
-        
-        // KSD
-        float grad_x_k = -2.0f * diff * inv_bw_sq * K_sq;
-        float grad_y_k = -grad_x_k;
-        float hess_xy_k = 2.0f * inv_bw_sq * K_sq * (4.0f * dist_sq * K - 1.0f);
-        float u_ij = K * s_i * s_j + s_i * grad_y_k + s_j * grad_x_k + hess_xy_k;
-        ksd_sum += u_ij;
-    }
-    
-    float phi_i = (k_sum + gk_sum) * inv_n;
-    d_ksd_partial[i] = ksd_sum;
-    
-    float v_prev = v_rmsprop[i];
-    float v_new = rho_rmsprop * v_prev + (1.0f - rho_rmsprop) * phi_i * phi_i;
-    v_rmsprop[i] = v_new;
-    
-    float effective_step = step_size * beta_factor;
-    float precond = rsqrtf(v_new + epsilon);
-    float drift = effective_step * phi_i * precond;
-    
-    float diffusion = 0.0f;
-    if (temperature > 1e-6f) {
-        float noise = curand_normal(&rng[i]);
-        diffusion = sqrtf(2.0f * effective_step * temperature) * noise;
-    }
-    
-    h[i] = clamp_logvol(h_i + drift + diffusion);
-}
-
-// =============================================================================
 // FUSED: Stein + Transport (Full Newton)
 // =============================================================================
 
@@ -896,7 +374,7 @@ __global__ void svpf_fused_stein_transport_full_newton_kernel(
     float temperature,
     float rho_rmsprop,
     float epsilon,
-    int stein_sign_mode,  // 0=legacy(subtract), 1=paper(add)
+    int stein_sign_mode,
     int n
 ) {
     extern __shared__ float smem[];
@@ -920,7 +398,6 @@ __global__ void svpf_fused_stein_transport_full_newton_kernel(
     float inv_bw_sq = 1.0f / bw_sq;
     float inv_n = 1.0f / (float)n;
     
-    // Sign multiplier: -1 for legacy (attraction), +1 for paper (repulsion)
     float sign_mult = (stein_sign_mode == 1) ? 1.0f : -1.0f;
     
     float H_weighted = 0.0f;
@@ -972,7 +449,6 @@ __global__ void svpf_fused_stein_transport_full_newton_kernel(
 // =============================================================================
 // FUSED: Stein + Transport (Full Newton with KSD)
 // =============================================================================
-// Same as full_newton but also computes KSD for adaptive stepping
 
 __global__ void svpf_fused_stein_transport_full_newton_ksd_kernel(
     float* __restrict__ h,
@@ -987,7 +463,7 @@ __global__ void svpf_fused_stein_transport_full_newton_ksd_kernel(
     float temperature,
     float rho_rmsprop,
     float epsilon,
-    int stein_sign_mode,  // 0=legacy(subtract), 1=paper(add)
+    int stein_sign_mode,
     int n
 ) {
     extern __shared__ float smem[];
@@ -1012,7 +488,6 @@ __global__ void svpf_fused_stein_transport_full_newton_ksd_kernel(
     float inv_bw_sq = 1.0f / bw_sq;
     float inv_n = 1.0f / (float)n;
     
-    // Sign multiplier: -1 for legacy (attraction), +1 for paper (repulsion)
     float sign_mult = (stein_sign_mode == 1) ? 1.0f : -1.0f;
     
     float H_weighted = 0.0f;
@@ -1078,18 +553,42 @@ __global__ void svpf_fused_stein_transport_full_newton_ksd_kernel(
 }
 
 // =============================================================================
+// KSD Reduction Kernel
+// =============================================================================
+
+__global__ void svpf_ksd_reduce_kernel(
+    const float* __restrict__ d_ksd_partial,
+    float* __restrict__ d_ksd,
+    int n
+) {
+    float local_sum = 0.0f;
+    
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        local_sum += d_ksd_partial[i];
+    }
+    
+    local_sum = block_reduce_sum(local_sum);
+    
+    if (threadIdx.x == 0) {
+        float inv_n_sq = 1.0f / ((float)n * (float)n);
+        float ksd_sq = local_sum * inv_n_sq;
+        *d_ksd = sqrtf(fmaxf(ksd_sq, 0.0f));
+    }
+}
+
+// =============================================================================
 // FUSED: Outputs
 // =============================================================================
 
 __global__ void svpf_fused_outputs_kernel(
     const float* __restrict__ h,
     const float* __restrict__ log_w,
-    const float* __restrict__ d_bandwidth_in,  // Read bandwidth for packing
-    const float* __restrict__ d_ksd_in,        // Read KSD for packing
+    const float* __restrict__ d_bandwidth_in,
+    const float* __restrict__ d_ksd_in,
     float* __restrict__ d_loglik,
     float* __restrict__ d_vol,
     float* __restrict__ d_h_mean,
-    float* __restrict__ d_output_pack,         // Packed output [5 floats]
+    float* __restrict__ d_output_pack,
     int t_out,
     int n
 ) {
@@ -1128,12 +627,10 @@ __global__ void svpf_fused_outputs_kernel(
         float vol = local_sum_vol * inv_n;
         float h_mean = local_sum_h * inv_n;
         
-        // Write to legacy outputs (backward compat)
         d_loglik[t_out] = loglik;
         d_vol[t_out] = vol;
         *d_h_mean = h_mean;
         
-        // Pack all outputs for single D2H transfer
         d_output_pack[0] = loglik;
         d_output_pack[1] = vol;
         d_output_pack[2] = h_mean;
@@ -1227,13 +724,6 @@ __global__ void svpf_fused_bandwidth_kernel(
 // =============================================================================
 // PARTIAL REJUVENATION KERNEL (Maken et al. 2022)
 // =============================================================================
-// When particles are stuck (high KSD after Stein), randomly select some
-// and nudge them toward the EKF guide prediction.
-//
-// For each particle with probability rejuv_prob:
-//   h_new = (1 - blend) * h_old + blend * (guide_mean + guide_std * noise)
-//
-// This helps escape local modes at reflecting boundaries.
 
 __global__ void svpf_partial_rejuvenation_kernel(
     float* __restrict__ h,
@@ -1247,19 +737,15 @@ __global__ void svpf_partial_rejuvenation_kernel(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     
-    // Draw uniform random to decide if this particle gets rejuvenated
     float u = curand_uniform(&rng[i]);
     
     if (u < rejuv_prob) {
-        // This particle will be nudged toward guide
         float z = curand_normal(&rng[i]);
         float guide_sample = guide_mean + guide_std * z;
         
-        // Blend current position with guide sample
         float h_old = h[i];
         float h_new = (1.0f - blend_factor) * h_old + blend_factor * guide_sample;
         
-        // Clamp to valid range
         h[i] = clamp_logvol(h_new);
     }
 }
