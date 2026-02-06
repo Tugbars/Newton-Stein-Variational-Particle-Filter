@@ -101,68 +101,82 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     cudaMemcpy(state->d_return_var, &init_ema, sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(state->d_bw_alpha, &init_alpha, sizeof(float), cudaMemcpyHostToDevice);
     
-    state->lik_offset = 0.45f;
-    state->use_exact_gradient = 0;
+    // =========================================================================
+    // Production defaults (matches test harness configuration)
+    // =========================================================================
     
+    state->use_exact_gradient = 1;
+    state->lik_offset = 0.345f;
+    
+    // --- SVLD + Annealing ---
     state->use_svld = 1;
     state->use_annealing = 1;
-    state->use_adaptive_beta = 1;  // KSD-adaptive beta (Maken 2022)
-    state->n_anneal_steps = 3;
-    state->temperature = 1.0f;
-    state->rmsprop_rho = 0.9f;
+    state->use_adaptive_beta = 1;   // KSD-adaptive beta (Maken 2022)
+    state->n_anneal_steps = 5;
+    state->temperature = 0.45f;
+    state->rmsprop_rho = 0.7f;
     state->rmsprop_eps = 1e-6f;
     
-    state->use_mim = 1;
-    state->mim_jump_prob = 0.05f;
-    state->mim_jump_scale = 5.0f;
+    // --- MIM (OFF by default — guided prediction supersedes) ---
+    state->use_mim = 0;
+    state->mim_jump_prob = 0.25f;
+    state->mim_jump_scale = 9.0f;
     
-    state->use_asymmetric_rho = 1;
+    // --- Asymmetric persistence ---
+    state->use_asymmetric_rho = 0;
     state->rho_up = 0.98f;
     state->rho_down = 0.93f;
     
+    // --- EKF Guide density ---
     state->use_guide = 1;
-    state->use_guide_preserving = 1;
+    state->use_guide_preserving = 1;  // Variance-preserving shift (not contraction)
     state->guide_strength = 0.05f;
     state->guide_mean = 0.0f;
     state->guide_var = 0.0f;
     state->guide_K = 0.0f;
-    state->guide_initialized = 0;
+    state->guide_initialized = 1;
     
-    state->use_adaptive_guide = 0;
-    state->guide_strength_base = 0.05f;
-    state->guide_strength_max = 0.30f;
-    state->guide_innovation_threshold = 1.0f;
+    // --- Adaptive guide (innovation-gated strength) ---
+    state->use_adaptive_guide = 1;
+    state->guide_strength_base = 0.05f;       // Base when model fits
+    state->guide_strength_max = 0.30f;        // Max during surprises
+    state->guide_innovation_threshold = 1.0f; // Z-score to start boosting
     state->vol_prev = 0.05f;
     
-    // Partial rejuvenation (Maken 2022)
-    state->use_rejuvenation = 1;        // ON by default
-    state->rejuv_ksd_threshold = 0.30f; // Trigger when KSD > 0.3
-    state->rejuv_prob = 0.30f;          // Nudge 30% of particles
-    state->rejuv_blend = 0.30f;         // 30% toward guide, 70% stay
+    // --- Partial rejuvenation (Maken 2022) ---
+    state->use_rejuvenation = 1;
+    state->rejuv_ksd_threshold = 0.05f;  // Trigger threshold
+    state->rejuv_prob = 0.30f;           // 30% of particles
+    state->rejuv_blend = 0.30f;          // 30% blend factor
     
-    state->use_newton = 0;
-    state->use_full_newton = 0;
+    // --- Newton-Stein (Hessian preconditioning) ---
+    state->use_newton = 1;
+    state->use_full_newton = 1;  // Detommaso 2018 full Newton
     
-    state->use_guided = 0;
-    state->guided_alpha_base = 0.0f;
-    state->guided_alpha_shock = 0.5f;
-    state->guided_innovation_threshold = 1.5f;
+    // --- Guided Prediction with innovation gating ---
+    state->use_guided = 1;
+    state->guided_alpha_base = 0.0f;             // 0% when model fits
+    state->guided_alpha_shock = 0.40f;            // 40% when model fails
+    state->guided_innovation_threshold = 1.5f;    // 1.5σ = "surprised"
     
+    // --- Local parameter perturbation ---
     state->use_local_params = 0;
     state->delta_rho = 0.02f;
     state->delta_sigma = 0.1f;
     
-    state->use_adaptive_mu = 0;
+    // --- Adaptive mu (Kalman drift) ---
+    state->use_adaptive_mu = 1;
     state->mu_state = -3.5f;
     state->mu_var = 1.0f;
-    state->mu_process_var = 0.001f;
-    state->mu_obs_var_scale = 10.0f;
-    state->mu_min = -6.0f;
+    state->mu_process_var = 0.001f;   // Q: how fast can mu drift
+    state->mu_obs_var_scale = 11.0f;  // R = scale * bw²
+    state->mu_min = -4.0f;
     state->mu_max = -1.0f;
     
-    state->use_adaptive_sigma = 0;
-    state->sigma_boost_threshold = 1.0f;
-    state->sigma_boost_max = 3.0f;
+    // --- Adaptive sigma (volatility-of-volatility boost) ---
+    state->use_adaptive_sigma = 1;
+    state->sigma_boost_threshold = 0.95f;  // Start boosting when |z| > ~1
+    state->sigma_boost_max = 3.2f;         // Max 3.2× boost
     state->sigma_z_effective = 0.10f;
     
     // === Stein operator sign mode ===
@@ -171,51 +185,47 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     state->stein_repulsive_sign = SVPF_STEIN_SIGN_DEFAULT;
     
     // === Fan mode (weightless SVGD) ===
-    // 0 = hybrid (default), 1 = pure Stein without importance weights
     state->use_fan_mode = 0;
     
     // === Student-t state dynamics ===
-    // 0 = Gaussian AR(1) (default), 1 = Student-t AR(1) with bounded gradients
-    state->use_student_t_state = 0;
-    state->nu_state = 5.0f;  // Degrees of freedom for state dynamics (recommended: 5-7, min: 3)
-    // Note: nu_state is clamped to >= 2.5 in svpf_initialize to ensure finite variance
+    state->use_student_t_state = 1;
+    state->nu_state = 5.0f;  // 5-7 recommended, lower = fatter tails
     
     // === KSD-based Adaptive Stein Steps ===
-    state->stein_min_steps = 4;              // Always run at least this many
-    state->stein_max_steps = 12;             // Never exceed this
-    state->ksd_improvement_threshold = 0.05f; // Stop if relative improvement < 5%
-    state->ksd_prev = 1e10f;                 // Initialize high
-    state->stein_steps_used = n_stein_steps; // Diagnostic
+    state->stein_min_steps = 8;
+    state->stein_max_steps = 16;
+    state->ksd_improvement_threshold = 0.05f;  // Stop if <5% relative improvement
+    state->ksd_prev = 1e10f;
+    state->stein_steps_used = n_stein_steps;
     
     // === Heun's Method (Improved Euler) ===
-    // 0 = Euler (default), 1 = Heun's method (2nd order, 2× gradient evals)
-    state->use_heun = 0;
+    state->use_heun = 0;  // Commented out in test config
     
     // === Antithetic Sampling ===
-    // Pairs particles (i, i+n/2) with (+z, -z) noise for variance reduction
-    state->use_antithetic = 1;  // ON by default (reduces variance ~2×)
+    state->use_antithetic = 1;
     
     // === Adaptive Annealing (KL-based beta stepping) ===
-    // Replaces fixed beta schedule with variance-constrained adaptive stepping
-    state->use_adaptive_anneal = 1;           // ON by default
-    state->anneal_kl_threshold = 0.5f;        // KL constraint (0.5 ≈ ESS=N/2)
-    state->anneal_steps_per_beta = 2;         // Stein steps per beta update
-    state->anneal_max_stages = 50;            // Safety cap
+    state->use_adaptive_anneal = 1;
+    state->anneal_kl_threshold = 0.9f;
+    state->anneal_steps_per_beta = 3;
+    state->anneal_max_stages = 50;
     state->anneal_stages_used = 0;
     state->anneal_final_var_ll = 0.0f;
     state->anneal_final_h_std = 0.0f;
     
-    // === Backward Smoothing (Fan et al. 2021 sliding window, lightweight) ===
-    // Applies RTS-style correction to past estimates using recent observations
-    state->use_smoothing = 0;                // OFF by default
-    state->smooth_lag = 3;                   // Window size (1-5 recommended)
-    state->smooth_output_lag = 1;            // Output h[t-1] instead of h[t]
+    // === Backward Smoothing (Fan et al. 2021 sliding window) ===
+    state->use_smoothing = 1;
+    state->smooth_lag = 3;           // Buffer last 3 estimates
+    state->smooth_output_lag = 1;    // Output h[t-1] (smoothed by y[t])
     for (int i = 0; i < SVPF_SMOOTH_MAX_LAG; i++) {
         state->smooth_h_mean[i] = 0.0f;
         state->smooth_h_var[i] = 1.0f;
         state->smooth_y[i] = 0.0f;
     }
-    state->smooth_head = 0;
+    state->smooth_head = 1;
+    
+    // === Persistent kernel ===
+    state->use_persistent_kernel = 1;
     
     // Device scalars
     cudaMalloc(&state->d_scalar_max, sizeof(float));
@@ -235,6 +245,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     
     return state;
 }
+
 
 // =============================================================================
 // STATE MANAGEMENT: Destroy
