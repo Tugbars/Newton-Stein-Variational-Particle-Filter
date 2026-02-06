@@ -2,31 +2,30 @@
  * @file svpf.cuh
  * @brief Stein Variational Particle Filter for Stochastic Volatility
  * 
- * Purpose: Real-time volatility tracking with crash robustness.
+ * Real-time volatility tracking with crash robustness.
+ * Algorithm: Fan et al. 2021 (arXiv:2106.10568) with extensions:
+ *   - Full Newton Stein (Detommaso 2018)
+ *   - Adaptive annealing (KL-constrained beta stepping)
+ *   - Student-t state dynamics for bounded gradients
+ *   - Antithetic sampling for variance reduction
+ *   - EKF guide density with innovation gating
+ *   - RTS backward smoothing
  * 
- * Key features:
- * - Stein transport prevents particle degeneracy
- * - Student-t likelihood handles tail events
- * - Fewer particles needed vs bootstrap PF (500 vs 3000)
- * 
- * Algorithm (Fan et al. 2021, arXiv:2106.10568):
- * - Prior is Gaussian MIXTURE over all particles: p(h_t|Z_{t-1}) = (1/N) Σ_i p(h_t|h_{t-1}^i)
- * - This requires O(N²) gradient computation per Stein iteration
- * - Weights use exact Student-t likelihood for unbiased importance sampling
- * - Gradients use log-squared approximation for robust linear transport
- * 
- * Usage (single-step, real-time):
- *   SVPFState* filter = svpf_create(1024, 10, 5.0f, stream);
- *   svpf_initialize(filter, &params, seed);
- *   for each observation y_t:
- *       svpf_step_adaptive(filter, y_t, y_prev, &params, &loglik, &vol, &h_mean);
- *   svpf_destroy(filter);
+ * Usage:
+ *   SVPFState* f = svpf_create(512, 8, 5.0f, stream);
+ *   svpf_initialize(f, &params, seed);
+ *   for each y_t:
+ *       svpf_step_async(f, y_t, y_prev, &params);
+ *       svpf_sync_outputs(f, &loglik, &vol, &h_mean);
+ *   svpf_destroy(f);
  * 
  * Memory Layout: Structure of Arrays (SoA) for coalesced GPU access
  * 
  * References:
  * - Liu & Wang (2016): SVGD algorithm
  * - Fan et al. (2021): Stein Particle Filtering (arXiv:2106.10568)
+ * - Detommaso et al. (2018): Full Newton Stein
+ * - Maken et al. (2022): Partial rejuvenation, KSD-adaptive beta
  */
 
 #ifndef SVPF_CUH
@@ -45,7 +44,7 @@ extern "C" {
 // =============================================================================
 
 #define SVPF_DEFAULT_PARTICLES     512
-#define SVPF_DEFAULT_STEIN_STEPS   5
+#define SVPF_DEFAULT_STEIN_STEPS   8
 #define SVPF_DEFAULT_NU            5.0f
 #define SVPF_STEIN_STEP_SIZE       0.1f
 #define SVPF_BANDWIDTH_MIN         0.01f
@@ -53,35 +52,11 @@ extern "C" {
 #define SVPF_H_MIN                 -15.0f
 #define SVPF_H_MAX                 5.0f
 #define SVPF_BLOCK_SIZE            256
+#define SVPF_SMALL_N_THRESHOLD     4096   // Threshold for persistent CTA path
+#define SVPF_GRAPH_PARAMS_SIZE     32     // Floats in graph parameter staging buffer
+#define SVPF_SMOOTH_MAX_LAG        8      // Max backward smoothing window
 
-// Threshold for small N optimizations (persistent CTA path)
-#define SVPF_SMALL_N_THRESHOLD     4096
-
-// Number of floats in graph parameter staging buffer
-#define SVPF_GRAPH_PARAMS_SIZE     32
-
-// === Backward Smoothing (Fan et al. 2021 lightweight) ===
-#define SVPF_SMOOTH_MAX_LAG 8
-
-// =============================================================================
-// STEIN SIGN MODE CONFIGURATION
-// =============================================================================
-//
-// The Stein operator has two terms:
-//   φ(x_i) = 1/n Σⱼ [k(xⱼ, xᵢ)·∇log q(xⱼ) + ∇_{xⱼ} k(xⱼ, xᵢ)]
-//                    └─── attraction ────┘   └─── repulsion ───┘
-//
-// For IMQ kernel with diff = x_i - x_j:
-//   ∇_{xⱼ} k(xⱼ, xᵢ) = +2·diff/h²·k²
-//
-// STEIN_SIGN_LEGACY (0): Subtracts kernel gradient (particles attract)
-//   - Empirically tuned with MIM/SVLD/guide compensating for lack of repulsion
-//   - Production-tested configuration
-//
-// STEIN_SIGN_PAPER (1): Adds kernel gradient (particles repel)
-//   - Mathematically correct per Fan et al. 2021
-//   - May require retuning other parameters
-//
+// Stein sign: 0=legacy(attraction), 1=paper(repulsion, Fan et al. 2021)
 #define SVPF_STEIN_SIGN_LEGACY  0
 #define SVPF_STEIN_SIGN_PAPER   1
 
@@ -96,163 +71,112 @@ extern "C" {
 /**
  * @brief Device-side parameter staging for CUDA graph execution
  * 
- * Layout of d_params_staging buffer (32 floats):
- * [0]  y_prev           - Previous observation
- * [1]  y_t              - Current observation
- * [2]  guide_mean       - EKF guide mean
- * [3]  beta             - Current annealing factor
- * [4]  step_size        - Stein step size
- * [5]  temp             - SVLD temperature
- * [6]  rho              - AR persistence
- * [7]  sigma_z          - Innovation std
- * [8]  mu               - Mean level
- * [9]  gamma            - Leverage coefficient
- * [10] nu               - Student-t degrees of freedom
- * [11] student_t_const  - Precomputed Student-t normalizing constant
- * [12] rho_up           - Asymmetric rho (up)
- * [13] rho_down         - Asymmetric rho (down)
- * [14] delta_rho        - Particle-local rho sensitivity
- * [15] delta_sigma      - Particle-local sigma sensitivity
- * [16] alpha_base       - Guided alpha (base)
- * [17] alpha_shock      - Guided alpha (shock)
- * [18] innovation_thresh - Guided innovation threshold
- * [19] jump_prob        - MIM jump probability
- * [20] jump_scale       - MIM jump scale
- * [21] guide_strength   - Guide density strength
- * [22] rmsprop_rho      - RMSProp decay
- * [23] rmsprop_eps      - RMSProp epsilon
- * [24-31] reserved      - Future use
+ * Layout: 24 named floats + 8 reserved = 32 floats total.
+ * Updated via cudaMemcpyAsync before graph replay.
  */
 typedef struct {
-    float y_prev;
-    float y_t;
-    float guide_mean;
-    float beta;
-    float step_size;
-    float temp;
-    float rho;
-    float sigma_z;
-    float mu;
-    float gamma;
-    float nu;
-    float student_t_const;
-    float rho_up;
-    float rho_down;
-    float delta_rho;
-    float delta_sigma;
-    float alpha_base;
-    float alpha_shock;
-    float innovation_thresh;
-    float jump_prob;
-    float jump_scale;
-    float guide_strength;
-    float rmsprop_rho;
-    float rmsprop_eps;
-    float reserved[8];
+    float y_prev;            // Previous observation
+    float y_t;               // Current observation
+    float guide_mean;        // EKF guide mean
+    float beta;              // Current annealing factor
+    float step_size;         // Stein step size
+    float temp;              // SVLD temperature
+    float rho;               // AR persistence
+    float sigma_z;           // Innovation std
+    float mu;                // Mean level
+    float gamma;             // Leverage coefficient
+    float nu;                // Student-t degrees of freedom
+    float student_t_const;   // Precomputed Student-t normalizing constant
+    float rho_up;            // Asymmetric rho (up moves)
+    float rho_down;          // Asymmetric rho (down moves)
+    float delta_rho;         // Particle-local rho sensitivity
+    float delta_sigma;       // Particle-local sigma sensitivity
+    float alpha_base;        // Guided alpha (base)
+    float alpha_shock;       // Guided alpha (shock)
+    float innovation_thresh; // Guided innovation threshold
+    float jump_prob;         // MIM jump probability
+    float jump_scale;        // MIM jump scale
+    float guide_strength;    // Guide density strength
+    float rmsprop_rho;       // RMSProp decay
+    float rmsprop_eps;       // RMSProp epsilon
+    float reserved[8];       // Future use
 } SVPFGraphParams;
 
 /**
  * @brief Optimized backend state for batch/graph processing
  * 
- * Embedded in SVPFState for thread safety - each filter instance
+ * Embedded in SVPFState for thread safety — each filter instance
  * has its own optimization buffers.
  */
 typedef struct {
     // CUB temporary storage
-    void* d_temp_storage;
-    size_t temp_storage_bytes;
-    
+    void* d_temp_storage;          // CUB reduction workspace
+    size_t temp_storage_bytes;     // Size of CUB workspace
+
     // Device scalars
-    float* d_max_log_w;
-    float* d_sum_exp;
-    float* d_bandwidth;
-    float* d_bandwidth_sq;
-    
+    float* d_max_log_w;            // Max log-weight (for logsumexp)
+    float* d_sum_exp;              // Sum of exp(log_w - max)
+    float* d_bandwidth;            // Current kernel bandwidth
+    float* d_bandwidth_sq;         // Bandwidth squared (EMA state)
+
     // Stein computation buffers
-    float* d_exp_w;
-    float* d_phi;
-    
-    // Mixture prior fix: separate likelihood gradient buffer
-    // Required for correct O(N²) mixture prior + O(N) likelihood decomposition
-    float* d_grad_lik;
-    
-    // Newton-Stein buffers (Hessian preconditioning)
-    float* d_precond_grad;    // H^{-1} * grad (preconditioned gradient)
-    float* d_inv_hessian;     // H^{-1} (inverse Hessian per particle)
-    
-    // Particle-local parameters: h_mean from previous step
-    float* d_h_mean_prev;
-    
-    // Guide mean and strength (device-side for graph compatibility)
-    float* d_guide_mean;
-    float* d_guide_strength;   // Adaptive guide strength
-    
+    float* d_exp_w;                // [N] Exponentiated weights
+    float* d_phi;                  // [N] Stein operator output
+    float* d_grad_lik;             // [N] Likelihood gradient (separate from prior)
+    float* d_precond_grad;         // [N] H^{-1} * grad (Newton preconditioned)
+    float* d_inv_hessian;          // [N] Curvature per particle
+
+    // State from previous step
+    float* d_h_mean_prev;          // Scalar: h mean from last step
+
+    // Guide (device-side for graph compatibility)
+    float* d_guide_mean;           // Scalar: EKF guide mean on device
+    float* d_guide_strength;       // Scalar: adaptive guide strength on device
+
     // Single-step API buffers (avoid malloc in hot loop)
-    float* d_y_single;
-    float* d_loglik_single;
-    float* d_vol_single;
-    
-    // =========================================================================
-    // CUDA GRAPH SUPPORT
-    // For HFT: captures kernel sequence, replays with ~5μs overhead vs ~100μs+
-    // =========================================================================
-    
-    // Graph handles
-    cudaGraph_t graph;
-    cudaGraphExec_t graph_exec;
-    cudaStream_t graph_stream;
-    bool graph_captured;
-    int graph_n;              // N at capture time (recapture if changed)
-    int graph_n_stein;        // Stein steps at capture time
-    
-    // Device-side parameter staging (kernels read from here)
-    // Updated via cudaMemcpyAsync before graph replay
-    float* d_params_staging;  // Packed: [y_prev, y_t, guide_mean, beta, step_size, temp, ...]
-    
-    // Burned-in mu at capture time (for graph invalidation check)
-    float mu_captured;
-    float sigma_z_captured;
-    
-    // Pinned host memory for fast D2H transfers
-    // Layout: [loglik, vol, h_mean, bandwidth]
-    float* h_results_pinned;
-    
-    // Capacity tracking
-    int allocated_n;
-    bool initialized;
+    float* d_y_single;             // [2] y_prev and y_t staging
+    float* d_loglik_single;        // Scalar: log-likelihood output
+    float* d_vol_single;           // Scalar: volatility output
 
-    float *d_ksd_partial; // Partial sums for KSD reduction [n floats]
-    float *d_ksd;         // Final KSD value [1 float]
+    // CUDA Graph handles
+    cudaGraph_t graph;             // Captured graph
+    cudaGraphExec_t graph_exec;    // Executable graph instance
+    cudaStream_t graph_stream;     // Stream for graph capture
+    bool graph_captured;           // Whether graph is currently valid
+    int graph_n;                   // N at capture time
+    int graph_n_stein;             // Stein steps at capture time
+    float* d_params_staging;       // [32] Packed parameters for graph replay
+    float mu_captured;             // Mu burned into graph
+    float sigma_z_captured;        // Sigma_z burned into graph
+    float* h_results_pinned;       // [4] Pinned host: [loglik, vol, h_mean, bw]
 
-    float *d_beta_schedule; // [8] Beta schedule for persistent kernel
+    // KSD buffers
+    float* d_ksd_partial;          // [N] Partial KSD sums per particle
+    float* d_ksd;                  // Scalar: final KSD value
 
-    // === Heun's Method Buffers ===
-    float *d_phi_orig; // Stein operator at original h
-    float *d_phi_pred; // Stein operator at predicted h̃
-    float *d_h_orig;   // Original h before predictor step
-    
-    // === Consolidated D2H Output Pack ===
-    // Single 32-byte transfer for all outputs (5 floats + padding)
-    float* d_output_pack;      // Device: [loglik, vol, h_mean, bandwidth, ksd, pad, pad, pad]
-    float* h_output_pinned;    // Pinned host (same layout)
-    
-    // === Async Processing State ===
-    // Stored between svpf_step_async() and svpf_sync_outputs()
-    float pending_y_t;
-    const void* pending_params;  // Actually SVPFParams*, but void* avoids forward decl
+    // Consolidated D2H output pack (single transfer)
+    float* d_output_pack;          // [8] Device: [loglik, vol, h_mean, bw, ksd, pad...]
+    float* h_output_pinned;        // [8] Pinned host mirror
 
-        // === Adaptive Annealing Buffers ===
-    float* d_anneal_stats;       // [4]: mean_ll, var_ll, mean_grad, h_std
-    float* h_anneal_stats_pinned; // Pinned host for fast D2H
+    // Async state (between step_async and sync_outputs)
+    float pending_y_t;             // Stored y_t for post-sync processing
+    const void* pending_params;    // Stored SVPFParams* for post-sync
+
+    // Adaptive annealing buffers
+    float* d_anneal_stats;         // [4] mean_ll, var_ll, mean_grad, h_std
+    float* h_anneal_stats_pinned;  // [4] Pinned host mirror
+
+    // Capacity
+    int allocated_n;               // Allocated particle count
+    bool initialized;              // Whether backend is initialized
 } SVPFOptimizedState;
 
 /**
  * @brief SV model parameters
  * 
- * AR(1) log-volatility with leverage effect:
+ * AR(1) log-volatility with leverage:
  *   h_t = mu + rho*(h_{t-1} - mu) + sigma_z*eps_t + gamma*y_{t-1}/exp(h_{t-1}/2)
- * 
- * Observation: y_t = exp(h_t/2) * eta_t, eta_t ~ Student-t(nu)
+ *   y_t = exp(h_t/2) * eta_t,  eta_t ~ Student-t(nu)
  */
 typedef struct {
     float rho;      // Persistence (0 < rho < 1, typically 0.9-0.99)
@@ -263,284 +187,175 @@ typedef struct {
 
 /**
  * @brief SVPF filter state (SoA layout for GPU)
- * 
- * Key implementation notes:
- * 
- * MIXTURE PRIOR (Fan et al. 2021, Eq. 6):
- *   The prior at time t is a Gaussian mixture:
- *     p(h_t | Z_{t-1}) = (1/N) Σ_i N(h_t; μ_i, σ_z²)
- *   where μ_i = μ + ρ(h_{t-1}^i - μ)
- * 
- *   This means each particle j feels attraction from ALL prior means,
- *   not just its own. The gradient is:
- *     ∇_h log p_prior(h_j) = Σ_i r_i(h_j) * (-(h_j - μ_i)/σ_z²)
- *   where r_i is the responsibility (soft assignment to component i).
- * 
- *   This requires O(N²) computation but is essential for correct filtering.
- * 
- * HYBRID LIKELIHOOD STRATEGY:
- *   - Weights: Exact Student-t (unbiased importance sampling)
- *   - Gradients: Log-squared approximation (robust linear transport)
- *   
- *   The log-squared gradient provides a "parabolic bowl" that always
- *   pulls particles toward the observation, even from far away.
- *   The Student-t gradient creates a "volcano" that saturates for
- *   large deviations, causing particles to get stuck.
  */
 typedef struct {
-    // Particle states
-    float* h;           // [N] Current log-volatility particles
-    float* h_prev;      // [N] Previous step (for AR(1) prior)
-    float* h_pred;      // [N] Predicted particles (before Stein)
-    
-    // Stein computation workspace
-    float* grad_log_p;  // [N] Gradient of log posterior (prior + likelihood)
-    float* kernel_sum;  // [N] Sum of kernel weights (attraction)
-    float* grad_kernel_sum; // [N] Sum of kernel gradients (repulsion)
-    
-    // Likelihood computation
-    float* log_weights; // [N] Log importance weights
-    
-    // Bandwidth computation
-    float* d_h_centered;  // [N] Centered particles for variance computation
-    
-    // === ADAPTIVE SVPF ADDITIONS ===
-    // Per-particle RMSProp momentum (for SVLD)
-    float* d_grad_v;       // [N] Second moment (uncentered variance)
-    
-    // Regime detection for bandwidth scaling
-    float* d_return_ema;   // Scalar: EMA of |returns|
-    float* d_return_var;   // Scalar: EMA of return variance
-    float* d_bw_alpha;     // Scalar: adaptive bandwidth alpha
-    
-    // RNG states
-    curandStatePhilox4_32_10_t* rng_states;  // [N] CURAND Philox states
-    
-    // Reduction workspace
-    float* d_reduce_buf;
-    float* d_temp;
-    void* d_cub_temp;
-    size_t cub_temp_bytes;
-    
-    // Device scalars
-    float* d_scalar_max;
-    float* d_scalar_sum;
-    float* d_scalar_mean;
-    float* d_scalar_bandwidth;
-    float* d_y_prev;
-    
-    // Result buffer
-    float* d_result_loglik;
-    float* d_result_vol_mean;
-    float* d_result_h_mean;
-    
-    // Configuration
-    int n_particles;
-    int n_stein_steps;
-    float nu;               // Student-t degrees of freedom
-    float student_t_const;  // Precomputed: lgamma((nu+1)/2) - lgamma(nu/2) - 0.5*log(pi*nu)
-    float student_t_implied_offset;  // Precomputed offset for implied h from observation:
-                                     //   For Student-t: h_implied = log(y²) - E[log(t²_ν)]
-                                     //   E[log(t²_ν)] = log(ν) + ψ(1/2) - ψ(ν/2)
-                                     //   We store the negated value so: h_implied = log(y²) + offset
-                                     //   For ν→∞ (Gaussian), this approaches 1.27
-    int timestep;
-    float y_prev;
-    cudaStream_t stream;
-    
-    // Likelihood gradient config
-    // lik_offset serves different purposes depending on use_exact_gradient:
-    //   SURROGATE (use_exact_gradient=0):
-    //     - grad = (log(y²) - h + lik_offset) / R_noise
-    //     - Tuned value: ~0.70 for minimal bias
-    //   EXACT (use_exact_gradient=1):
-    //     - grad = exact_student_t_grad - lik_offset
-    //     - Tuned value: ~0.25-0.30 to correct for equilibrium bias
-    float lik_offset;       // Bias correction (0.70 for surrogate, 0.27 for exact)
-    
-    // Exact vs Surrogate likelihood gradient
-    // - Exact: d/dh log p(y|h) = -0.5 + 0.5*(nu+1)*A/(1+A) - lik_offset
-    //   Mathematically consistent with log_w and Hessian. Saturates at ±nu/2.
-    // - Surrogate: (log(y²) - h + lik_offset) / R_noise
-    //   Linear (no saturation), but inconsistent with Student-t weights/Hessian.
-    int use_exact_gradient; // 0 = surrogate (legacy), 1 = exact Student-t (recommended with nu>=30)
-    
-    // Adaptive SVPF config
-    int use_svld;           // Enable SVLD (Langevin noise) - 0=SVGD, 1=SVLD
-    int use_annealing;      // Enable annealed Stein
-    int use_adaptive_beta;  // KSD-adaptive beta (Maken 2022): trust prior when particles disagree
-    int n_anneal_steps;     // Number of annealing steps (2-3)
-    float temperature;      // Langevin temperature: 0=SVGD, 1=SVLD, >1=exploration
-    float rmsprop_rho;      // RMSProp decay (0.9-0.99)
-    float rmsprop_eps;      // RMSProp epsilon (1e-6)
-    
-    // Mixture Innovation Model (MIM) config
-    int use_mim;            // Enable MIM predict (vs standard Gaussian)
-    float mim_jump_prob;    // Probability of jump component (e.g., 0.05)
-    float mim_jump_scale;   // Scale factor for jump component std (e.g., 5.0)
-    
-    // Particle-local parameters config
-    // Key insight: DGP has θ(z), σ(z) — params depend on latent z
-    // We use h deviation from mean as proxy: high h → likely high z
-    int use_local_params;   // Enable particle-local ρ and σ
-    float delta_rho;        // Rho sensitivity to h deviation (e.g., 0.02)
-    float delta_sigma;      // Sigma sensitivity to |h deviation| (e.g., 0.1)
-    
-    // Asymmetric persistence config
-    int use_asymmetric_rho; // Enable asymmetric rho (vol spikes fast, decays slow)
-    float rho_up;           // Persistence when vol increasing (e.g., 0.98)
-    float rho_down;         // Persistence when vol decreasing (e.g., 0.93)
-    
-    // Newton-Stein config (Hessian preconditioning)
-    // Moves particles along H^{-1} * grad instead of grad
-    // Benefits: adaptive step size based on local curvature
-    int use_newton;         // Enable Newton-Stein (0=standard SVGD, 1=Newton)
-    
-    // Full Newton-Stein (Detommaso et al. 2018)
-    // When enabled, uses kernel-weighted Hessian averaging:
-    //   Ĥᵢ = Σⱼ [Nπ(xⱼ)·K(xⱼ,xᵢ) + Nk(xⱼ,xᵢ)]
-    // Instead of just local Hessian Nπ(xᵢ).
-    // Cost: ~1.2x per Stein step (fused into O(N²) loop)
-    // Benefit: Better preconditioning when particles span different curvature regions
-    int use_full_newton;    // 0 = local Hessian (fast), 1 = kernel-weighted (accurate)
-    
-    // Guided Prediction config (Lookahead / APF-style)
-    // Standard predict is REACTIVE: scatters blindly, then corrects.
-    // Guided predict is PROACTIVE: peeks at y_t to know where to go.
-    // Proposal: h ~ N((1-α)μ_prior + α·μ_implied, σ²)
-    // where μ_implied = log(y_t²) + student_t_implied_offset
-    //
-    // INNOVATION GATING: Only activate when model is SURPRISED
-    // - Model fits well: innovation low → α ≈ 0 → trust prior
-    // - Model lags: innovation high → α > 0 → use guidance
-    int use_guided;              // Enable guided predict (0=standard, 1=lookahead)
-    float guided_alpha_base;     // Alpha when model fits (e.g., 0.0 - trust prior)
-    float guided_alpha_shock;    // Alpha when model fails (e.g., 0.5 - trust observation)
-    float guided_innovation_threshold; // z-score threshold for "surprise" (e.g., 1.5)
-    
-    // =========================================================================
-    // PARTIAL REJUVENATION (Maken et al. 2022)
-    // =========================================================================
-    // When KSD stays high after Stein (particles stuck), nudge a fraction
-    // toward the EKF guide prediction to help escape local modes.
-    int use_rejuvenation;           // Enable partial rejuvenation (default: 1)
-    float rejuv_ksd_threshold;      // KSD threshold to trigger (e.g., 0.3)
-    float rejuv_prob;               // Fraction of particles to nudge (e.g., 0.3)
-    float rejuv_blend;              // How much to blend toward guide (e.g., 0.3)
-    
-    // Guide density (EKF) config
-    int use_guide;          // Enable EKF guide density
-    int use_guide_preserving; // Use variance-preserving guide (vs contraction)
-    float guide_strength;   // Base guide strength (0.05 default)
-    float guide_mean;       // EKF posterior mean (m_t)
-    float guide_var;        // EKF posterior variance (P_t)
-    float guide_K;          // Kalman gain (for debugging)
-    int guide_initialized;  // Whether guide has been initialized
-    
-    // =========================================================================
-    // ADAPTIVE GUIDE STRENGTH: Innovation-gated nudging
-    // =========================================================================
-    // When innovation is high (model surprised), boost guide strength to
-    // "teleport" particles toward EKF estimate. When innovation is low,
-    // use base strength to avoid over-correction.
-    int use_adaptive_guide;         // Enable adaptive guide strength (default: 0)
-    float guide_strength_base;      // Base strength when model fits (e.g., 0.05)
-    float guide_strength_max;       // Max strength during surprises (e.g., 0.30)
-    float guide_innovation_threshold; // Z-score threshold for boost (e.g., 1.0)
-    float vol_prev;                 // Previous vol estimate (for innovation calc)
-    
-    // =========================================================================
-    // ADAPTIVE MU: 1D Kalman Filter on mean level
-    // =========================================================================
-    // Uses particle confidence (inverse bandwidth) to gate learning rate.
-    // - Calm market (low bandwidth): adapt mu quickly to track drift
-    // - Crisis (high bandwidth): freeze mu to ignore transient spikes
-    int use_adaptive_mu;        // Enable adaptive mu learning (default: 0)
-    float mu_state;             // Current mu estimate (Kalman state)
-    float mu_var;               // Current mu variance (Kalman P)
-    float mu_process_var;       // Process noise Q (how fast mu can drift)
-    float mu_obs_var_scale;     // Scale factor for measurement noise R = scale * bandwidth²
-    float mu_min;               // Lower bound for mu (e.g., -6.0)
-    float mu_max;               // Upper bound for mu (e.g., -1.0)
-    
-    // =========================================================================
-    // ADAPTIVE SIGMA_Z: Innovation-gated vol-of-vol ("Breathing Filter")
-    // =========================================================================
-    // When innovation is high, particles need to spread faster to catch up.
-    // Boost sigma_z proportional to innovation magnitude.
-    int use_adaptive_sigma;         // Enable adaptive sigma_z (default: 0)
-    float sigma_boost_threshold;    // Z-score threshold to start boosting (e.g., 1.0)
-    float sigma_boost_max;          // Maximum boost multiplier (e.g., 3.0 = 3x base)
-    float sigma_z_effective;        // Current effective sigma_z (for graph capture)
-    
-    // =========================================================================
-    // STEIN OPERATOR SIGN MODE
-    // =========================================================================
-    // Controls whether the kernel gradient term adds (repulsion, per paper)
-    // or subtracts (attraction, legacy empirical tuning).
-    //
-    // 0 = SVPF_STEIN_SIGN_LEGACY: gk_sum -= 2*diff*inv_bw_sq*K_sq (attraction)
-    // 1 = SVPF_STEIN_SIGN_PAPER:  gk_sum += 2*diff*inv_bw_sq*K_sq (repulsion)
-    //
-    // Legacy mode works with current MIM/SVLD/guide tuning.
-    // Paper mode is mathematically correct but may need parameter retuning.
-    int stein_repulsive_sign;
-    
-    // =========================================================================
-    // FAN MODE (Fan et al. 2021 - Weightless SVGD)
-    // =========================================================================
-    // Pure Stein-based particle filter without importance weights.
-    // Key changes when enabled:
-    //   1. Uniform weights: log_w = 0 for all particles (no weighting)
-    //   2. No annealing: beta = 1.0 always (full likelihood from start)
-    //   3. No resampling: Stein repulsion maintains diversity
-    //   4. Paper sign: uses correct repulsive sign (+) automatically
-    //
-    // Theoretical benefit: avoids weight degeneracy that causes variance collapse.
-    // Trade-off: relies entirely on Stein operator for posterior approximation.
-    int use_fan_mode;  // 0 = hybrid (default), 1 = weightless SVGD
-    
-    // Optimized backend (embedded for thread safety)
+    // --- Particle arrays [N] ---
+    float* h;                  // Current log-volatility particles
+    float* h_prev;             // Previous step (for AR(1) prior)
+    float* h_pred;             // Predicted particles (before Stein)
+    float* grad_log_p;         // Gradient of log posterior
+    float* kernel_sum;         // Sum of kernel weights (attraction)
+    float* grad_kernel_sum;    // Sum of kernel gradients (repulsion)
+    float* log_weights;        // Log importance weights
+    float* d_h_centered;       // Centered particles for variance
+    float* d_grad_v;           // RMSProp second moment [N]
+
+    // --- Regime detection for bandwidth scaling ---
+    float* d_return_ema;       // Scalar: EMA of |returns|
+    float* d_return_var;       // Scalar: EMA of return variance
+    float* d_bw_alpha;         // Scalar: adaptive bandwidth alpha
+
+    // --- RNG ---
+    curandStatePhilox4_32_10_t* rng_states;  // [N] Philox RNG states
+
+    // --- Reduction workspace ---
+    float* d_reduce_buf;       // Reduction scratch [N]
+    float* d_temp;             // Temp scratch [N]
+    void* d_cub_temp;          // CUB temp storage
+    size_t cub_temp_bytes;     // CUB temp size
+
+    // --- Device scalars ---
+    float* d_scalar_max;       // Reduction: max
+    float* d_scalar_sum;       // Reduction: sum
+    float* d_scalar_mean;      // Reduction: mean
+    float* d_scalar_bandwidth; // Current bandwidth
+    float* d_y_prev;           // Previous observation on device
+    float* d_result_loglik;    // Output: log-likelihood
+    float* d_result_vol_mean;  // Output: volatility mean
+    float* d_result_h_mean;    // Output: h mean
+
+    // --- Core configuration ---
+    int n_particles;           // Number of particles
+    int n_stein_steps;         // Stein iterations per timestep
+    float nu;                  // Student-t degrees of freedom
+    float student_t_const;     // Precomputed: lgamma((nu+1)/2) - lgamma(nu/2) - 0.5*log(pi*nu)
+    float student_t_implied_offset;  // Precomputed: -E[log(t²_ν)] for implied h
+    int timestep;              // Current timestep
+    float y_prev;              // Previous observation (host-side)
+    cudaStream_t stream;       // CUDA stream for this filter
+
+    // --- Likelihood gradient config ---
+    int use_exact_gradient;    // 0=surrogate (log-squared), 1=exact Student-t
+    float lik_offset;          // Bias correction (0.345 for exact, 0.70 for surrogate)
+
+    // --- Stein transport config ---
+    int use_svld;              // Enable SVLD (Langevin noise)
+    int use_annealing;         // Enable annealed Stein
+    int use_adaptive_beta;     // KSD-adaptive beta (Maken 2022)
+    int n_anneal_steps;        // Number of annealing stages
+    float temperature;         // Langevin temperature (0=SVGD, >0=SVLD)
+    float rmsprop_rho;         // RMSProp decay (0.7)
+    float rmsprop_eps;         // RMSProp epsilon (1e-6)
+
+    // --- MIM predict ---
+    int use_mim;               // Enable mixture innovation model
+    float mim_jump_prob;       // Jump component probability
+    float mim_jump_scale;      // Jump component scale factor
+
+    // --- Particle-local parameters ---
+    int use_local_params;      // Enable particle-local rho and sigma
+    float delta_rho;           // Rho sensitivity to h deviation
+    float delta_sigma;         // Sigma sensitivity to |h deviation|
+
+    // --- Asymmetric persistence ---
+    int use_asymmetric_rho;    // Enable asymmetric rho
+    float rho_up;              // Persistence when vol increasing
+    float rho_down;            // Persistence when vol decreasing
+
+    // --- Newton-Stein (Hessian preconditioning) ---
+    int use_newton;            // Enable Newton-Stein
+    int use_full_newton;       // Detommaso 2018 kernel-weighted Hessian
+
+    // --- Guided prediction (innovation-gated lookahead) ---
+    int use_guided;            // Enable guided predict
+    float guided_alpha_base;   // Alpha when model fits (0 = trust prior)
+    float guided_alpha_shock;  // Alpha when model fails (0.4 = trust observation)
+    float guided_innovation_threshold;  // Z-score threshold for "surprise"
+
+    // --- Partial rejuvenation (Maken 2022) ---
+    int use_rejuvenation;      // Nudge stuck particles toward guide
+    float rejuv_ksd_threshold; // KSD threshold to trigger
+    float rejuv_prob;          // Fraction of particles to nudge
+    float rejuv_blend;         // Blend factor toward guide
+
+    // --- EKF guide density ---
+    int use_guide;             // Enable EKF guide
+    int use_guide_preserving;  // Variance-preserving shift (vs contraction)
+    float guide_strength;      // Base guide strength
+    float guide_mean;          // EKF posterior mean (m_t)
+    float guide_var;           // EKF posterior variance (P_t)
+    float guide_K;             // Kalman gain
+    int guide_initialized;     // Whether guide has been initialized
+
+    // --- Adaptive guide strength (innovation-gated) ---
+    int use_adaptive_guide;    // Enable adaptive guide strength
+    float guide_strength_base; // Base strength when model fits
+    float guide_strength_max;  // Max strength during surprises
+    float guide_innovation_threshold;  // Z-score threshold for boost
+    float vol_prev;            // Previous vol estimate
+
+    // --- Adaptive mu (1D Kalman filter on mean level) ---
+    int use_adaptive_mu;       // Enable adaptive mu learning
+    float mu_state;            // Current mu estimate (Kalman state)
+    float mu_var;              // Current mu variance (Kalman P)
+    float mu_process_var;      // Process noise Q (mu drift rate)
+    float mu_obs_var_scale;    // Measurement noise R = scale * bw²
+    float mu_min;              // Lower bound for mu
+    float mu_max;              // Upper bound for mu
+
+    // --- Adaptive sigma_z (innovation-gated vol-of-vol boost) ---
+    int use_adaptive_sigma;    // Enable adaptive sigma_z
+    float sigma_boost_threshold;  // Z-score threshold to start boosting
+    float sigma_boost_max;     // Maximum boost multiplier
+    float sigma_z_effective;   // Current effective sigma_z
+
+    // --- Stein operator sign mode ---
+    int stein_repulsive_sign;  // 0=legacy(attract), 1=paper(repel)
+
+    // --- Fan mode (weightless SVGD, Fan et al. 2021) ---
+    int use_fan_mode;          // 0=hybrid, 1=uniform weights + no annealing
+
+    // --- Student-t state dynamics ---
+    int use_student_t_state;   // 0=Gaussian AR(1), 1=Student-t AR(1)
+    float nu_state;            // State DoF (5-7 recommended, clamped >= 2.5)
+
+    // --- KSD-based adaptive Stein steps ---
+    int stein_min_steps;       // Minimum Stein iterations
+    int stein_max_steps;       // Maximum Stein iterations
+    float ksd_improvement_threshold;  // Stop if relative improvement < this
+    float ksd_prev;            // KSD from previous timestep
+    int stein_steps_used;      // Diagnostic: actual steps used
+
+    // --- Antithetic sampling ---
+    int use_antithetic;        // Pair particles with (+z, -z) noise
+
+    // --- Adaptive annealing (KL-constrained beta stepping) ---
+    int use_adaptive_anneal;   // 0=fixed stages, 1=KL-adaptive
+    float anneal_kl_threshold; // KL constraint per stage
+    int anneal_steps_per_beta; // Stein steps per beta update
+    int anneal_max_stages;     // Safety cap
+    int anneal_stages_used;    // Diagnostic: stages used this step
+    float anneal_final_var_ll; // Diagnostic: final variance of log-lik
+    float anneal_final_h_std;  // Diagnostic: final particle spread
+
+    // --- Backward smoothing (lightweight RTS) ---
+    int use_smoothing;         // 0=off, 1=on
+    int smooth_lag;            // Window size (1-5 recommended)
+    int smooth_output_lag;     // Output delay: 0=raw, 1=h[t-1], etc.
+    int smooth_head;           // Circular buffer write index
+    float smooth_h_mean[SVPF_SMOOTH_MAX_LAG];  // Stored h estimates
+    float smooth_h_var[SVPF_SMOOTH_MAX_LAG];   // Stored uncertainties
+    float smooth_y[SVPF_SMOOTH_MAX_LAG];       // Stored observations
+
+    // --- Persistent kernel mode ---
+    int use_persistent_kernel;        // 0=standard, 1=persistent CTA
+    int persistent_kernel_supported;  // Set at creation based on GPU
+
+    // --- Heun's method (reserved, currently disabled) ---
+    int use_heun;              // 0=Euler, 1=Heun (2nd order, 2x grad evals)
+
+    // --- Optimized backend (embedded for thread safety) ---
     SVPFOptimizedState opt_backend;
-
-    // === KSD-based Adaptive Stein Steps ===
-    int stein_min_steps;             // Minimum Stein iterations (default: 4)
-    int stein_max_steps;             // Maximum Stein iterations (default: 12)
-    float ksd_improvement_threshold; // Stop if relative improvement < this
-                                     // (default: 0.05)
-    float ksd_prev;                  // KSD from previous iteration (internal)
-    int stein_steps_used; // Diagnostic: how many steps were actually used
-
-    int use_student_t_state; // 0 = Gaussian, 1 = Student-t
-    float nu_state;          // Degrees of freedom (recommended: 5-7)
-
-    int use_smoothing;     // 0 = off, 1 = on
-    int smooth_lag;        // Window size (1-5 recommended)
-    int smooth_output_lag; // Output delay: 0=raw, 1=h[t-1], etc.
-    int smooth_head;       // Circular buffer index
-    float smooth_h_mean[SVPF_SMOOTH_MAX_LAG]; // Stored h estimates
-    float smooth_h_var[SVPF_SMOOTH_MAX_LAG];  // Stored uncertainties
-    float smooth_y[SVPF_SMOOTH_MAX_LAG];      // Stored observations
-
-    // === Persistent Kernel Mode ===
-    int use_persistent_kernel;       // 0 = standard, 1 = persistent
-    int persistent_kernel_supported; // Set at creation
-
-    int use_heun;  // 0 = Euler (default), 1 = Heun's method
-
-    int use_antithetic;
-
-    // === Adaptive Annealing (KL-based beta stepping) ===
-    int use_adaptive_anneal;      // 0 = fixed stages, 1 = KL-adaptive (default: 1)
-    float anneal_kl_threshold;    // KL constraint (default: 0.5, lower = more conservative)
-    int anneal_steps_per_beta;    // Stein steps per beta update (default: 2)
-    int anneal_max_stages;        // Safety cap (default: 50)
-    
-    // Adaptive anneal diagnostics (updated each timestep)
-    int anneal_stages_used;       // How many beta updates occurred
-    float anneal_final_var_ll;    // Final variance of log-likelihood
-    float anneal_final_h_std;     // Final particle spread
-
 
 } SVPFState;
 
@@ -548,756 +363,265 @@ typedef struct {
  * @brief Result of one SVPF filtering step
  */
 typedef struct {
-    float log_lik_increment;  // log p(y_t | y_{1:t-1}, theta)
-    float vol_mean;           // E[exp(h/2)]
-    float vol_std;            // Std[exp(h/2)]
-    float h_mean;             // E[h]
-    float mu_estimate;        // Current adaptive mu (if enabled)
+    float log_lik_increment;   // log p(y_t | y_{1:t-1}, theta)
+    float vol_mean;            // E[exp(h/2)]
+    float vol_std;             // Std[exp(h/2)]
+    float h_mean;              // E[h]
+    float mu_estimate;         // Current adaptive mu (if enabled)
 } SVPFResult;
 
 // =============================================================================
-// API: Core Filter Functions (svpf_kernels.cu)
+// API: Core Filter Functions
 // =============================================================================
 
-/**
- * @brief Create SVPF filter
- * 
- * @param n_particles Number of particles (recommend 256-1024, power of 2)
- * @param n_stein_steps Stein iterations per timestep (recommend 3-10)
- * @param nu Student-t degrees of freedom (recommend 5.0 for fat tails)
- * @param stream CUDA stream (NULL for default stream)
- * @return Initialized state, or NULL on error
- */
+/** Create SVPF filter. n_particles should be power of 2 (256-1024). */
 SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_t stream);
 
-/**
- * @brief Free SVPF filter
- */
+/** Free all GPU and host memory. */
 void svpf_destroy(SVPFState* state);
 
-/**
- * @brief Initialize particles from stationary distribution
- * 
- * @param state SVPF state
- * @param params Model parameters
- * @param seed Random seed for reproducibility
- */
+/** Initialize particles from stationary distribution. */
 void svpf_initialize(SVPFState* state, const SVPFParams* params, unsigned long long seed);
 
-/**
- * @brief Process one observation (main filtering step)
- * 
- * @param state SVPF state
- * @param y_t Observation (return) at time t
- * @param params Model parameters
- * @param result Output: volatility estimate and likelihood
- */
+/** Process one observation (synchronous). */
 void svpf_step(SVPFState* state, float y_t, const SVPFParams* params, SVPFResult* result);
 
-/**
- * @brief Process observation with seeded RNG (for SMC²/CPMMH)
- */
+/** Process one observation with explicit RNG seed (for SMC²/CPMMH). */
 void svpf_step_seeded(SVPFState* state, float y_t, const SVPFParams* params,
                       unsigned long long rng_seed, SVPFResult* result);
 
 // =============================================================================
-// API: Stein Sign Mode Configuration
+// API: Optimized Step (production use)
 // =============================================================================
 
-/**
- * @brief Set Stein operator repulsive sign mode
- * 
- * @param state   Filter state
- * @param mode    SVPF_STEIN_SIGN_LEGACY (0) or SVPF_STEIN_SIGN_PAPER (1)
- * 
- * LEGACY (0): Kernel gradient subtracts (particles attract)
- *   - Empirically tuned with MIM/SVLD/guide providing diversity
- *   - Production-tested, stable configuration
- * 
- * PAPER (1): Kernel gradient adds (particles repel)
- *   - Mathematically correct per Fan et al. 2021
- *   - May allow reducing MIM/SVLD/guide strength
- *   - Requires validation and possible retuning
- * 
- * Call svpf_graph_invalidate() after changing if using CUDA graphs.
- */
-static inline void svpf_set_stein_sign_mode(SVPFState* state, int mode) {
-    state->stein_repulsive_sign = (mode == SVPF_STEIN_SIGN_PAPER) ? 1 : 0;
-}
+/** Optimized single step with pre-allocated buffers (zero malloc in hot loop). */
+void svpf_step_optimized(SVPFState* state, float y_t, float y_prev,
+                         const SVPFParams* params, float* h_loglik_out, float* h_vol_out);
 
 /**
- * @brief Get current Stein operator sign mode
- * @return SVPF_STEIN_SIGN_LEGACY (0) or SVPF_STEIN_SIGN_PAPER (1)
+ * Graph-accelerated step. Captures kernel sequence on first call, replays
+ * with ~5us overhead. Call svpf_graph_invalidate() after changing params.
  */
-static inline int svpf_get_stein_sign_mode(const SVPFState* state) {
-    return state->stein_repulsive_sign;
-}
+void svpf_step_graph(SVPFState* state, float y_t, float y_prev, const SVPFParams* params,
+                     float* h_loglik_out, float* h_vol_out, float* h_mean_out);
+
+/** Alias for svpf_step_graph (adaptive annealing + full Newton). */
+void svpf_step_adaptive(SVPFState* state, float y_t, float y_prev, const SVPFParams* params,
+                        float* h_loglik_out, float* h_vol_out, float* h_mean_out);
+
+/** Check if CUDA graph is currently captured. */
+bool svpf_graph_is_captured(SVPFState* state);
+
+/** Force graph recapture on next step (call after changing any config). */
+void svpf_graph_invalidate(SVPFState* state);
 
 // =============================================================================
-// API: Fan Mode (Weightless SVGD - Fan et al. 2021)
+// API: Async (multi-stream parallel execution)
 // =============================================================================
+//
+// Usage for N filters in parallel:
+//   for (i) svpf_step_async(filters[i], y_t[i], y_prev[i], &params[i]);
+//   for (i) svpf_sync_outputs(filters[i], &loglik[i], &vol[i], &h_mean[i]);
 
-/**
- * @brief Enable/disable Fan mode (weightless SVGD)
- * 
- * Fan mode implements pure Stein variational inference without importance weights:
- *   - All particles have uniform weight (log_w = 0)
- *   - No likelihood annealing (beta = 1.0)
- *   - No resampling (Stein repulsion maintains diversity)
- *   - Automatically uses correct repulsive sign
- * 
- * Benefits: Avoids weight degeneracy that causes variance collapse
- * Trade-offs: Relies entirely on Stein operator for posterior approximation
- * 
- * @param state SVPF state
- * @param enable 1 to enable Fan mode, 0 for hybrid mode (default)
- * 
- * Call svpf_graph_invalidate() after changing if using CUDA graphs.
- */
-static inline void svpf_set_fan_mode(SVPFState* state, int enable) {
-    state->use_fan_mode = enable ? 1 : 0;
-    // Fan mode implies paper sign (repulsive)
-    if (enable) {
-        state->stein_repulsive_sign = SVPF_STEIN_SIGN_PAPER;
-    }
-}
+/** Launch all GPU work non-blocking. Call sync_outputs() to get results. */
+void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams* params);
 
-/**
- * @brief Get current Fan mode status
- * @return 1 if Fan mode enabled, 0 otherwise
- */
-static inline int svpf_get_fan_mode(const SVPFState* state) {
-    return state->use_fan_mode;
-}
+/** Wait for GPU, read outputs, update state. Must follow step_async(). */
+void svpf_sync_outputs(SVPFState* state, float* h_loglik_out, float* h_vol_out, float* h_mean_out);
 
 // =============================================================================
-// API: Batch Processing (svpf_kernels.cu)
+// API: Batch Processing
 // =============================================================================
 
-/**
- * @brief Process entire observation sequence
- * 
- * @param state SVPF state
- * @param h_observations Host array [T] of observations
- * @param T Number of observations
- * @param params Model parameters
- * @param h_loglik_out Host array [T] for log-likelihood outputs
- * @param h_vol_out Host array [T] for volatility outputs (can be NULL)
- */
-void svpf_run_sequence(
-    SVPFState* state,
-    const float* h_observations,
-    int T,
-    const SVPFParams* params,
-    float* h_loglik_out,
-    float* h_vol_out
-);
+/** Process entire observation sequence (host arrays). */
+void svpf_run_sequence(SVPFState* state, const float* h_observations, int T,
+                       const SVPFParams* params, float* h_loglik_out, float* h_vol_out);
 
-/**
- * @brief Process sequence with data already on GPU
- */
-void svpf_run_sequence_device(
-    SVPFState* state,
-    const float* d_observations,
-    int T,
-    const SVPFParams* params,
-    float* d_loglik_out,
-    float* d_vol_out
-);
-
-// =============================================================================
-// API: Optimized (svpf_optimized.cu) - PRODUCTION USE
-// =============================================================================
-
-/**
- * @brief OPTIMIZED: Single step (for real-time/HFT usage)
- * 
- * Uses pre-allocated buffers (zero malloc in hot loop).
- * 
- * @param state SVPF state
- * @param y_t Current observation
- * @param y_prev Previous observation (for leverage)
- * @param params Model parameters
- * @param h_loglik_out Host pointer for log-likelihood output (can be NULL)
- * @param h_vol_out Host pointer for volatility output (can be NULL)
- */
-void svpf_step_optimized(
-    SVPFState* state,
-    float y_t,
-    float y_prev,
-    const SVPFParams* params,
-    float* h_loglik_out,
-    float* h_vol_out
-);
-
-/**
- * @brief ADAPTIVE SVPF: Single step with all improvements
- * 
- * Implements Preconditioned Stein Variational Langevin Descent with
- * CORRECT mixture prior (O(N²)) per Fan et al. 2021:
- * 
- *   1. Mixture Prior Gradient (O(N²)) - each particle feels pull from all prior means
- *   2. Log-Squared Likelihood Gradient - robust linear transport (no volcano collapse)
- *   3. Mixture Innovation Model (MIM) - fat-tailed predict for scout particles
- *   4. Asymmetric ρ - vol spikes fast (ρ_up), decays slow (ρ_down)
- *   5. Adaptive bandwidth α scaling (tighter kernel during high vol)
- *   6. Annealed Stein updates (β schedule: 0.3 → 0.65 → 1.0)
- *   7. Fused RMSProp + Langevin diffusion (SVLD for diversity)
- * 
- * Configure via SVPFState fields:
- *   - use_mim: Enable Mixture Innovation (default: 1)
- *   - mim_jump_prob: Probability of jump component (default: 0.05)
- *   - mim_jump_scale: Scale factor for jump std (default: 5.0)
- *   - use_asymmetric_rho: Enable asymmetric persistence (default: 1)
- *   - rho_up: Persistence when vol increasing (default: 0.98)
- *   - rho_down: Persistence when vol decreasing (default: 0.93)
- *   - use_svld: Enable SVLD noise (default: 1)
- *   - use_annealing: Enable/disable annealing (default: 1)
- *   - temperature: 0=SVGD, 1=SVLD, >1=extra exploration
- * 
- * @param state SVPF state
- * @param y_t Current observation
- * @param y_prev Previous observation
- * @param params Model parameters
- * @param h_loglik_out Host pointer for log-likelihood output (can be NULL)
- * @param h_vol_out Host pointer for volatility output (can be NULL)
- * @param h_mean_out Host pointer for mean log-vol output (can be NULL)
- */
-void svpf_step_adaptive(
-    SVPFState* state,
-    float y_t,
-    float y_prev,
-    const SVPFParams* params,
-    float* h_loglik_out,
-    float* h_vol_out,
-    float* h_mean_out
-);
-
-/**
- * @brief Internal: Initialize optimized backend (called by svpf_create)
- */
-void svpf_optimized_init(SVPFState* state);
-
-/**
- * @brief Internal: Cleanup optimized backend (called by svpf_destroy)
- */
-void svpf_optimized_cleanup_state(SVPFState* state);
+/** Process sequence with data already on GPU. */
+void svpf_run_sequence_device(SVPFState* state, const float* d_observations, int T,
+                              const SVPFParams* params, float* d_loglik_out, float* d_vol_out);
 
 // =============================================================================
 // API: Diagnostics
 // =============================================================================
 
-/**
- * @brief Copy particles to host (for diagnostics/plotting)
- */
+/** Copy particles to host (for plotting/debugging). */
 void svpf_get_particles(const SVPFState* state, float* h_out);
 
-/**
- * @brief Get current particle statistics
- */
+/** Get particle mean and std on host. */
 void svpf_get_stats(const SVPFState* state, float* h_mean, float* h_std);
 
-/**
- * @brief Get effective sample size (ESS) of current particle weights
- * 
- * ESS = 1 / Σ w_i² where w_i are normalized weights.
- * ESS close to N means particles are well-distributed.
- * ESS close to 1 means particle degeneracy (one particle dominates).
- * 
- * Note: SVPF with Stein transport should maintain high ESS without resampling.
- */
+/** Get ESS. Close to N = healthy, close to 1 = degeneracy. */
 float svpf_get_ess(const SVPFState* state);
 
-// =============================================================================
-// CUDA GRAPH API (Low-latency for HFT)
-// =============================================================================
-
-/**
- * @brief Graph-accelerated SVPF step
- * 
- * Captures the kernel sequence on first call, then replays with minimal
- * CPU overhead (~5μs vs ~100μs+ for regular kernel launches).
- * 
- * Automatic recapture on:
- *   - First call
- *   - Particle count change
- *   - Stein step count change
- * 
- * IMPORTANT: Model parameters (rho, sigma_z, mu, gamma) are "burned in" at
- * capture time. If you change SVPFParams, you MUST call svpf_graph_invalidate()
- * before the next step, or the graph will run with stale parameters!
- * 
- * Filter configuration flags (use_guided, use_newton, use_param_learning, etc.)
- * are also burned in. Call svpf_graph_invalidate() after changing any configuration.
- * 
- * @param state     Filter state
- * @param y_t       Current observation (staged to device before graph launch)
- * @param y_prev    Previous observation (staged to device before graph launch)
- * @param params    Model parameters (BURNED IN at capture - invalidate if changed!)
- * @param h_loglik_out  Output: log-likelihood (optional, can be NULL)
- * @param h_vol_out     Output: volatility estimate (optional, can be NULL)
- * @param h_mean_out    Output: h mean (optional, can be NULL)
- */
-void svpf_step_graph(
-    SVPFState* state,
-    float y_t,
-    float y_prev,
-    const SVPFParams* params,
-    float* h_loglik_out,
-    float* h_vol_out,
-    float* h_mean_out
-);
+/** Get KSD and number of Stein steps used last timestep. */
+void svpf_get_ksd_stats(const SVPFState* state, float* ksd_out, int* steps_used_out);
 
 // =============================================================================
-// MULTI-STREAM ASYNC API (for parallel filter execution)
-// =============================================================================
-// 
-// Usage for running N filters in parallel:
-// 
-//   // 1. Launch all filters (non-blocking)
-//   for (int i = 0; i < n_filters; i++) {
-//       svpf_step_async(filters[i], y_t[i], y_prev[i], &params[i]);
-//   }
-//   
-//   // 2. Sync all and read outputs
-//   for (int i = 0; i < n_filters; i++) {
-//       svpf_sync_outputs(filters[i], &loglik[i], &vol[i], &h_mean[i]);
-//   }
-// 
-// Each filter must have its own CUDA stream (pass to svpf_create).
-// GPU work overlaps across filters during step 1.
+// API: Internal (called by create/destroy)
 // =============================================================================
 
-/**
- * @brief Launch GPU work asynchronously (non-blocking)
- * 
- * Queues all kernels and D2H transfer on filter's stream.
- * Returns immediately - call svpf_sync_outputs() to get results.
- */
-void svpf_step_async(
-    SVPFState* state,
-    float y_t,
-    float y_prev,
-    const SVPFParams* params
-);
+void svpf_optimized_init(SVPFState* state);
+void svpf_optimized_cleanup_state(SVPFState* state);
 
-/**
- * @brief Sync stream and read outputs
- * 
- * Waits for GPU work to complete, reads results, updates state.
- * Must be called after svpf_step_async().
- */
-void svpf_sync_outputs(
-    SVPFState* state,
-    float* h_loglik_out,
-    float* h_vol_out,
-    float* h_mean_out
-);
+// =============================================================================
+// API: Configuration Helpers
+// =============================================================================
 
-/**
- * @brief Check if graph is currently captured
- */
-bool svpf_graph_is_captured(SVPFState* state);
+/** Set Stein sign: SVPF_STEIN_SIGN_LEGACY(0) or SVPF_STEIN_SIGN_PAPER(1). */
+static inline void svpf_set_stein_sign_mode(SVPFState* state, int mode) {
+    state->stein_repulsive_sign = (mode == SVPF_STEIN_SIGN_PAPER) ? 1 : 0;
+}
 
-/**
- * @brief Force graph recapture on next step
- * 
- * Call after changing:
- *   - SVPFParams (rho, sigma_z, mu, gamma)
- *   - Filter configuration (use_guided, use_newton, use_mim, etc.)
- *   - Stein sign mode (stein_repulsive_sign)
- *   - Any other filter settings
- * 
- * The next svpf_step_graph() call will recapture with new parameters.
- */
-void svpf_graph_invalidate(SVPFState* state);
+static inline int svpf_get_stein_sign_mode(const SVPFState* state) {
+    return state->stein_repulsive_sign;
+}
+
+/** Enable Fan mode (weightless SVGD). Implies paper sign. */
+static inline void svpf_set_fan_mode(SVPFState* state, int enable) {
+    state->use_fan_mode = enable ? 1 : 0;
+    if (enable) state->stein_repulsive_sign = SVPF_STEIN_SIGN_PAPER;
+}
+
+static inline int svpf_get_fan_mode(const SVPFState* state) {
+    return state->use_fan_mode;
+}
 
 // =============================================================================
 // GRADIENT DIAGNOSTICS & SELF-TUNING (svpf_gradient_diagnostic.cu)
 // =============================================================================
-// 
-// AGC-style parameter adaptation: SVPF particles find h, then θ follows.
-// No oracle, no batch inference, no memory. Just negative feedback.
-//
-// Development phases:
-//   Step 0: Observe gradients (no learning) - verify correctness
-//   Step 1: Learn ν only (safest - observation likelihood only)
-//   Step 2: Add σ learning (transition, with breathing overlay)
-//   Step 3: Add ρ learning (if needed, often stable enough to fix)
-//   Step 4: Full 4-param natural gradient (μ, ρ, σ, ν)
-//
-// Current implementation: Step 0 (diagnostic only)
-// =============================================================================
 
 /**
  * @brief Gradient diagnostic state for parameter learning
- * 
- * Tracks gradients and statistics for self-tuning development.
- * Start with diagnostic-only mode to verify gradient correctness
- * before enabling any parameter updates.
  */
 typedef struct {
-    // Device buffers for gradient computation
-    float* d_nu_grad;           // Weighted mean ν gradient
-    float* d_z_sq_mean;         // Mean standardized residual² (diagnostic)
-    
-    // Future: transition gradients (μ, ρ, σ)
-    float* d_mu_grad;           // μ gradient (transition)
-    float* d_rho_grad;          // ρ gradient (transition, unconstrained η)
-    float* d_sigma_grad;        // σ gradient (transition, unconstrained κ)
-    
-    // Future: Fisher matrix for natural gradient (4x4, row-major)
-    float* d_fisher;            // [16] Fisher matrix elements
-    float* d_fisher_inv;        // [16] Inverse Fisher (for natural gradient)
-    
+    // Device buffers
+    float* d_nu_grad;          // Weighted mean nu gradient
+    float* d_z_sq_mean;        // Mean standardized residual squared
+    float* d_mu_grad;          // mu gradient (transition)
+    float* d_rho_grad;         // rho gradient (unconstrained eta)
+    float* d_sigma_grad;       // sigma gradient (unconstrained kappa)
+    float* d_fisher;           // [16] Fisher matrix (4x4, row-major)
+    float* d_fisher_inv;       // [16] Inverse Fisher
+
     // Host-side EMA smoothing
-    float nu_gradient_ema;      // Smoothed ν gradient
-    float z_sq_ema;             // Smoothed z² (should be ~1 at equilibrium)
-    float mu_gradient_ema;      // Smoothed μ gradient
-    float rho_gradient_ema;     // Smoothed ρ gradient (unconstrained)
-    float sigma_gradient_ema;   // Smoothed σ gradient (unconstrained)
-    
-    // Shock state machine (SHOCK → RECOVERY → CALM)
-    int shock_state;            // 0=CALM, 1=SHOCK, 2=RECOVERY
-    int ticks_in_state;         // Ticks since last state transition
-    float shock_threshold;      // z² threshold to enter SHOCK (e.g., 9.0 = 3σ)
-    int shock_duration;         // Ticks to stay in SHOCK (e.g., 20)
-    int recovery_duration;      // Ticks in RECOVERY before CALM (e.g., 50)
-    float recovery_exit_threshold; // z² threshold to exit RECOVERY (e.g., 4.0)
-    
+    float nu_gradient_ema;     // Smoothed nu gradient
+    float z_sq_ema;            // Smoothed z squared (should be ~1 at equilibrium)
+    float mu_gradient_ema;     // Smoothed mu gradient
+    float rho_gradient_ema;    // Smoothed rho gradient (unconstrained)
+    float sigma_gradient_ema;  // Smoothed sigma gradient (unconstrained)
+
+    // Shock state machine (CALM -> SHOCK -> RECOVERY -> CALM)
+    int shock_state;           // 0=CALM, 1=SHOCK, 2=RECOVERY
+    int ticks_in_state;        // Ticks since last state transition
+    float shock_threshold;     // z squared threshold to enter SHOCK
+    int shock_duration;        // Ticks to stay in SHOCK
+    int recovery_duration;     // Ticks in RECOVERY before CALM
+    float recovery_exit_threshold;  // z squared threshold to exit RECOVERY
+
     // Logging
-    bool enable_logging;
-    FILE* log_file;
-    
-    bool initialized;
+    bool enable_logging;       // Write CSV log file
+    FILE* log_file;            // Log file handle
+
+    bool initialized;          // Whether buffers are allocated
 } SVPFGradientDiagnostics;
 
 /**
- * @brief Unconstrained parameter representation for gradient descent
+ * @brief Unconstrained parameter space for gradient descent
  * 
- * Maps constrained parameters to unconstrained space:
- *   μ = μ directly (unbounded)
- *   ρ = tanh(η)        → η ∈ (-∞, +∞), ρ ∈ (-1, 1)
- *   σ = exp(κ)         → κ ∈ (-∞, +∞), σ ∈ (0, +∞)
- *   ν = 2 + exp(κ_ν)   → κ_ν ∈ (-∞, +∞), ν ∈ (2, +∞)
- * 
- * Gradients are computed in unconstrained space for smooth optimization.
+ * Maps: rho=tanh(eta), sigma=exp(kappa), nu=2+exp(kappa_nu)
  */
 typedef struct {
     float mu;       // Mean level (unbounded)
-    float eta;      // Unconstrained persistence: ρ = tanh(η)
-    float kappa;    // Unconstrained vol-of-vol: σ = exp(κ)
-    float kappa_nu; // Unconstrained tail weight: ν = 2 + exp(κ_ν)
+    float eta;      // Unconstrained persistence: rho = tanh(eta)
+    float kappa;    // Unconstrained vol-of-vol: sigma = exp(kappa)
+    float kappa_nu; // Unconstrained tail weight: nu = 2 + exp(kappa_nu)
 } SVPFThetaUnconstrained;
 
 /**
- * @brief Natural gradient tuner state
- * 
- * Implements Fisher-preconditioned parameter updates:
- *   θ += lr · F⁻¹ · ∇θ
- * 
- * Fisher matrix captures parameter correlations (σ-ν, μ-ρ)
- * allowing a single learning rate for all parameters.
+ * @brief Natural gradient tuner (Fisher-preconditioned updates)
  */
 typedef struct {
-    SVPFThetaUnconstrained theta;
-    
-    // Fisher matrix (4x4, EMA smoothed)
-    float F[4][4];              // Fisher information matrix
-    float F_ema_decay;          // EMA decay for Fisher (e.g., 0.95)
-    float F_reg;                // Regularization for invertibility (e.g., 1e-4)
-    
-    // Learning rate
-    float base_lr;              // Base learning rate (e.g., 0.01)
-    float lr_shock_mult;        // LR multiplier in RECOVERY (e.g., 2.0)
-    
-    // Gradient clipping
-    float grad_clip;            // Max |gradient| per parameter (e.g., 1.0)
-    
-    // Regularization toward prior (soft oracle)
-    float prior_weight;         // Pull toward offline-calibrated baseline
+    SVPFThetaUnconstrained theta;  // Current unconstrained params
+
+    float F[4][4];             // Fisher information matrix (EMA smoothed)
+    float F_ema_decay;         // EMA decay for Fisher
+    float F_reg;               // Regularization for invertibility
+
+    float base_lr;             // Base learning rate
+    float lr_shock_mult;       // LR multiplier in RECOVERY
+    float grad_clip;           // Max |gradient| per parameter
+
+    float prior_weight;        // Pull toward offline baseline
     SVPFThetaUnconstrained theta_prior;  // Offline baseline
-    
-    // State
-    int warmup_ticks;           // Ticks before learning starts
-    bool learning_enabled;      // Master switch
-    
+
+    int warmup_ticks;          // Ticks before learning starts
+    bool learning_enabled;     // Master switch
 } SVPFNaturalGradientTuner;
 
-// -----------------------------------------------------------------------------
-// Gradient Diagnostic API
-// -----------------------------------------------------------------------------
+// --- Gradient Diagnostic API ---
 
-/**
- * @brief Create gradient diagnostic state
- * 
- * @param enable_logging  Write CSV log file
- * @param log_path        Path to log file (NULL for no logging)
- * @return Diagnostic state, or NULL on error
- */
 SVPFGradientDiagnostics* svpf_gradient_diagnostic_create(bool enable_logging, const char* log_path);
-
-/**
- * @brief Destroy gradient diagnostic state
- */
 void svpf_gradient_diagnostic_destroy(SVPFGradientDiagnostics* diag);
 
-/**
- * @brief Compute ν gradient (observation likelihood only)
- * 
- * Call AFTER svpf_step_graph() to compute the gradient of log p(y|h,ν)
- * with respect to ν, averaged over particles weighted by posterior.
- * 
- * Expected behavior:
- *   - ν too high → gradient NEGATIVE (wants heavier tails)
- *   - ν too low → gradient POSITIVE (wants lighter tails)
- *   - ν correct → gradient ≈ 0
- * 
- * @param state         SVPF state (after step)
- * @param diag          Diagnostic state
- * @param y_t           Current observation
- * @param timestep      Current timestep (for logging)
- * @param nu_grad_out   Optional: raw ν gradient
- * @param z_sq_mean_out Optional: mean standardized residual²
- */
-void svpf_compute_nu_diagnostic(
-    SVPFState* state,
-    SVPFGradientDiagnostics* diag,
-    float y_t,
-    int timestep,
-    float* nu_grad_out,
-    float* z_sq_mean_out
-);
+/** Compute nu gradient from observation likelihood. Call AFTER svpf_step_graph(). */
+void svpf_compute_nu_diagnostic(SVPFState* state, SVPFGradientDiagnostics* diag,
+                                float y_t, int timestep,
+                                float* nu_grad_out, float* z_sq_mean_out);
 
-/**
- * @brief Simplified ν gradient (no diagnostic state needed)
- * 
- * Allocates temporary buffers, computes gradient, frees buffers.
- * Less efficient but convenient for quick tests.
- */
-void svpf_compute_nu_diagnostic_simple(
-    SVPFState* state,
-    float y_t,
-    float* nu_grad_out,
-    float* z_sq_mean_out
-);
+/** Simplified nu gradient (allocates temp buffers internally). */
+void svpf_compute_nu_diagnostic_simple(SVPFState* state, float y_t,
+                                       float* nu_grad_out, float* z_sq_mean_out);
 
-/**
- * @brief Compute σ gradient for diagnostic purposes
- * 
- * From transition likelihood: log p(h_t|h_{t-1}) = -½log(2πσ²) - ε²/(2σ²)
- * Gradient: ∂/∂σ = (ε²/σ² - 1) / σ
- * 
- * IMPORTANT: Uses h_pred (before Stein transport), not h (after Stein).
- * Stein transport is deterministic and >> σ, so post-Stein h gives garbage.
- * 
- * Expected behavior:
- *   - σ too HIGH → ε²/σ² < 1 → gradient NEGATIVE (decrease σ)
- *   - σ too LOW  → ε²/σ² > 1 → gradient POSITIVE (increase σ)
- *   - σ correct  → ε²/σ² ≈ 1 → gradient ≈ 0
- * 
- * Key advantage over ν: Signal available EVERY timestep, not just crashes.
- * 
- * @param state           SVPF state (uses h_pred, h_prev, log_weights)
- * @param params          SV parameters (μ, ρ, σ)
- * @param sigma_grad_out  Output: σ gradient (positive → increase σ)
- * @param eps_sq_norm_out Output: mean ε²/σ² (should be ~1.0 if σ correct)
- */
-void svpf_compute_sigma_diagnostic_simple(
-    SVPFState* state,
-    const SVPFParams* params,
-    float* sigma_grad_out,
-    float* eps_sq_norm_out
-);
+/** Compute sigma gradient from transition likelihood. Uses h_pred (before Stein). */
+void svpf_compute_sigma_diagnostic_simple(SVPFState* state, const SVPFParams* params,
+                                          float* sigma_grad_out, float* eps_sq_norm_out);
 
-/**
- * @brief Snapshot current particles to a buffer
- * 
- * Use when you need h_{t-1} explicitly (state->h_prev should already have it).
- */
-void svpf_snapshot_particles(
-    SVPFState* state,
-    float* d_h_buffer
-);
+/** Snapshot current particles to a device buffer. */
+void svpf_snapshot_particles(SVPFState* state, float* d_h_buffer);
 
-/**
- * @brief Compute all 4 parameter gradients (μ, ρ, σ, ν)
- * 
- * Requires h_prev snapshot from BEFORE svpf_step_graph().
- * 
- * For transition gradients (μ, ρ, σ):
- *   ε = h_t - μ - ρ·(h_{t-1} - μ)
- *   ∂/∂μ = ε·(1-ρ) / σ²
- *   ∂/∂ρ = ε·(h_{t-1} - μ) / σ²
- *   ∂/∂σ = -1/σ + ε²/σ³
- * 
- * For observation gradient (ν):
- *   ∂/∂ν = ½[ψ((ν+1)/2) - ψ(ν/2) - 1/ν - log(1+z²/ν) + (ν+1)z²/(ν²(1+z²/ν))]
- * 
- * Gradients are in UNCONSTRAINED space (η, κ, κ_ν).
- * 
- * @param state         SVPF state (after step)
- * @param diag          Diagnostic state
- * @param h_prev_snap   Snapshot of h_prev from before step [n_particles]
- * @param y_t           Current observation
- * @param params        Model parameters (for ρ, σ, μ values)
- * @param timestep      Current timestep (for logging)
- */
-void svpf_compute_all_gradients(
-    SVPFState* state,
-    SVPFGradientDiagnostics* diag,
-    const float* h_prev_snap,
-    float y_t,
-    const SVPFParams* params,
-    int timestep
-);
+/** Compute all 4 parameter gradients (mu, rho, sigma, nu) in unconstrained space. */
+void svpf_compute_all_gradients(SVPFState* state, SVPFGradientDiagnostics* diag,
+                                const float* h_prev_snap, float y_t,
+                                const SVPFParams* params, int timestep);
 
-// -----------------------------------------------------------------------------
-// Shock State Machine API
-// -----------------------------------------------------------------------------
+// --- Shock State Machine API ---
 
-/**
- * @brief Update shock state machine
- * 
- * Transitions: CALM → SHOCK (on surprise) → RECOVERY → CALM
- * During SHOCK: freeze all learning (gradients are garbage)
- * During RECOVERY: boost learning rate to catch up
- * 
- * @param diag      Diagnostic state
- * @param z_sq      Current standardized residual² (from diagnostic)
- */
 void svpf_update_shock_state(SVPFGradientDiagnostics* diag, float z_sq);
-
-/**
- * @brief Get current shock state
- * @return 0=CALM, 1=SHOCK, 2=RECOVERY
- */
 int svpf_get_shock_state(const SVPFGradientDiagnostics* diag);
-
-/**
- * @brief Check if learning should be active
- * @return true if CALM or RECOVERY, false if SHOCK
- */
 bool svpf_should_learn(const SVPFGradientDiagnostics* diag);
-
-/**
- * @brief Get learning rate multiplier based on shock state
- * @return 0.0 (SHOCK), lr_shock_mult (RECOVERY), 1.0 (CALM)
- */
 float svpf_get_lr_multiplier(const SVPFGradientDiagnostics* diag, float lr_shock_mult);
 
-// -----------------------------------------------------------------------------
-// Natural Gradient Tuner API (Future - Step 4)
-// -----------------------------------------------------------------------------
+// --- Natural Gradient Tuner API ---
 
-/**
- * @brief Create natural gradient tuner
- * 
- * @param params        Initial parameters (from offline calibration)
- * @param base_lr       Base learning rate (e.g., 0.01)
- * @param prior_weight  Regularization toward initial params (e.g., 0.001)
- * @return Tuner state, or NULL on error
- */
-SVPFNaturalGradientTuner* svpf_tuner_create(
-    const SVPFParams* params,
-    float nu,
-    float base_lr,
-    float prior_weight
-);
-
-/**
- * @brief Destroy natural gradient tuner
- */
+SVPFNaturalGradientTuner* svpf_tuner_create(const SVPFParams* params, float nu,
+                                             float base_lr, float prior_weight);
 void svpf_tuner_destroy(SVPFNaturalGradientTuner* tuner);
+void svpf_tuner_update(SVPFNaturalGradientTuner* tuner, const SVPFGradientDiagnostics* diag,
+                       SVPFParams* params_out, float* nu_out);
+void svpf_tuner_get_params(const SVPFNaturalGradientTuner* tuner,
+                           SVPFParams* params_out, float* nu_out);
 
-/**
- * @brief Update parameters with natural gradient
- * 
- * Computes: θ += lr · F⁻¹ · ∇θ
- * 
- * Call after svpf_compute_all_gradients() to update parameters.
- * Respects shock state (no update during SHOCK).
- * 
- * @param tuner         Tuner state
- * @param diag          Diagnostic state (for gradients and shock state)
- * @param params_out    Updated SVPFParams (constrained space)
- * @param nu_out        Updated ν value
- */
-void svpf_tuner_update(
-    SVPFNaturalGradientTuner* tuner,
-    const SVPFGradientDiagnostics* diag,
-    SVPFParams* params_out,
-    float* nu_out
-);
+// --- Synthetic Test ---
 
-/**
- * @brief Get current parameters in constrained space
- */
-void svpf_tuner_get_params(
-    const SVPFNaturalGradientTuner* tuner,
-    SVPFParams* params_out,
-    float* nu_out
-);
-
-// -----------------------------------------------------------------------------
-// Synthetic Verification
-// -----------------------------------------------------------------------------
-
-/**
- * @brief Run synthetic gradient verification test
- * 
- * Generates data from known model, then verifies:
- *   - ν too high → gradient negative
- *   - ν too low → gradient positive
- *   - ν correct → gradient ≈ 0
- * 
- * @param n_particles   Particles to use
- * @param n_stein_steps Stein steps per observation
- */
 void svpf_test_nu_gradient_synthetic(int n_particles, int n_stein_steps);
 
-// -----------------------------------------------------------------------------
-// Utility: Convert Between Constrained/Unconstrained
-// -----------------------------------------------------------------------------
+// --- Constrained/Unconstrained Conversions ---
 
-static inline float svpf_constrain_rho(float eta) {
-    return tanhf(eta);
-}
-
+static inline float svpf_constrain_rho(float eta) { return tanhf(eta); }
 static inline float svpf_unconstrain_rho(float rho) {
-    // atanh(rho) = 0.5 * log((1+rho)/(1-rho))
-    rho = fminf(fmaxf(rho, -0.999f), 0.999f);  // Clamp to avoid inf
+    rho = fminf(fmaxf(rho, -0.999f), 0.999f);
     return 0.5f * logf((1.0f + rho) / (1.0f - rho));
 }
+static inline float svpf_constrain_sigma(float kappa) { return expf(kappa); }
+static inline float svpf_unconstrain_sigma(float sigma) { return logf(fmaxf(sigma, 1e-8f)); }
+static inline float svpf_constrain_nu(float kappa_nu) { return 2.0f + expf(kappa_nu); }
+static inline float svpf_unconstrain_nu(float nu) { return logf(fmaxf(nu - 2.0f, 1e-8f)); }
 
-static inline float svpf_constrain_sigma(float kappa) {
-    return expf(kappa);
-}
-
-static inline float svpf_unconstrain_sigma(float sigma) {
-    return logf(fmaxf(sigma, 1e-8f));
-}
-
-static inline float svpf_constrain_nu(float kappa_nu) {
-    return 2.0f + expf(kappa_nu);
-}
-
-static inline float svpf_unconstrain_nu(float nu) {
-    return logf(fmaxf(nu - 2.0f, 1e-8f));
-}
-
-// Chain rule factors for unconstrained gradients
-static inline float svpf_drho_deta(float rho) {
-    return 1.0f - rho * rho;  // sech²(η) = 1 - tanh²(η)
-}
-
-static inline float svpf_dsigma_dkappa(float sigma) {
-    return sigma;  // d/dκ exp(κ) = exp(κ) = σ
-}
-
-static inline float svpf_dnu_dkappa_nu(float nu) {
-    return nu - 2.0f;  // d/dκ_ν (2 + exp(κ_ν)) = exp(κ_ν) = ν - 2
-}
+// Chain rule factors: d(constrained)/d(unconstrained)
+static inline float svpf_drho_deta(float rho) { return 1.0f - rho * rho; }
+static inline float svpf_dsigma_dkappa(float sigma) { return sigma; }
+static inline float svpf_dnu_dkappa_nu(float nu) { return nu - 2.0f; }
 
 #ifdef __cplusplus
 }
