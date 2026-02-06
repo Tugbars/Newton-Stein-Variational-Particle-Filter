@@ -492,213 +492,160 @@ static Metrics compute_metrics(const TestData* data, const float* est_logvol) {
  * RUN SVPF ON SCENARIO
  *═══════════════════════════════════════════════════════════════════════════*/
 
+
 static Metrics run_svpf_on_scenario(
     TestData* data,
     int n_particles,
     int n_stein,
     float nu,
-    int use_adaptive,
+    int use_optimized,      // 1 = svpf_step_graph (production), 0 = svpf_step (basic)
     int seed,
     double* elapsed_ms_out
 ) {
     int n = data->n_ticks;
-    
+
     /* Allocate outputs */
     float* h_returns = (float*)malloc(n * sizeof(float));
-    float* h_loglik = (float*)malloc(n * sizeof(float));
-    float* h_vol = (float*)malloc(n * sizeof(float));
-    float* h_logvol = (float*)malloc(n * sizeof(float));
-    
+    float* h_loglik  = (float*)malloc(n * sizeof(float));
+    float* h_vol     = (float*)malloc(n * sizeof(float));
+    float* h_logvol  = (float*)malloc(n * sizeof(float));
+
     for (int t = 0; t < n; t++) {
         h_returns[t] = (float)data->returns[t];
     }
-    
-    /* Create filter */
-    SVPFState* filter = svpf_create(n_particles, n_stein, nu, NULL);
 
-    //svpf_set_stein_sign_mode(filter, SVPF_STEIN_SIGN_PAPER);  // or just: filter->stein_repulsive_sign = 1;
-
-    
-    /* 
-     * SVPF parameters - note these are MISSPECIFIED for this DGP!
+    /*
+     * SVPF parameters — note these are MISSPECIFIED for this DGP!
      * SVPF assumes fixed AR(1) parameters, but DGP has z-dependent params.
-     * This is intentional - tests SVPF robustness to misspecification.
+     * This is intentional — tests SVPF robustness to misspecification.
      */
     SVPFParams params;
-    params.rho = 0.97f;     /* Fixed, but DGP has θ(z) ∈ [0.007, 0.127] */
-    params.sigma_z = 0.15f; /* Fixed, but DGP has σ(z) ∈ [0.08, 0.50] */
-    params.mu = -4.5f;      /* Fixed, but DGP has μ(z) ∈ [-4.5, -1.0] */
-    params.gamma = 0.0f;    /* No leverage in this DGP */
+    params.rho     = 0.97f;
+    params.sigma_z = 0.15f;
+    params.mu      = -4.5f;
+    params.gamma   = 0.0f;
 
-    // IMPORTANT: Re-initialize to set up lambda particles
+    /* Create filter — all features always-on in refactored build */
+    SVPFState* filter = svpf_create(n_particles, n_stein, nu, NULL);
     svpf_initialize(filter, &params, seed);
 
-    /* Configure adaptive settings */
-    if (use_adaptive) {
-        filter->use_svld = 1;
-        filter->use_annealing = 1;
-        filter->n_anneal_steps = 5;
-        filter->temperature = 0.45f;
-        filter->rmsprop_rho = 0.7f;
-        filter->rmsprop_eps = 1e-6f;
-        
-        filter->use_mim = 0;
-        filter->mim_jump_prob = 0.25f;
-        filter->mim_jump_scale = 9.0f;
-        filter->use_adaptive_beta = 1;  // ON by default, set 0 for A/B test
+    if (use_optimized) {
+        /* ── Stein transport ── */
+        filter->temperature     = 0.45f;
+        filter->rmsprop_rho     = 0.7f;
+        filter->rmsprop_eps     = 1e-6f;
 
-        filter->use_rejuvenation = 1;        // ON
-        filter->rejuv_ksd_threshold = 0.05f; // Trigger threshold
-        filter->rejuv_prob = 0.30f;          // 30% of particles
-        filter->rejuv_blend = 0.30f;         // 30% blend factor
+        /* ── MIM (disabled via zero probability) ── */
+        filter->mim_jump_prob   = 0.0f;
+        filter->mim_jump_scale  = 9.0f;
 
-        // Newton-Stein (Hessian preconditioning)
-        // Adaptive step size based on local curvature: H^{-1} * grad
-        filter->use_newton = 1;
-        filter->use_full_newton = 1;  // Enable Detommaso 2018 full Newton
+        /* ── Rejuvenation (Maken 2022) ── */
+        filter->rejuv_ksd_threshold = 0.05f;
+        filter->rejuv_prob          = 0.30f;
+        filter->rejuv_blend         = 0.30f;
 
-        // Guided Prediction with INNOVATION GATING (FIXED)
-        // - Bottom clamp prevents zero-return trap (log(0) → -inf)
-        // - Asymmetric gating only activates on UPWARD shocks (spikes)
-        filter->use_guided = 1;
-        filter->guided_alpha_base = 0.0f;             // 0% when model fits
-        filter->guided_alpha_shock = 0.40f;           // 40% when model fails
-        filter->guided_innovation_threshold = 1.5f;   // 1.5σ = "surprised"
-        
-        // EKF Guide density
-        filter->use_guide = 1;
-        filter->use_guide_preserving = 1;  // Variance-preserving shift (not contraction)
-        filter->guide_strength = 0.05f;
-      
-        filter->use_adaptive_mu = 1;
-        filter->mu_process_var = 0.001f;  // Q: how fast can mu drift
-        filter->mu_obs_var_scale = 11.0f; // R = scale * bw²
-        filter->mu_min = -4.0f;
-        filter->mu_max = -1.0f;
-
-        filter->use_adaptive_guide = 1;
-        filter->guide_strength_base = 0.05f;       // Base when model fits
-        filter->guide_strength_max = 0.30f;        // Max during surprises
-        filter->guide_innovation_threshold = 1.0f; // Z-score to start boosting
-
-        filter->use_adaptive_sigma = 1;
-        filter->sigma_boost_threshold = 0.95f; // Start boosting when |z| > 1
-        filter->sigma_boost_max = 3.2f;       // Max 3x boost
-
-        filter->use_exact_gradient = 1;
-        filter->lik_offset = 0.345f;  // No correction - test if model is now consistent
-
-         // === KSD-based Adaptive Stein Steps ===
-        // Replaces fixed n_stein_steps with convergence-based early stopping
-        // KSD (Kernel Stein Discrepancy) computed in same O(N²) pass - zero extra cost
-        filter->stein_min_steps = 8;              // Always run at least 4 (RMSProp warmup)
-        filter->stein_max_steps = 8;             // Cap at 12 (crisis budget)
-        filter->ksd_improvement_threshold = 0.05; // Stop if <5% relative improvement
-
-        // Enable Student-t state dynamics
-        filter->use_student_t_state = 1;
-        filter->nu_state = 5.0f; // 5-7 recommended, lower = fatter tails
-
-        // Enable smoothing with 1-tick output lag
-        filter->use_smoothing = 1;
-        filter->smooth_lag = 3;        // Buffer last 3 estimates
-        filter->smooth_output_lag = 1; // Output h[t-1] (smoothed by y[t])
-
-        filter->use_persistent_kernel = 1;
-
-        //filter->use_heun = 1;
-
-        filter->use_adaptive_anneal = 1; // Already default
-        filter->anneal_kl_threshold = 0.9f;
-        filter->anneal_steps_per_beta = 3;
-
-    } else {
-        filter->use_svld = 0;
-        filter->use_annealing = 0;
-        filter->use_mim = 0;
-        filter->use_asymmetric_rho = 0;
-        filter->use_local_params = 0;
-        filter->use_newton = 0;
-        filter->use_guided = 0;
-        filter->guided_alpha_base = 0.0f;
-        filter->guided_alpha_shock = 0.0f;
+        /* ── Guided prediction (innovation-gated) ── */
+        filter->guided_alpha_base           = 0.0f;
+        filter->guided_alpha_shock          = 0.40f;
         filter->guided_innovation_threshold = 1.5f;
-        filter->use_guide = 0;
-        filter->use_guide_preserving = 0;
+
+        /* ── EKF guide density (adaptive strength) ── */
+        filter->guide_strength_base       = 0.05f;
+        filter->guide_strength_max        = 0.30f;
+        filter->guide_innovation_threshold = 1.0f;
+
+        /* ── Adaptive mu (Kalman) ── */
+        filter->mu_process_var   = 0.001f;
+        filter->mu_obs_var_scale = 11.0f;
+        filter->mu_min           = -4.0f;
+        filter->mu_max           = -1.0f;
+
+        /* ── Adaptive sigma ("breathing") ── */
+        filter->sigma_boost_threshold = 0.95f;
+        filter->sigma_boost_max       = 3.2f;
+
+        /* ── Likelihood ── */
+        filter->lik_offset = 0.345f;
+
+        /* ── Student-t state dynamics ── */
+        filter->nu_state = 5.0f;
+
+        /* ── Backward smoothing ── */
+        filter->smooth_lag        = 3;
+        filter->smooth_output_lag = 1;
+
+        /* ── Adaptive annealing ── */
+        filter->anneal_kl_threshold  = 0.9f;
+        filter->anneal_steps_per_beta = 3;
     }
-    
+    /* No else branch needed — svpf_create sets sane defaults for all fields.
+     * The basic path (use_optimized=0) just runs with those defaults via svpf_step(). */
+
     /* Run filter */
     double t_start = get_time_us();
-    
+
 #if BENCHMARK_LATENCY
     double* step_latencies = (double*)malloc(n * sizeof(double));
 #endif
-    
+
     float y_prev = 0.0f;
     for (int t = 0; t < n; t++) {
         float y_t = h_returns[t];
-        
+
 #if BENCHMARK_LATENCY
         double step_start = get_time_us();
 #endif
-        
-        if (use_adaptive) {
-#if USE_CUDA_GRAPH
-            // CUDA Graph mode: captures on first call, replays thereafter
+
+        if (use_optimized) {
             svpf_step_graph(filter, y_t, y_prev, &params,
-                           &h_loglik[t], &h_vol[t], &h_logvol[t]);
-#else
-            // Regular mode: launches kernels directly each step
-            svpf_step_adaptive(filter, y_t, y_prev, &params,
-                              &h_loglik[t], &h_vol[t], &h_logvol[t]);
-#endif
+                            &h_loglik[t], &h_vol[t], &h_logvol[t]);
         } else {
             SVPFResult result;
             svpf_step(filter, y_t, &params, &result);
             h_loglik[t] = result.log_lik_increment;
-            h_vol[t] = result.vol_mean;
+            h_vol[t]    = result.vol_mean;
             h_logvol[t] = result.h_mean;
         }
-        
+
 #if BENCHMARK_LATENCY
         step_latencies[t] = get_time_us() - step_start;
 #endif
-        
+
         y_prev = y_t;
     }
-    
+
     double t_end = get_time_us();
     *elapsed_ms_out = (t_end - t_start) / 1000.0;
-    
+
 #if BENCHMARK_LATENCY
-    // Skip warmup (first 100 steps) for percentile calculation
+    /* Skip warmup (first 100 steps) for percentile calculation */
     int warmup = 100;
     int effective_n = n - warmup;
     double* sorted_latencies = step_latencies + warmup;
-    
+
     qsort(sorted_latencies, effective_n, sizeof(double), compare_double_for_qsort);
-    
-    double p50 = sorted_latencies[effective_n / 2];
-    double p90 = sorted_latencies[(int)(effective_n * 0.90)];
-    double p99 = sorted_latencies[(int)(effective_n * 0.99)];
+
+    double p50  = sorted_latencies[effective_n / 2];
+    double p90  = sorted_latencies[(int)(effective_n * 0.90)];
+    double p99  = sorted_latencies[(int)(effective_n * 0.99)];
     double p999 = sorted_latencies[(int)(effective_n * 0.999)];
-    
+
     printf("  Latency (μs): P50=%.1f, P90=%.1f, P99=%.1f, P99.9=%.1f\n",
            p50, p90, p99, p999);
-    
+
     free(step_latencies);
 #endif
-    
+
     /* Compute metrics */
     Metrics m = compute_metrics(data, h_logvol);
-    
+
     /* Cleanup */
     svpf_destroy(filter);
     free(h_returns);
     free(h_loglik);
     free(h_vol);
     free(h_logvol);
-    
+
     return m;
 }
 

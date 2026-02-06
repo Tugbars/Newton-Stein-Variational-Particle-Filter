@@ -4,7 +4,7 @@
 
 # Create Python module
 pybind11_add_module(pysvpf 
-    svpf_python.cpp
+    #svpf_python.cpp
 )
 
 # Include directories

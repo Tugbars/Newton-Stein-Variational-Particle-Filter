@@ -122,7 +122,7 @@ endif()
 
 find_package(pybind11 QUIET)
 if(pybind11_FOUND)
-    add_subdirectory(py-torch)
+    #add_subdirectory(py-torch)
     set(PYTHON_BINDINGS_STATUS "ENABLED")
 else()
     message(WARNING "pybind11 not found - Python bindings disabled. Install with: pip install pybind11")
