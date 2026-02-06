@@ -32,13 +32,8 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-// Maximum smoothing window size
-#ifndef SVPF_SMOOTH_MAX_LAG
-#define SVPF_SMOOTH_MAX_LAG 8
-#endif
-
 // Forward declarations
-static void svpf_optimized_init(SVPFOptimizedState* opt, int n);
+void svpf_optimized_init(SVPFOptimizedState* opt, int n);
 
 // =============================================================================
 // STATE MANAGEMENT: Create
@@ -359,7 +354,7 @@ void svpf_initialize(SVPFState* state, const SVPFParams* params, unsigned long l
 // OPTIMIZED BACKEND
 // =============================================================================
 
-static void svpf_optimized_init(SVPFOptimizedState* opt, int n) {
+void svpf_optimized_init(SVPFOptimizedState* opt, int n) {
     if (opt->initialized && n > opt->allocated_n) {
         svpf_optimized_cleanup(opt);
     }
@@ -533,74 +528,7 @@ static void svpf_adaptive_mu_update(
     state->mu_var = P_new;
 }
 
-// =============================================================================
-// BACKWARD SMOOTHING: Lightweight RTS-style correction
-// =============================================================================
-
-static void svpf_smooth_backward(
-    SVPFState* state,
-    float h_mean_new,
-    float h_var_new,
-    float y_t,
-    const SVPFParams* params
-) {
-    if (!state->use_smoothing) return;
-    
-    int k = state->smooth_lag;
-    if (k > SVPF_SMOOTH_MAX_LAG) k = SVPF_SMOOTH_MAX_LAG;
-    if (k < 1) k = 1;
-    
-    // Store current estimate in buffer
-    int head = state->smooth_head;
-    state->smooth_h_mean[head] = h_mean_new;
-    state->smooth_h_var[head] = h_var_new;
-    state->smooth_y[head] = y_t;
-    
-    // Advance head (circular)
-    state->smooth_head = (head + 1) % k;
-    
-    // Skip backward pass until buffer is full
-    if (state->timestep < k) return;
-    
-    // Get AR(1) parameters
-    float rho = params->rho;
-    float mu = state->use_adaptive_mu ? state->mu_state : params->mu;
-    float sigma_z_sq = params->sigma_z * params->sigma_z;
-    
-    for (int lag = 1; lag < k; lag++) {
-        int idx_curr = (state->smooth_head - lag - 1 + k) % k;
-        int idx_next = (state->smooth_head - lag + k) % k;
-        
-        float h_curr = state->smooth_h_mean[idx_curr];
-        float h_next = state->smooth_h_mean[idx_next];
-        float var_curr = state->smooth_h_var[idx_curr];
-        
-        float h_pred = mu + rho * (h_curr - mu);
-        float pred_var = rho * rho * var_curr + sigma_z_sq;
-        float innovation = h_next - h_pred;
-        float J = rho * var_curr / (pred_var + 1e-8f);
-        
-        state->smooth_h_mean[idx_curr] = h_curr + J * innovation;
-        state->smooth_h_var[idx_curr] = var_curr * (1.0f - J * rho);
-    }
-}
-
-// Get smoothed output (with configured lag)
-static float svpf_get_smoothed_output(SVPFState* state, float h_mean_raw) {
-    if (!state->use_smoothing) return h_mean_raw;
-    
-    int k = state->smooth_lag;
-    if (k > SVPF_SMOOTH_MAX_LAG) k = SVPF_SMOOTH_MAX_LAG;
-    
-    if (state->timestep < k) return h_mean_raw;
-    
-    int output_lag = state->smooth_output_lag;
-    if (output_lag <= 0) return h_mean_raw;
-    if (output_lag >= k) output_lag = k - 1;
-    
-    int idx = (state->smooth_head - output_lag - 1 + k) % k;
-    return state->smooth_h_mean[idx];
-}
+// svpf_smooth_backward and svpf_get_smoothed_output are in svpf_kernels.cuh
 
 // =============================================================================
 // ASYNC STEP: Launch all GPU work, return immediately

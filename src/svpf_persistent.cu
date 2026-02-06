@@ -42,7 +42,7 @@
 // =============================================================================
 // INLINE DEVICE HELPERS
 // =============================================================================
-// Self-contained: no dependency on svpf_common.cuh
+// warp_reduce_sum/max/min come from svpf_common.cuh (via svpf_kernels.cuh)
 
 __device__ __forceinline__ float p_clamp_logvol(float h) {
     return fminf(fmaxf(h, SVPF_H_MIN), SVPF_H_MAX);
@@ -53,53 +53,32 @@ __device__ __forceinline__ float p_safe_exp(float x) {
     return __expf(x);
 }
 
-// Warp-level reduction (full warp of 32 threads)
-__device__ __forceinline__ float warp_reduce_sum(float val) {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        val += __shfl_down_sync(0xFFFFFFFF, val, offset);
-    return val;
-}
-
-__device__ __forceinline__ float warp_reduce_max(float val) {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        val = fmaxf(val, __shfl_down_sync(0xFFFFFFFF, val, offset));
-    return val;
-}
-
-__device__ __forceinline__ float warp_reduce_min(float val) {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        val = fminf(val, __shfl_down_sync(0xFFFFFFFF, val, offset));
-    return val;
-}
-
-// Block-level reduction for 1024 threads (32 warps)
-// Uses the last 32 floats of shared memory as scratch
+// Block-level reductions — work for any blockDim.x (not just 1024)
+// Uses scratch[32] from shared memory
 __device__ float block_reduce_sum_1024(float val, float* scratch) {
     int lane = threadIdx.x & 31;
     int wid  = threadIdx.x >> 5;
+    int num_warps = (blockDim.x + 31) >> 5;
 
     val = warp_reduce_sum(val);
     if (lane == 0) scratch[wid] = val;
     __syncthreads();
 
-    // First warp reduces 32 partial sums
-    val = (threadIdx.x < 32) ? scratch[threadIdx.x] : 0.0f;
+    val = (threadIdx.x < num_warps) ? scratch[threadIdx.x] : 0.0f;
     if (wid == 0) val = warp_reduce_sum(val);
-    return val;  // Valid in thread 0
+    return val;
 }
 
 __device__ float block_reduce_max_1024(float val, float* scratch) {
     int lane = threadIdx.x & 31;
     int wid  = threadIdx.x >> 5;
+    int num_warps = (blockDim.x + 31) >> 5;
 
     val = warp_reduce_max(val);
     if (lane == 0) scratch[wid] = val;
     __syncthreads();
 
-    val = (threadIdx.x < 32) ? scratch[threadIdx.x] : -FLT_MAX;
+    val = (threadIdx.x < num_warps) ? scratch[threadIdx.x] : -FLT_MAX;
     if (wid == 0) val = warp_reduce_max(val);
     return val;
 }
@@ -107,12 +86,13 @@ __device__ float block_reduce_max_1024(float val, float* scratch) {
 __device__ float block_reduce_min_1024(float val, float* scratch) {
     int lane = threadIdx.x & 31;
     int wid  = threadIdx.x >> 5;
+    int num_warps = (blockDim.x + 31) >> 5;
 
     val = warp_reduce_min(val);
     if (lane == 0) scratch[wid] = val;
     __syncthreads();
 
-    val = (threadIdx.x < 32) ? scratch[threadIdx.x] : FLT_MAX;
+    val = (threadIdx.x < num_warps) ? scratch[threadIdx.x] : FLT_MAX;
     if (wid == 0) val = warp_reduce_min(val);
     return val;
 }
@@ -141,6 +121,7 @@ struct SVPFPersistentParams {
     float temperature;
     float rho_rmsprop;
     float epsilon;
+    int   stein_sign_mode;  // [FIX #10] was missing — needed for sign_mult
 
     // Rejuvenation
     float guide_mean;
@@ -272,6 +253,7 @@ __device__ __noinline__ void persistent_transport_phase(
     float        temperature,
     float        rho_rmsprop,
     float        epsilon,
+    int          stein_sign_mode,            // [FIX #10] was missing
     bool         compute_ksd,
     float*       __restrict__ d_ksd_partial, // [N] KSD partial sums (global, may be NULL)
     int          n
@@ -283,6 +265,9 @@ __device__ __noinline__ void persistent_transport_phase(
     float bw_sq     = bandwidth * bandwidth;
     float inv_bw_sq = 1.0f / bw_sq;
     float inv_n     = 1.0f / (float)n;
+
+    // [FIX #10] Use sign mode from production config
+    float sign_mult = (stein_sign_mode == 1) ? 1.0f : -1.0f;
 
     float H_weighted = 0.0f;
     float K_sum_norm = 0.0f;
@@ -306,12 +291,14 @@ __device__ __noinline__ void persistent_transport_phase(
 
         // Full Newton: Hessian-weighted kernel
         H_weighted += sh_hess[j] * K;
-        H_weighted += 2.0f * inv_bw_sq * K_sq * fabsf(3.0f * dist_sq - 1.0f);
+        float Nk = 2.0f * inv_bw_sq * K_sq * fabsf(3.0f * dist_sq - 1.0f);
+        H_weighted += Nk;
         K_sum_norm += K;
 
         // Stein operator components
+        // [FIX #10] sign_mult matches production kernel
         k_grad_sum += K * sh_grad[j];
-        gk_sum     += -2.0f * diff * inv_bw_sq * K_sq;  // Legacy sign (attraction)
+        gk_sum     += sign_mult * 2.0f * diff * inv_bw_sq * K_sq;
 
         // KSD Stein kernel (last iteration only)
         if (compute_ksd) {
@@ -366,7 +353,7 @@ __device__ __noinline__ void persistent_transport_phase(
 //
 // Outputs:
 //   d_bandwidth, d_bandwidth_sq     — bandwidth for Stein kernel
-//   d_anneal_stats[4]               — {Σ ll_diff, Σ ll_diff², Σ|grad|, Σ(h-μ)²}
+//   d_anneal_stats[4]               — {Σ ll_diff, Σ ll_diff², Σ|grad|, Σ h²}
 
 __global__ __launch_bounds__(1024, 1)
 void svpf_probe_kernel(
@@ -425,9 +412,6 @@ void svpf_probe_kernel(
     __syncthreads();
 
     // Thread 0: compute and write bandwidth
-    __shared__ float s_bandwidth;
-    __shared__ float s_h_mean;  // Needed later for anneal stats
-
     if (threadIdx.x == 0) {
         float inv_n    = 1.0f / (float)n;
         float mean     = sum_val * inv_n;
@@ -471,8 +455,6 @@ void svpf_probe_kernel(
 
         *d_bandwidth_sq = bw_sq;
         *d_bandwidth    = bw;
-        s_bandwidth     = bw;
-        s_h_mean        = mean;
     }
     __syncthreads();
 
@@ -510,22 +492,30 @@ void svpf_probe_kernel(
     // PART 4: ACCUMULATE ANNEALING STATS
     // =====================================================================
     // Stats needed by CPU to compute beta schedule:
-    //   [0] Σ log_w[i]          (mean log-likelihood contribution)
-    //   [1] Σ log_w[i]²         (variance of log-likelihood)
-    //   [2] Σ |grad[i]|         (gradient magnitude)
-    //   [3] Σ (h[i] - h_mean)²  (spatial spread)
+    //   [0] Σ (log_w[i] - CENTER)       (mean log-likelihood contribution)
+    //   [1] Σ (log_w[i] - CENTER)²      (variance of log-likelihood)
+    //   [2] Σ |grad[i]|                  (gradient magnitude)
+    //   [3] Σ (h[i] - CENTER_H)²        (spatial spread — matches production RMS)
 
     float lw_i    = log_w[i];
     float grad_i  = sh_grad[i];
-    float h_dev   = h_i - s_h_mean;
 
-    float s0 = block_reduce_sum_1024(lw_i, scratch);
+    // [FIX #7] Match production centering: CENTER_H=0 → gives RMS not std dev
+    // [FIX #8] Match production clamping on log_w
+    const float CENTER_LL = -50.0f;
+    const float CENTER_H  = 0.0f;
+
+    float ll_clamped = fmaxf(fminf(lw_i, -1.0f), -100.0f);
+    float ll_diff    = ll_clamped - CENTER_LL;
+    float h_diff     = h_i - CENTER_H;
+
+    float s0 = block_reduce_sum_1024(ll_diff, scratch);
     __syncthreads();
-    float s1 = block_reduce_sum_1024(lw_i * lw_i, scratch);
+    float s1 = block_reduce_sum_1024(ll_diff * ll_diff, scratch);
     __syncthreads();
     float s2 = block_reduce_sum_1024(fabsf(grad_i), scratch);
     __syncthreads();
-    float s3 = block_reduce_sum_1024(h_dev * h_dev, scratch);
+    float s3 = block_reduce_sum_1024(h_diff * h_diff, scratch);
 
     if (threadIdx.x == 0) {
         d_anneal_stats[0] = s0;
@@ -600,30 +590,29 @@ void svpf_persistent_stein_kernel(
 
     int n_stages       = params.n_stages;
     int steps_per_beta = params.steps_per_beta;
-    int total_steps    = 0;
 
     // =====================================================================
-    // ANNEALING LOOP: stages × steps_per_beta iterations
+    // ANNEALING LOOP: gradient once per stage, transport steps_per_beta×
+    // (Matches production structure — gradients reused within a stage)
     // =====================================================================
     for (int stage = 0; stage < n_stages; stage++) {
         float beta        = fminf((float)(stage + 1) / (float)n_stages, 1.0f);
         float beta_factor = sqrtf(beta);
 
+        // ----- GRADIENT PHASE (once per stage) -----
+        persistent_gradient_phase(
+            sh_mu_i, sh_grad, sh_hess,
+            h, log_w,
+            y_t, beta,
+            params.nu, params.student_t_const, params.lik_offset,
+            params.nu_state, params.sigma_z,
+            n
+        );
+        __syncthreads();
+
         for (int s = 0; s < steps_per_beta; s++) {
-            total_steps++;
             bool is_last = (stage == n_stages - 1)
                         && (s == steps_per_beta - 1);
-
-            // ----- GRADIENT PHASE -----
-            persistent_gradient_phase(
-                sh_mu_i, sh_grad, sh_hess,
-                h, log_w,
-                y_t, beta,
-                params.nu, params.student_t_const, params.lik_offset,
-                params.nu_state, params.sigma_z,
-                n
-            );
-            __syncthreads();
 
             // ----- TRANSPORT PHASE: snapshot h into shared -----
             sh_h[i] = h[i];
@@ -635,6 +624,7 @@ void svpf_persistent_stein_kernel(
                 bandwidth,
                 params.step_size, beta_factor,
                 params.temperature, params.rho_rmsprop, params.epsilon,
+                params.stein_sign_mode,
                 is_last, d_ksd_partial,
                 n
             );
@@ -730,28 +720,40 @@ void svpf_persistent_step_async(
     int n = state->n_particles;
     cudaStream_t cs = state->stream;
 
-    // Ensure backend is initialized
-    // (reuses existing svpf_optimized_init logic — caller must guarantee)
+    // Lazy-init backend buffers (idempotent — same as production path)
+    svpf_optimized_init(opt, n);
 
-    // --- Effective parameters (adaptive sigma boost) ---
-    float effective_mu      = state->mu_state;
+    // --- Effective parameters ---
+    // [FIX #5] Check use_adaptive_mu flag (matches production)
+    float effective_mu = state->use_adaptive_mu ? state->mu_state : params->mu;
+
+    // [FIX #6] Check use_adaptive_sigma flag (matches production)
     float effective_sigma_z = params->sigma_z;
 
-    if (state->timestep > 0) {
+    if (state->use_adaptive_sigma && state->timestep > 0) {
         float vol_est  = fmaxf(state->vol_prev, 1e-4f);
         float return_z = fabsf(y_t) / vol_est;
 
+        float sigma_boost = 1.0f;
         if (return_z > state->sigma_boost_threshold) {
             float severity    = fminf((return_z - state->sigma_boost_threshold) / 3.0f, 1.0f);
-            float sigma_boost = 1.0f + (state->sigma_boost_max - 1.0f) * severity;
-            effective_sigma_z = params->sigma_z * sigma_boost;
+            sigma_boost = 1.0f + (state->sigma_boost_max - 1.0f) * severity;
         }
+        effective_sigma_z = params->sigma_z * sigma_boost;
         state->sigma_z_effective = effective_sigma_z;
     }
 
     float student_t_const = lgammaf((state->nu + 1.0f) / 2.0f)
                           - lgammaf(state->nu / 2.0f)
                           - 0.5f * logf((float)M_PI * state->nu);
+
+    // [FIX #2] Resolve rho_up/rho_down through flag (matches production)
+    float rho_up   = state->use_asymmetric_rho ? state->rho_up   : params->rho;
+    float rho_down = state->use_asymmetric_rho ? state->rho_down : params->rho;
+
+    // [FIX #3] Resolve delta_rho/delta_sigma through flag (matches production)
+    float delta_rho   = state->use_local_params ? state->delta_rho   : 0.0f;
+    float delta_sigma = state->use_local_params ? state->delta_sigma : 0.0f;
 
     // --- Upload y values ---
     float y_arr[2] = {y_prev, y_t};
@@ -767,14 +769,14 @@ void svpf_persistent_step_async(
         svpf_predict_guided_antithetic_kernel<<<nb_half, SVPF_BLOCK_SIZE, 0, cs>>>(
             state->h, state->h_prev, state->rng_states,
             opt->d_y_single, opt->d_h_mean_prev, 1,
-            state->rho_up, state->rho_down,
+            rho_up, rho_down,                           // [FIX #2] flag-resolved
             effective_sigma_z, effective_mu, params->gamma,
             state->mim_jump_prob, state->mim_jump_scale,
-            state->delta_rho, state->delta_sigma,
+            delta_rho, delta_sigma,                     // [FIX #3] flag-resolved
             state->guided_alpha_base, state->guided_alpha_shock,
             state->guided_innovation_threshold,
             state->student_t_implied_offset,
-            state->nu_state,
+            state->use_student_t_state, state->nu_state, // [FIX #1] both args present
             n
         );
     }
@@ -783,7 +785,9 @@ void svpf_persistent_step_async(
     // 2. EKF GUIDE (adaptive strength, variance-preserving) — existing kernel
     // =========================================================================
     float current_guide_strength = state->guide_strength_base;
-    if (state->timestep > 0) {
+
+    // [FIX #9] Check use_adaptive_guide flag (matches production)
+    if (state->use_adaptive_guide && state->timestep > 0) {
         float vol_est = fmaxf(state->vol_prev, 1e-4f);
         float return_z = fabsf(y_t) / vol_est;
         float implied_h = logf(y_t * y_t + 1e-8f) + state->student_t_implied_offset;
@@ -792,18 +796,19 @@ void svpf_persistent_step_async(
 
         if (h_innovation > 0.0f && return_z > state->guide_innovation_threshold) {
             float severity = fminf((return_z - state->guide_innovation_threshold) / 3.0f, 1.0f);
-            current_guide_strength = state->guide_strength_base
-                + (state->guide_strength_max - state->guide_strength_base) * severity;
+            float boost = (state->guide_strength_max - state->guide_strength_base) * severity;
+            current_guide_strength = state->guide_strength_base + boost;
         }
     }
 
-    SVPFParams guide_params = *params;
-    guide_params.mu = effective_mu;
-    svpf_ekf_update(state, y_t, &guide_params);
-
     {
-        int nb = (n + SVPF_BLOCK_SIZE - 1) / SVPF_BLOCK_SIZE;
+        SVPFParams guide_params = *params;
+        if (state->use_adaptive_mu) {
+            guide_params.mu = effective_mu;
+        }
+        svpf_ekf_update(state, y_t, &guide_params);
 
+        int nb = (n + SVPF_BLOCK_SIZE - 1) / SVPF_BLOCK_SIZE;
         svpf_apply_guide_preserving_kernel<<<nb, SVPF_BLOCK_SIZE, 0, cs>>>(
             state->h, opt->d_h_mean_prev, state->guide_mean,
             current_guide_strength, n
@@ -861,7 +866,8 @@ void svpf_persistent_step_async(
     // =========================================================================
     // 5. PERSISTENT STEIN KERNEL — entire annealing loop in one launch
     // =========================================================================
-    float base_step = SVPF_STEIN_STEP_SIZE * 0.5f;  // Halved (guide is always on)
+    float base_step = SVPF_STEIN_STEP_SIZE * (state->use_guide ? 0.5f : 1.0f);
+    float temp = state->use_svld ? state->temperature : 0.0f;
 
     SVPFPersistentParams pparams;
     pparams.rho             = params->rho;
@@ -873,14 +879,16 @@ void svpf_persistent_step_async(
     pparams.lik_offset      = state->lik_offset;
     pparams.nu_state        = state->nu_state;
     pparams.step_size       = base_step;
-    pparams.temperature     = state->temperature;
+    pparams.temperature     = temp;
     pparams.rho_rmsprop     = state->rmsprop_rho;
     pparams.epsilon         = state->rmsprop_eps;
+    pparams.stein_sign_mode = state->stein_repulsive_sign;  // [FIX #10]
     pparams.guide_mean      = state->guide_mean;
     pparams.guide_std       = sqrtf(fmaxf(state->guide_var, 1e-6f));
     pparams.rejuv_prob      = state->rejuv_prob;
     pparams.rejuv_blend     = state->rejuv_blend;
-    pparams.do_rejuvenation = (state->timestep > 10
+    pparams.do_rejuvenation = (state->use_rejuvenation
+                            && state->timestep > 10
                             && state->ksd_prev > state->rejuv_ksd_threshold) ? 1 : 0;
     pparams.y_idx           = 1;
     pparams.n_stages        = n_stages;
@@ -915,10 +923,9 @@ void svpf_persistent_step_async(
 }
 
 // =============================================================================
-// SYNC OUTPUTS — identical to original svpf_sync_outputs
+// SYNC OUTPUTS — matches production svpf_sync_outputs exactly
 // =============================================================================
-// Can reuse existing svpf_sync_outputs() directly; included here for
-// self-contained compilation.
+// [FIX #4] Added backward smoothing + smoothed output that was entirely missing
 
 void svpf_persistent_sync_outputs(
     SVPFState* state,
@@ -935,20 +942,28 @@ void svpf_persistent_sync_outputs(
     float vol_local       = r[1];
     float ksd_local       = r[4];
 
+    // [FIX #4] Backward smoothing (RTS-style correction, matches production)
+    float h_var_est = bandwidth_local * bandwidth_local;
+    const SVPFParams* params = (const SVPFParams*)opt->pending_params;
+    svpf_smooth_backward(state, h_mean_local, h_var_est, opt->pending_y_t, params);
+
+    float h_mean_output = svpf_get_smoothed_output(state, h_mean_local);
+
     if (h_loglik_out) *h_loglik_out = r[0];
     if (h_vol_out)    *h_vol_out    = vol_local;
-    if (h_mean_out)   *h_mean_out   = h_mean_local;
+    if (h_mean_out)   *h_mean_out   = h_mean_output;  // [FIX #4] smoothed, not raw
 
     state->vol_prev  = vol_local;
     state->ksd_prev  = ksd_local;
 
-    if (state->timestep > 10) {
-        // Adaptive mu (Kalman update)
+    // Adaptive mu Kalman update (matches production)
+    if (state->use_adaptive_mu && state->timestep > 10) {
         float P_pred = state->mu_var + state->mu_process_var;
         float R      = state->mu_obs_var_scale * bandwidth_local * bandwidth_local;
         float K      = P_pred / (P_pred + R + 1e-8f);
         float mu_new = state->mu_state + K * (h_mean_local - state->mu_state);
-        state->mu_state = fminf(fmaxf(mu_new, state->mu_min), state->mu_max);
+        mu_new = fminf(fmaxf(mu_new, state->mu_min), state->mu_max);
+        state->mu_state = mu_new;
         state->mu_var   = (1.0f - K) * P_pred;
     }
 

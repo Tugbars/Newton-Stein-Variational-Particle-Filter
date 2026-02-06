@@ -213,4 +213,98 @@ static inline void svpf_ekf_update(
     state->guide_K = K;
 }
 
+// =============================================================================
+// Host-side Backward Smoothing (RTS-style)
+// =============================================================================
+
+#ifndef SVPF_SMOOTH_MAX_LAG
+#define SVPF_SMOOTH_MAX_LAG 8
+#endif
+
+/** @brief Lightweight RTS backward pass over sliding window. Called after each sync. */
+static inline void svpf_smooth_backward(
+    SVPFState* state,
+    float h_mean_new,
+    float h_var_new,
+    float y_t,
+    const SVPFParams* params
+) {
+    if (!state->use_smoothing) return;
+
+    int k = state->smooth_lag;
+    if (k > SVPF_SMOOTH_MAX_LAG) k = SVPF_SMOOTH_MAX_LAG;
+    if (k < 1) k = 1;
+
+    int head = state->smooth_head;
+    state->smooth_h_mean[head] = h_mean_new;
+    state->smooth_h_var[head] = h_var_new;
+    state->smooth_y[head] = y_t;
+
+    state->smooth_head = (head + 1) % k;
+
+    if (state->timestep < k) return;
+
+    float rho = params->rho;
+    float mu = state->use_adaptive_mu ? state->mu_state : params->mu;
+    float sigma_z_sq = params->sigma_z * params->sigma_z;
+
+    for (int lag = 1; lag < k; lag++) {
+        int idx_curr = (state->smooth_head - lag - 1 + k) % k;
+        int idx_next = (state->smooth_head - lag + k) % k;
+
+        float h_curr = state->smooth_h_mean[idx_curr];
+        float h_next = state->smooth_h_mean[idx_next];
+        float var_curr = state->smooth_h_var[idx_curr];
+
+        float h_pred = mu + rho * (h_curr - mu);
+        float pred_var = rho * rho * var_curr + sigma_z_sq;
+        float innovation = h_next - h_pred;
+        float J = rho * var_curr / (pred_var + 1e-8f);
+
+        state->smooth_h_mean[idx_curr] = h_curr + J * innovation;
+        state->smooth_h_var[idx_curr] = var_curr * (1.0f - J * rho);
+    }
+}
+
+/** @brief Return smoothed h_mean with configured output lag. */
+static inline float svpf_get_smoothed_output(SVPFState* state, float h_mean_raw) {
+    if (!state->use_smoothing) return h_mean_raw;
+
+    int k = state->smooth_lag;
+    if (k > SVPF_SMOOTH_MAX_LAG) k = SVPF_SMOOTH_MAX_LAG;
+
+    if (state->timestep < k) return h_mean_raw;
+
+    int output_lag = state->smooth_output_lag;
+    if (output_lag <= 0) return h_mean_raw;
+    if (output_lag >= k) output_lag = k - 1;
+
+    int idx = (state->smooth_head - output_lag - 1 + k) % k;
+    return state->smooth_h_mean[idx];
+}
+
+// =============================================================================
+// Optimized Backend Init (svpf_optimized_graph.cu)
+// =============================================================================
+
+/** @brief Lazy-init for SVPFOptimizedState buffers. Idempotent. */
+void svpf_optimized_init(SVPFOptimizedState* opt, int n);
+
+// =============================================================================
+// Persistent Kernel API (svpf_persistent.cu)
+// =============================================================================
+
+/** @brief Async 2-kernel step: predict → probe → persistent stein. */
+void svpf_persistent_step_async(
+    SVPFState* state, float y_t, float y_prev, const SVPFParams* params);
+
+/** @brief Sync outputs after persistent_step_async. Includes smoothing + adaptive mu. */
+void svpf_persistent_sync_outputs(
+    SVPFState* state, float* h_loglik_out, float* h_vol_out, float* h_mean_out);
+
+/** @brief Synchronous convenience: async + sync in one call. */
+void svpf_persistent_step(
+    SVPFState* state, float y_t, float y_prev, const SVPFParams* params,
+    float* h_loglik_out, float* h_vol_out, float* h_mean_out);
+
 #endif // SVPF_KERNELS_CUH

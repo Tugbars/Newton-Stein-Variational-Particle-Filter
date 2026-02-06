@@ -623,6 +623,24 @@ static inline float svpf_drho_deta(float rho) { return 1.0f - rho * rho; }
 static inline float svpf_dsigma_dkappa(float sigma) { return sigma; }
 static inline float svpf_dnu_dkappa_nu(float nu) { return nu - 2.0f; }
 
+// =============================================================================
+// Persistent Kernel API (svpf_persistent.cu)
+// =============================================================================
+
+/** @brief Async 2-kernel step: predict → probe → persistent stein. */
+void svpf_persistent_step_async(
+    SVPFState* state, float y_t, float y_prev, const SVPFParams* params);
+
+/** @brief Sync outputs after persistent_step_async. Includes smoothing + adaptive mu. */
+void svpf_persistent_sync_outputs(
+    SVPFState* state, float* h_loglik_out, float* h_vol_out, float* h_mean_out);
+
+/** @brief Synchronous convenience: async + sync in one call. */
+void svpf_persistent_step(
+    SVPFState* state, float y_t, float y_prev, const SVPFParams* params,
+    float* h_loglik_out, float* h_vol_out, float* h_mean_out);
+
+
 #ifdef __cplusplus
 }
 #endif
