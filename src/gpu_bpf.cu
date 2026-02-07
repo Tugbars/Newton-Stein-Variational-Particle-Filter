@@ -1,13 +1,15 @@
 /**
  * @file gpu_bpf.cu
- * @brief GPU Bootstrap PF + IMM implementation
+ * @brief GPU Bootstrap PF + IMM with CUDA stream parallelism
+ *
+ * Custom reduction kernels replace thrust for max/sum to enable fully async
+ * execution across K streams. Only thrust::inclusive_scan remains (device→device).
  */
 
 #include "gpu_bpf.cuh"
 #include <thrust/device_ptr.h>
-#include <thrust/reduce.h>
 #include <thrust/scan.h>
-#include <thrust/extrema.h>
+#include <thrust/system/cuda/execution_policy.h>
 #include <math.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -34,8 +36,20 @@ __device__ static float bpf_log_t_pdf(float x, float nu) {
          - (nu + 1.0f) / 2.0f * logf(1.0f + x * x / nu);
 }
 
+// Atomic float max via CAS
+__device__ static float atomicMaxf(float* addr, float val) {
+    int* addr_as_int = (int*)addr;
+    int old = *addr_as_int, assumed;
+    do {
+        assumed = old;
+        old = atomicCAS(addr_as_int, assumed,
+                        __float_as_int(fmaxf(val, __int_as_float(assumed))));
+    } while (assumed != old);
+    return __int_as_float(old);
+}
+
 // =============================================================================
-// BPF Kernels
+// Kernels: BPF core
 // =============================================================================
 
 __global__ void bpf_init_rng(curandState* states, unsigned long long seed, int n) {
@@ -57,12 +71,10 @@ __global__ void bpf_propagate_weight(
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    
     if (do_propagate) {
         float eps = bpf_sample_t(&states[i], nu_state);
         h[i] = mu + rho * (h[i] - mu) + sigma_z * eps;
     }
-    
     float h_i = h[i];
     float eta = y_t * __expf(-h_i * 0.5f);
     log_w[i] = (nu_obs > 0.0f)
@@ -70,28 +82,73 @@ __global__ void bpf_propagate_weight(
         : -0.9189385f - 0.5f * eta * eta - h_i * 0.5f;
 }
 
-__global__ void bpf_exp_sub(float* w, const float* log_w, float max_lw, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) w[i] = __expf(log_w[i] - max_lw);
+// =============================================================================
+// Kernels: Async reductions (no host sync)
+// =============================================================================
+
+// Initialize a device scalar
+__global__ void bpf_set_scalar(float* scalar, float val) {
+    *scalar = val;
 }
 
-__global__ void bpf_scale_and_wh(float* w, float* wh, const float* h,
-                                  float inv_sum, int n) {
+// Block-reduce max → atomicMax to output scalar
+__global__ void bpf_reduce_max(const float* in, float* out, int n) {
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x;
+    int i = blockIdx.x * blockDim.x + tid;
+    sdata[tid] = (i < n) ? in[i] : -1e30f;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
+        __syncthreads();
+    }
+    if (tid == 0) atomicMaxf(out, sdata[0]);
+}
+
+// Block-reduce sum → atomicAdd to output scalar
+__global__ void bpf_reduce_sum(const float* in, float* out, int n) {
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x;
+    int i = blockIdx.x * blockDim.x + tid;
+    sdata[tid] = (i < n) ? in[i] : 0.0f;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) atomicAdd(out, sdata[0]);
+}
+
+// exp(log_w - max_lw), reading max from device scalar
+__global__ void bpf_exp_sub_dev(float* w, const float* log_w, const float* d_max, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) w[i] = __expf(log_w[i] - *d_max);
+}
+
+// Normalize weights and compute w*h, reading sum from device scalar
+__global__ void bpf_scale_wh_dev(float* w, float* wh, const float* h,
+                                  const float* d_sum, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
+        float inv_sum = 1.0f / *d_sum;
         w[i] *= inv_sum;
         wh[i] = w[i] * h[i];
     }
 }
 
+// Compute log-likelihood from max_lw and sum_w: log(sum_w/N) + max_lw
+// d_scalars[0]=max_lw, d_scalars[1]=sum_w → d_scalars[3]=log_lik
+__global__ void bpf_compute_loglik(float* d_scalars, int n) {
+    d_scalars[3] = d_scalars[0] + logf(fmaxf(d_scalars[1] / (float)n, 1e-30f));
+}
+
+// Systematic resampling
 __global__ void bpf_resample(float* h_out, const float* h_in,
                               const float* cdf, float u_base, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    
     float target = u_base + (float)i / (float)n;
     if (target >= 1.0f) target -= 1.0f;
-    
     int lo = 0, hi = n - 1;
     while (lo < hi) {
         int mid = (lo + hi) >> 1;
@@ -118,7 +175,7 @@ static inline float bpf_pcg32_float(unsigned long long* state) {
 }
 
 // =============================================================================
-// BPF Streaming API
+// BPF Create / Destroy
 // =============================================================================
 
 GpuBpfState* gpu_bpf_create(int n_particles, float rho, float sigma_z, float mu,
@@ -134,61 +191,32 @@ GpuBpfState* gpu_bpf_create(int n_particles, float rho, float sigma_z, float mu,
     s->grid = (n_particles + s->block - 1) / s->block;
     s->host_rng_state = (unsigned long long)seed * 67890ULL + 12345ULL;
     s->timestep = 0;
-    
-    cudaMalloc(&s->d_h,     n_particles * sizeof(float));
-    cudaMalloc(&s->d_h2,    n_particles * sizeof(float));
-    cudaMalloc(&s->d_log_w, n_particles * sizeof(float));
-    cudaMalloc(&s->d_w,     n_particles * sizeof(float));
-    cudaMalloc(&s->d_cdf,   n_particles * sizeof(float));
-    cudaMalloc(&s->d_wh,    n_particles * sizeof(float));
-    cudaMalloc(&s->d_rng,   n_particles * sizeof(curandState));
-    
-    bpf_init_rng<<<s->grid, s->block>>>(s->d_rng, (unsigned long long)seed, n_particles);
-    
-    float std_stat = sqrtf((sigma_z * sigma_z) / fmaxf(1.0f - rho * rho, 1e-6f));
-    bpf_init_particles<<<s->grid, s->block>>>(s->d_h, s->d_rng, mu, std_stat, n_particles);
-    cudaDeviceSynchronize();
-    
-    return s;
-}
 
-BpfResult gpu_bpf_step(GpuBpfState* s, float y_t) {
-    int n = s->n_particles;
-    
-    bpf_propagate_weight<<<s->grid, s->block>>>(
-        s->d_h, s->d_log_w, s->d_rng,
-        s->rho, s->sigma_z, s->mu, s->nu_state, s->nu_obs, y_t,
-        n, (s->timestep > 0) ? 1 : 0);
-    
-    thrust::device_ptr<float> t_log_w(s->d_log_w);
-    thrust::device_ptr<float> t_w(s->d_w);
-    thrust::device_ptr<float> t_wh(s->d_wh);
-    thrust::device_ptr<float> t_cdf(s->d_cdf);
-    
-    float max_lw = *thrust::max_element(t_log_w, t_log_w + n);
-    bpf_exp_sub<<<s->grid, s->block>>>(s->d_w, s->d_log_w, max_lw, n);
-    float sum_w = thrust::reduce(t_w, t_w + n, 0.0f);
-    bpf_scale_and_wh<<<s->grid, s->block>>>(s->d_w, s->d_wh, s->d_h, 1.0f / sum_w, n);
-    float h_est = thrust::reduce(t_wh, t_wh + n, 0.0f);
-    
-    thrust::inclusive_scan(t_w, t_w + n, t_cdf);
-    float u = bpf_pcg32_float(&s->host_rng_state) / (float)n;
-    bpf_resample<<<s->grid, s->block>>>(s->d_h2, s->d_h, s->d_cdf, u, n);
-    
-    float* tmp = s->d_h; s->d_h = s->d_h2; s->d_h2 = tmp;
-    s->timestep++;
-    
-    // Log marginal likelihood: log p(y_t | y_{1:t-1}) = max_lw + log(mean(w))
-    float log_lik = max_lw + logf(fmaxf(sum_w / (float)n, 1e-30f));
-    
-    BpfResult r;
-    r.h_mean = h_est;
-    r.log_lik = log_lik;
-    return r;
+    cudaStreamCreate(&s->stream);
+
+    cudaMalloc(&s->d_h,       n_particles * sizeof(float));
+    cudaMalloc(&s->d_h2,      n_particles * sizeof(float));
+    cudaMalloc(&s->d_log_w,   n_particles * sizeof(float));
+    cudaMalloc(&s->d_w,       n_particles * sizeof(float));
+    cudaMalloc(&s->d_cdf,     n_particles * sizeof(float));
+    cudaMalloc(&s->d_wh,      n_particles * sizeof(float));
+    cudaMalloc(&s->d_rng,     n_particles * sizeof(curandState));
+    cudaMalloc(&s->d_scalars, 4 * sizeof(float));  // max_lw, sum_w, h_est, log_lik
+
+    bpf_init_rng<<<s->grid, s->block, 0, s->stream>>>(
+        s->d_rng, (unsigned long long)seed, n_particles);
+
+    float std_stat = sqrtf((sigma_z * sigma_z) / fmaxf(1.0f - rho * rho, 1e-6f));
+    bpf_init_particles<<<s->grid, s->block, 0, s->stream>>>(
+        s->d_h, s->d_rng, mu, std_stat, n_particles);
+    cudaStreamSynchronize(s->stream);
+
+    return s;
 }
 
 void gpu_bpf_destroy(GpuBpfState* s) {
     if (!s) return;
+    cudaStreamDestroy(s->stream);
     cudaFree(s->d_h);
     cudaFree(s->d_h2);
     cudaFree(s->d_log_w);
@@ -196,7 +224,82 @@ void gpu_bpf_destroy(GpuBpfState* s) {
     cudaFree(s->d_cdf);
     cudaFree(s->d_wh);
     cudaFree(s->d_rng);
+    cudaFree(s->d_scalars);
     free(s);
+}
+
+// =============================================================================
+// BPF Async Step — all work on stream, no host sync
+// =============================================================================
+
+void gpu_bpf_step_async(GpuBpfState* s, float y_t) {
+    int n = s->n_particles;
+    int g = s->grid;
+    int b = s->block;
+    cudaStream_t st = s->stream;
+    size_t smem = b * sizeof(float);
+
+    // 1. Propagate + weight
+    bpf_propagate_weight<<<g, b, 0, st>>>(
+        s->d_h, s->d_log_w, s->d_rng,
+        s->rho, s->sigma_z, s->mu, s->nu_state, s->nu_obs, y_t,
+        n, (s->timestep > 0) ? 1 : 0);
+
+    // 2. Max of log_w → d_scalars[0]
+    bpf_set_scalar<<<1, 1, 0, st>>>(s->d_scalars + 0, -1e30f);
+    bpf_reduce_max<<<g, b, smem, st>>>(s->d_log_w, s->d_scalars + 0, n);
+
+    // 3. w = exp(log_w - max_lw)
+    bpf_exp_sub_dev<<<g, b, 0, st>>>(s->d_w, s->d_log_w, s->d_scalars + 0, n);
+
+    // 4. sum_w → d_scalars[1]
+    bpf_set_scalar<<<1, 1, 0, st>>>(s->d_scalars + 1, 0.0f);
+    bpf_reduce_sum<<<g, b, smem, st>>>(s->d_w, s->d_scalars + 1, n);
+
+    // 5. Normalize + w*h
+    bpf_scale_wh_dev<<<g, b, 0, st>>>(s->d_w, s->d_wh, s->d_h, s->d_scalars + 1, n);
+
+    // 6. h_est = sum(w*h) → d_scalars[2]
+    bpf_set_scalar<<<1, 1, 0, st>>>(s->d_scalars + 2, 0.0f);
+    bpf_reduce_sum<<<g, b, smem, st>>>(s->d_wh, s->d_scalars + 2, n);
+
+    // 7. log_lik → d_scalars[3]
+    bpf_compute_loglik<<<1, 1, 0, st>>>(s->d_scalars, n);
+
+    // 8. Inclusive scan for CDF (thrust on stream — device→device, no host sync)
+    thrust::inclusive_scan(
+        thrust::cuda::par.on(st),
+        thrust::device_ptr<float>(s->d_w),
+        thrust::device_ptr<float>(s->d_w + n),
+        thrust::device_ptr<float>(s->d_cdf));
+
+    // 9. Resample
+    float u = bpf_pcg32_float(&s->host_rng_state) / (float)n;
+    bpf_resample<<<g, b, 0, st>>>(s->d_h2, s->d_h, s->d_cdf, u, n);
+
+    // Swap particle buffers
+    float* tmp = s->d_h; s->d_h = s->d_h2; s->d_h2 = tmp;
+    s->timestep++;
+}
+
+// Read result after cudaDeviceSynchronize() or cudaStreamSynchronize()
+BpfResult gpu_bpf_get_result(GpuBpfState* s) {
+    float scalars[4];
+    cudaMemcpy(scalars, s->d_scalars, 4 * sizeof(float), cudaMemcpyDeviceToHost);
+    BpfResult r;
+    r.h_mean  = scalars[2];
+    r.log_lik = scalars[3];
+    return r;
+}
+
+// =============================================================================
+// BPF Synchronous Step (convenience wrapper)
+// =============================================================================
+
+BpfResult gpu_bpf_step(GpuBpfState* s, float y_t) {
+    gpu_bpf_step_async(s, y_t);
+    cudaStreamSynchronize(s->stream);
+    return gpu_bpf_get_result(s);
 }
 
 // =============================================================================
@@ -214,7 +317,7 @@ double gpu_bpf_run_rmse(
     int skip = 100;
     double sum_sq = 0.0;
     int count = 0;
-    
+
     for (int t = 0; t < n_ticks; t++) {
         BpfResult r = gpu_bpf_step(state, (float)returns[t]);
         if (t >= skip) {
@@ -223,14 +326,13 @@ double gpu_bpf_run_rmse(
             count++;
         }
     }
-    
-    cudaDeviceSynchronize();
+
     gpu_bpf_destroy(state);
     return sqrt(sum_sq / count);
 }
 
 // =============================================================================
-// IMM: Log-Sum-Exp utility
+// IMM utilities
 // =============================================================================
 
 static double log_sum_exp(const double* x, int n) {
@@ -244,7 +346,7 @@ static double log_sum_exp(const double* x, int n) {
 }
 
 // =============================================================================
-// IMM Create
+// IMM Create / Destroy
 // =============================================================================
 
 GpuImmState* gpu_imm_create(
@@ -257,95 +359,97 @@ GpuImmState* gpu_imm_create(
         fprintf(stderr, "IMM: n_models=%d exceeds max=%d\n", n_models, IMM_MAX_MODELS);
         return NULL;
     }
-    
+
     GpuImmState* s = (GpuImmState*)calloc(1, sizeof(GpuImmState));
     s->n_models = n_models;
     s->n_particles_per_model = n_particles_per_model;
     s->timestep = 0;
-    
-    // Allocate filters
+
     s->filters = (GpuBpfState**)malloc(n_models * sizeof(GpuBpfState*));
     for (int k = 0; k < n_models; k++) {
         s->filters[k] = gpu_bpf_create(
             n_particles_per_model,
             models[k].rho, models[k].sigma_z, models[k].mu,
             models[k].nu_state, models[k].nu_obs,
-            seed + k * 7919  // different seed per model
-        );
+            seed + k * 7919);
     }
-    
-    // Uniform initial model probabilities (log-space)
+
     s->log_pi = (double*)malloc(n_models * sizeof(double));
     s->log_pi_pred = (double*)malloc(n_models * sizeof(double));
     double log_uniform = -log((double)n_models);
     for (int k = 0; k < n_models; k++)
         s->log_pi[k] = log_uniform;
-    
-    // Transition matrix (log-space)
+
     s->log_T = (double*)malloc(n_models * n_models * sizeof(double));
     if (transition_matrix) {
-        for (int i = 0; i < n_models * n_models; i++) {
+        for (int i = 0; i < n_models * n_models; i++)
             s->log_T[i] = log(fmax((double)transition_matrix[i], 1e-30));
-        }
     } else {
-        // Default: high self-transition, uniform off-diagonal
-        // P(stay) = 0.95, P(switch to any other) = 0.05 / (K-1)
         double p_stay = 0.95;
         double p_switch = (n_models > 1) ? (1.0 - p_stay) / (n_models - 1) : 0.0;
-        for (int i = 0; i < n_models; i++) {
-            for (int j = 0; j < n_models; j++) {
-                double p = (i == j) ? p_stay : p_switch;
-                s->log_T[i * n_models + j] = log(fmax(p, 1e-30));
-            }
-        }
+        for (int i = 0; i < n_models; i++)
+            for (int j = 0; j < n_models; j++)
+                s->log_T[i * n_models + j] = log(fmax((i == j) ? p_stay : p_switch, 1e-30));
     }
-    
+
     return s;
 }
 
+void gpu_imm_destroy(GpuImmState* s) {
+    if (!s) return;
+    for (int k = 0; k < s->n_models; k++)
+        gpu_bpf_destroy(s->filters[k]);
+    free(s->filters);
+    free(s->log_pi);
+    free(s->log_pi_pred);
+    free(s->log_T);
+    free(s);
+}
+
 // =============================================================================
-// IMM Step
+// IMM Step — all K BPFs launch async, one sync, then mix
 // =============================================================================
 
 ImmResult gpu_imm_step(GpuImmState* s, float y_t) {
     int K = s->n_models;
-    
+
     // ─── 1. Interaction: π_k^- = Σ_j T(j→k) * π_j ───
-    // In log-space: log π_k^- = log Σ_j exp(log T[j][k] + log π_j)
     for (int k = 0; k < K; k++) {
         double terms[IMM_MAX_MODELS];
-        for (int j = 0; j < K; j++) {
+        for (int j = 0; j < K; j++)
             terms[j] = s->log_T[j * K + k] + s->log_pi[j];
-        }
         s->log_pi_pred[k] = log_sum_exp(terms, K);
     }
-    
-    // ─── 2. Run each BPF, collect h_est and log-likelihood ───
+
+    // ─── 2. Launch ALL BPF steps async on their streams ───
+    for (int k = 0; k < K; k++)
+        gpu_bpf_step_async(s->filters[k], y_t);
+
+    // ─── 3. Single sync — wait for all streams ───
+    cudaDeviceSynchronize();
+
+    // ─── 4. Collect results ───
     double log_liks[IMM_MAX_MODELS];
     float h_ests[IMM_MAX_MODELS];
-    
     for (int k = 0; k < K; k++) {
-        BpfResult r = gpu_bpf_step(s->filters[k], y_t);
+        BpfResult r = gpu_bpf_get_result(s->filters[k]);
         h_ests[k] = r.h_mean;
         log_liks[k] = (double)r.log_lik;
     }
-    
-    // ─── 3. Update: log π_k = log π_k^- + log p(y|model_k) - log Z ───
+
+    // ─── 5. Update: log π_k = log π_k^- + log p(y|model_k) - log Z ───
     double log_joint[IMM_MAX_MODELS];
     for (int k = 0; k < K; k++)
         log_joint[k] = s->log_pi_pred[k] + log_liks[k];
-    
+
     double log_Z = log_sum_exp(log_joint, K);
-    
     for (int k = 0; k < K; k++)
         s->log_pi[k] = log_joint[k] - log_Z;
-    
-    // ─── 4. Mixed output ───
-    // h = Σ_k π_k * h_k (in linear probability space)
+
+    // ─── 6. Mixed output ───
     double h_mixed = 0.0;
     int best_k = 0;
     double best_log_pi = -1e30;
-    
     for (int k = 0; k < K; k++) {
         double pi_k = exp(s->log_pi[k]);
         h_mixed += pi_k * (double)h_ests[k];
@@ -354,9 +458,9 @@ ImmResult gpu_imm_step(GpuImmState* s, float y_t) {
             best_k = k;
         }
     }
-    
+
     s->timestep++;
-    
+
     ImmResult r;
     r.h_mean = (float)h_mixed;
     r.vol = expf((float)h_mixed * 0.5f);
@@ -380,22 +484,6 @@ void gpu_imm_get_probs(const GpuImmState* state, float* probs_out) {
         probs_out[k] = (float)exp(state->log_pi[k]);
 }
 
-void gpu_imm_get_model_h(const GpuImmState* state, float* h_out) {
-    // Would need to store last h_ests — add if needed
-    (void)state; (void)h_out;
-}
-
-void gpu_imm_destroy(GpuImmState* s) {
-    if (!s) return;
-    for (int k = 0; k < s->n_models; k++)
-        gpu_bpf_destroy(s->filters[k]);
-    free(s->filters);
-    free(s->log_pi);
-    free(s->log_pi_pred);
-    free(s->log_T);
-    free(s);
-}
-
 // =============================================================================
 // Grid Builder
 // =============================================================================
@@ -410,8 +498,8 @@ ImmModelParams* gpu_imm_build_grid(
     int total = n_rho * n_sigma * n_mu;
     ImmModelParams* grid = (ImmModelParams*)malloc(total * sizeof(ImmModelParams));
     int idx = 0;
-    for (int r = 0; r < n_rho; r++) {
-        for (int s = 0; s < n_sigma; s++) {
+    for (int r = 0; r < n_rho; r++)
+        for (int s = 0; s < n_sigma; s++)
             for (int m = 0; m < n_mu; m++) {
                 grid[idx].rho = rhos[r];
                 grid[idx].sigma_z = sigma_zs[s];
@@ -420,8 +508,6 @@ ImmModelParams* gpu_imm_build_grid(
                 grid[idx].nu_obs = nu_obs;
                 idx++;
             }
-        }
-    }
     *out_n_models = total;
     return grid;
 }

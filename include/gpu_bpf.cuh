@@ -1,15 +1,12 @@
 /**
  * @file gpu_bpf.cuh
- * @brief GPU Bootstrap PF + Interacting Multiple Model filter
+ * @brief GPU Bootstrap PF + IMM with CUDA stream parallelism
  *
- * Layer 1: GpuBpfState  — single-model BPF, N particles, zero heuristics
- * Layer 2: GpuImmState  — K models with Markov switching, each running a BPF
+ * Layer 1: GpuBpfState  — single-model BPF with async step on its own stream
+ * Layer 2: GpuImmState  — K models running concurrently on K streams
  *
- * IMM per tick:
- *   1. Interaction: mix model probabilities via transition matrix
- *   2. Each BPF: propagate, weight, estimate, resample
- *   3. Update: π_k ∝ π_k × p(y_t | model_k)
- *   4. Output: h = Σ_k π_k × h_k,  vol = exp(h/2)
+ * All K BPF steps launch asynchronously, one cudaDeviceSynchronize,
+ * then results are collected. No host-sync thrust calls in the hot path.
  */
 
 #ifndef GPU_BPF_CUH
@@ -24,11 +21,12 @@
 // =============================================================================
 
 typedef struct {
-    float h_mean;       // Posterior mean of h
-    float log_lik;      // Log marginal likelihood p(y_t | y_{1:t-1}, model)
+    float h_mean;
+    float log_lik;
 } BpfResult;
 
 typedef struct {
+    // Particle arrays
     float* d_h;
     float* d_h2;
     float* d_log_w;
@@ -36,20 +34,35 @@ typedef struct {
     float* d_cdf;
     float* d_wh;
     curandState* d_rng;
+
+    // Async result storage (device-side)
+    float* d_scalars;       // [4]: {max_lw, sum_w, h_est, log_lik}
+
+    // Launch config
     int n_particles;
     int block;
     int grid;
+    cudaStream_t stream;
+
+    // Model params
     float rho, sigma_z, mu, nu_state, nu_obs;
+
+    // Host RNG for resampling uniform
     unsigned long long host_rng_state;
     int timestep;
 } GpuBpfState;
 
+// Create / destroy
 GpuBpfState* gpu_bpf_create(int n_particles, float rho, float sigma_z, float mu,
                               float nu_state, float nu_obs, int seed);
+void gpu_bpf_destroy(GpuBpfState* state);
 
+// Synchronous step (launches + waits + returns result)
 BpfResult gpu_bpf_step(GpuBpfState* state, float y_t);
 
-void gpu_bpf_destroy(GpuBpfState* state);
+// Async two-phase API (for IMM parallelism)
+void gpu_bpf_step_async(GpuBpfState* state, float y_t);
+BpfResult gpu_bpf_get_result(GpuBpfState* state);  // call after cudaDeviceSynchronize
 
 // Batch RMSE (for testing)
 double gpu_bpf_run_rmse(
@@ -67,62 +80,41 @@ typedef struct {
     float rho;
     float sigma_z;
     float mu;
-    float nu_state;     // 0 = Gaussian
-    float nu_obs;       // 0 = Gaussian
+    float nu_state;
+    float nu_obs;
 } ImmModelParams;
 
 typedef struct {
-    float h_mean;       // Mixed posterior mean
-    float vol;          // exp(h_mean / 2)
-    float log_lik;      // Mixed log-likelihood
-    int best_model;     // Highest probability model index
-    float best_prob;    // Probability of best model
+    float h_mean;
+    float vol;
+    float log_lik;
+    int best_model;
+    float best_prob;
 } ImmResult;
 
 typedef struct {
-    GpuBpfState** filters;          // K BPF instances
+    GpuBpfState** filters;
     int n_models;
     int n_particles_per_model;
-    
-    // Model probabilities (log-space for stability)
-    double* log_pi;                 // [K] log model probabilities
-    double* log_pi_pred;            // [K] after interaction step
-    
-    // Transition matrix (row-major, log-space)
-    // T[i][j] = log P(model_j at t | model_i at t-1)
-    double* log_T;                  // [K x K]
-    
+    double* log_pi;
+    double* log_pi_pred;
+    double* log_T;              // [K x K] row-major, log-space
     int timestep;
 } GpuImmState;
 
-// Create IMM with K models. transition_matrix is row-major [K x K] probabilities
-// (NOT log — will be converted internally). Pass NULL for uniform transitions.
 GpuImmState* gpu_imm_create(
     const ImmModelParams* models, int n_models,
     int n_particles_per_model,
-    const float* transition_matrix,     // [K x K] or NULL for uniform
+    const float* transition_matrix,     // [K x K] or NULL
     int seed
 );
 
 ImmResult gpu_imm_step(GpuImmState* state, float y_t);
-
-// Get model probability for model k (linear scale)
 float gpu_imm_get_prob(const GpuImmState* state, int k);
-
-// Get all model probabilities
 void gpu_imm_get_probs(const GpuImmState* state, float* probs_out);
-
-// Get per-model h estimates from last step
-void gpu_imm_get_model_h(const GpuImmState* state, float* h_out);
-
 void gpu_imm_destroy(GpuImmState* state);
 
-// =============================================================================
-// Convenience: grid builder
-// =============================================================================
-
-// Build a parameter grid from arrays. Returns allocated ImmModelParams[n_rho * n_sigma * n_mu].
-// Caller must free().
+// Grid builder
 ImmModelParams* gpu_imm_build_grid(
     const float* rhos, int n_rho,
     const float* sigma_zs, int n_sigma,

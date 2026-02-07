@@ -683,8 +683,8 @@ static void print_gold_standard(int n_ticks, int base_seed, int n_particles, int
 
 int main(int argc, char** argv) {
     int n_ticks    = 5000;
-    int n_particles = 128;
-    int n_stein    = 12;
+    int n_particles = 512;
+    int n_stein    = 8;
     int base_seed  = 42;
     
     // Parse optional overrides
