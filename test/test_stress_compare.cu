@@ -467,9 +467,9 @@ int main(int argc, char** argv) {
     // --- Config ---
     int svpf_particles = 512;
     int svpf_stein     = 8;
-    float svpf_nu      = 3.0f;       // observation nu for SVPF
+    float svpf_nu      = 50.0f;       // observation nu for SVPF
     int bpf_particles   = 50000;
-    float bpf_nu_obs    = 5.0f;       // observation nu for BPF/APF
+    float bpf_nu_obs    = 50.0f;       // observation nu for BPF/APF
     int seed            = 42;
 
     // DGP parameters (= filter params for this oracle test)

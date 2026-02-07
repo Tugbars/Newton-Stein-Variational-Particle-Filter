@@ -344,6 +344,25 @@ set_target_properties(test_stress_compare PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
 )
 
+# Profile Multi Stream
+add_executable(test_stress_compare_missmatch test_stress_compare_missmatch.cu)
+
+target_include_directories(test_stress_compare_missmatch
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CUDAToolkit_INCLUDE_DIRS}
+)
+
+target_link_libraries(test_stress_compare_missmatch
+    PRIVATE
+        svpf
+        CUDA::cudart
+        CUDA::curand
+)
+
+set_target_properties(test_stress_compare_missmatch PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+)
 
 
 
