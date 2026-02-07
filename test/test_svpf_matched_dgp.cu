@@ -597,26 +597,33 @@ static void print_gold_standard(int n_ticks, int base_seed, int n_particles, int
     };
     int n_scenarios = sizeof(scenarios) / sizeof(scenarios[0]);
     int bpf_n = 50000;
+    int imm_particles = 10000;  // per model
     
-    printf("\n═══════════════════════════════════════════════════════════════════════════════════════════════════\n");
-    printf("  FULL COMPARISON: SVPF vs CPU-BPF vs GPU-BPF vs EWMA vs GARCH\n");
-    printf("  BPF: %d particles | EWMA: lambda=0.94 | GARCH: grid-best | SVPF: %d particles\n", bpf_n, n_particles);
-    printf("═══════════════════════════════════════════════════════════════════════════════════════════════════\n");
-    printf("  %-22s %7s %8s %8s %7s %7s %7s %9s %9s %9s\n", 
-           "Scenario", "KF bnd", "CPU BPF", "GPU BPF", "EWMA", "GARCH", "SVPF", "CBPF ms", "GBPF ms", "SVPF ms");
-    printf("  ────────────────────── ─────── ──────── ──────── ─────── ─────── ─────── ───────── ───────── ─────────\n");
+    // ─── Build IMM grid (same for all scenarios — doesn't peek at DGP) ───
+    float imm_rhos[]   = {0.90f, 0.95f, 0.97f, 0.99f};
+    float imm_sigmas[] = {0.08f, 0.15f, 0.25f};
+    float imm_mus[]    = {-6.0f, -4.5f, -3.0f};
+    int n_imm_models;
+    ImmModelParams* imm_grid = gpu_imm_build_grid(
+        imm_rhos, 4, imm_sigmas, 3, imm_mus, 3,
+        0.0f, 5.0f,  // Gaussian state, Student-t(5) obs
+        &n_imm_models
+    );
+    
+    printf("\n═══════════════════════════════════════════════════════════════════════════════════════════════════════════\n");
+    printf("  FULL COMPARISON: KF bound vs GPU-BPF(50K) vs IMM-BPF(%d models × %dK) vs SVPF(%d)\n",
+           n_imm_models, imm_particles / 1000, n_particles);
+    printf("═══════════════════════════════════════════════════════════════════════════════════════════════════════════\n");
+    printf("  %-22s %7s %8s %8s %7s %9s %9s %9s %14s\n",
+           "Scenario", "KF bnd", "GPU BPF", "IMM BPF", "SVPF", "BPF ms", "IMM ms", "SVPF ms", "IMM best model");
+    printf("  ────────────────────── ─────── ──────── ──────── ─────── ───────── ───────── ───────── ──────────────\n");
     
     for (int i = 0; i < n_scenarios; i++) {
         MatchedTestData* data = scenarios[i].gen(n_ticks, base_seed + i);
         
         double kf = kalman_steady_state_rmse(data->dgp_rho, data->dgp_sigma_z, data->dgp_nu_obs);
         
-        // CPU BPF
-        double cbpf_t0 = get_time_us();
-        double cbpf = bpf_run_rmse(data, bpf_n, base_seed + 100 + i);
-        double cbpf_ms = (get_time_us() - cbpf_t0) / 1000.0;
-        
-        // GPU BPF
+        // GPU BPF (single model, true params)
         double gbpf_t0 = get_time_us();
         double gbpf = gpu_bpf_run_rmse(data->returns, data->true_h, data->n_ticks,
                                        bpf_n, (float)data->dgp_rho, (float)data->dgp_sigma_z,
@@ -624,20 +631,50 @@ static void print_gold_standard(int n_ticks, int base_seed, int n_particles, int
                                        (float)data->dgp_nu_obs, base_seed + 200 + i);
         double gbpf_ms = (get_time_us() - gbpf_t0) / 1000.0;
         
-        double ew = ewma_rmse(data, 0.94);
-        double ga = garch_best_rmse(data);
+        // IMM-BPF (grid of models, doesn't know true params)
+        double imm_t0 = get_time_us();
+        GpuImmState* imm = gpu_imm_create(imm_grid, n_imm_models, imm_particles,
+                                           NULL, base_seed + 400 + i);
+        int skip = 100;
+        double imm_sum_sq = 0.0;
+        int imm_count = 0;
+        int last_best = 0;
+        float last_best_prob = 0.0f;
         
+        for (int t = 0; t < data->n_ticks; t++) {
+            ImmResult ir = gpu_imm_step(imm, (float)data->returns[t]);
+            if (t >= skip) {
+                double err = (double)ir.h_mean - data->true_h[t];
+                imm_sum_sq += err * err;
+                imm_count++;
+            }
+            last_best = ir.best_model;
+            last_best_prob = ir.best_prob;
+        }
+        double imm_rmse = sqrt(imm_sum_sq / imm_count);
+        double imm_ms = (get_time_us() - imm_t0) / 1000.0;
+        
+        // Decode best model params
+        int best_k = last_best;
+        
+        gpu_imm_destroy(imm);
+        
+        // SVPF
         double svpf_elapsed;
         MatchedMetrics svpf_m = run_matched_scenario(data, n_particles, n_stein,
                                                       base_seed, &svpf_elapsed);
         
-        printf("  %-22s %7.4f %8.4f %8.4f %7.4f %7.4f %7.4f %9.1f %9.1f %9.1f\n",
-               data->scenario_name, kf, cbpf, gbpf, ew, ga, svpf_m.logvol_rmse,
-               cbpf_ms, gbpf_ms, svpf_elapsed);
+        printf("  %-22s %7.4f %8.4f %8.4f %7.4f %9.1f %9.1f %9.1f  [%d] p=%.0f%% r=%.2f s=%.2f m=%.1f\n",
+               data->scenario_name, kf, gbpf, imm_rmse, svpf_m.logvol_rmse,
+               gbpf_ms, imm_ms, svpf_elapsed,
+               best_k, last_best_prob * 100.0f,
+               imm_grid[best_k].rho, imm_grid[best_k].sigma_z, imm_grid[best_k].mu);
         
         free_matched_data(data);
     }
-    printf("═══════════════════════════════════════════════════════════════════════════════════════════════════\n");
+    printf("═══════════════════════════════════════════════════════════════════════════════════════════════════════════\n");
+    
+    free(imm_grid);
 }
 
 // =============================================================================
@@ -646,8 +683,8 @@ static void print_gold_standard(int n_ticks, int base_seed, int n_particles, int
 
 int main(int argc, char** argv) {
     int n_ticks    = 5000;
-    int n_particles = 512;
-    int n_stein    = 8;
+    int n_particles = 128;
+    int n_stein    = 12;
     int base_seed  = 42;
     
     // Parse optional overrides
@@ -665,66 +702,11 @@ int main(int argc, char** argv) {
     printf("═══════════════════════════════════════════════════════════════════════════════\n");
     printf("  SVPF MATCHED-DGP TEST SUITE\n");
     printf("  All scenarios: DGP = SVPF model (zero model mismatch)\n");
-    printf("  Any remaining bias is PURELY from Stein transport\n");
     printf("═══════════════════════════════════════════════════════════════════════════════\n");
-    printf("  Particles: %d | Stein steps: %d | Obs nu: per-scenario | Ticks: %d\n\n",
+    printf("  SVPF: %d particles, %d Stein steps | Ticks: %d\n\n",
            n_particles, n_stein, n_ticks);
     
-    // --- Scenario table ---
-    typedef MatchedTestData* (*GenFn)(int, int);
-    struct { GenFn gen; } scenarios[] = {
-        { gen_matched_baseline },
-        { gen_matched_student_t },
-        { gen_matched_high_persist },
-        { gen_matched_high_volvol },
-        { gen_matched_low_vol },
-        { gen_matched_high_vol },
-        { gen_matched_fast_revert },
-        { gen_matched_gaussian },
-    };
-    int n_scenarios = sizeof(scenarios) / sizeof(scenarios[0]);
-    
-    printf("  %-28s %8s %8s %8s %8s\n", "Scenario", "RMSE", "MAE", "Bias", "ms");
-    printf("  ──────────────────────────── ──────── ──────── ──────── ────────\n");
-    
-    double sum_rmse = 0.0, sum_bias = 0.0;
-    
-    for (int i = 0; i < n_scenarios; i++) {
-        MatchedTestData* data = scenarios[i].gen(n_ticks, base_seed + i);
-        double elapsed;
-        MatchedMetrics m = run_matched_scenario(data, n_particles, n_stein,
-                                                 base_seed, &elapsed);
-        
-        printf("  %-28s %8.4f %8.4f %+8.4f %8.1f\n",
-               data->scenario_name, m.logvol_rmse, m.logvol_mae, m.logvol_bias, elapsed);
-        
-        sum_rmse += m.logvol_rmse;
-        sum_bias += m.logvol_bias;
-        free_matched_data(data);
-    }
-    
-    printf("  ──────────────────────────── ──────── ──────── ────────\n");
-    printf("  %-28s %8.4f %8s %+8.4f\n", "AVERAGE",
-           sum_rmse / n_scenarios, "", sum_bias / n_scenarios);
-    
-    // --- Multi-seed average (reduce sampling noise on bias estimate) ---
-    printf("\n  ── Multi-Seed Average (Student-t Matched, %d seeds) ──\n", 10);
-    int n_seeds = 10;
-    double ms_rmse = 0, ms_mae = 0, ms_bias = 0;
-    for (int s = 0; s < n_seeds; s++) {
-        MatchedTestData* data = gen_matched_student_t(n_ticks, 1000 + s * 137);
-        double elapsed;
-        MatchedMetrics m = run_matched_scenario(data, n_particles, n_stein,
-                                                 2000 + s * 73, &elapsed);
-        ms_rmse += m.logvol_rmse;
-        ms_mae  += m.logvol_mae;
-        ms_bias += m.logvol_bias;
-        free_matched_data(data);
-    }
-    printf("  RMSE: %.4f | MAE: %.4f | Bias: %+.4f\n",
-           ms_rmse / n_seeds, ms_mae / n_seeds, ms_bias / n_seeds);
-    
-    // --- Gold standard comparison ---
+    // --- Gold standard comparison (includes SVPF, GPU BPF, IMM, EWMA, GARCH) ---
     print_gold_standard(n_ticks, base_seed, n_particles, n_stein);
     
     // --- GPU BPF particle sweep (find the knee) ---
