@@ -91,7 +91,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     cudaMalloc(&state->d_return_var, sizeof(float));
     cudaMalloc(&state->d_bw_alpha, sizeof(float));
     float init_ema = 0.0f;
-    float init_alpha = 0.3f;
+    float init_alpha = 0.5f;
     cudaMemcpy(state->d_return_ema, &init_ema, sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(state->d_return_var, &init_ema, sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(state->d_bw_alpha, &init_alpha, sizeof(float), cudaMemcpyHostToDevice);
@@ -115,7 +115,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     // --- MIM (OFF by default — guided prediction supersedes) ---
     state->use_mim = 0;
     state->mim_jump_prob = 0.35f;
-    state->mim_jump_scale = 9.0f;
+    state->mim_jump_scale = 8.2f;
     
     // --- Asymmetric persistence ---
     state->use_asymmetric_rho = 9;
@@ -182,7 +182,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     
     // === Student-t state dynamics ===
     state->use_student_t_state = 1;
-    state->nu_state = 5.0f;
+    state->nu_state = 5.1f;
     
     // === KSD-based Adaptive Stein Steps ===
     state->stein_min_steps = 8;
