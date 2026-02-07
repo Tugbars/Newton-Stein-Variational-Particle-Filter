@@ -91,7 +91,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     cudaMalloc(&state->d_return_var, sizeof(float));
     cudaMalloc(&state->d_bw_alpha, sizeof(float));
     float init_ema = 0.0f;
-    float init_alpha = 0.5f;
+    float init_alpha = 0.4f;  // <-- this is bandwidth EMA alpha, not weight tempering
     cudaMemcpy(state->d_return_ema, &init_ema, sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(state->d_return_var, &init_ema, sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(state->d_bw_alpha, &init_alpha, sizeof(float), cudaMemcpyHostToDevice);
@@ -101,7 +101,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     // =========================================================================
     
     state->use_exact_gradient = 1;
-    state->lik_offset = 0.335f;
+    state->lik_offset = 0.337f;
     
     // --- SVLD + Annealing ---
     state->use_svld = 1;
@@ -182,7 +182,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     
     // === Student-t state dynamics ===
     state->use_student_t_state = 1;
-    state->nu_state = 5.1f;
+    state->nu_state = 3.0f;
     
     // === KSD-based Adaptive Stein Steps ===
     state->stein_min_steps = 8;
@@ -200,7 +200,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     // === Adaptive Annealing (KL-based beta stepping) ===
     state->use_adaptive_anneal = 1;
     state->anneal_kl_threshold = 0.9f;
-    state->anneal_steps_per_beta = 3;
+    state->anneal_steps_per_beta = 5;
     state->anneal_max_stages = 50;
     state->anneal_stages_used = 0;
     state->anneal_final_var_ll = 0.0f;
