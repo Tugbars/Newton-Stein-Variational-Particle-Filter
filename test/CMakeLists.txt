@@ -303,6 +303,26 @@ set_target_properties(test_extreme_crypto_stress PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
 )
 
+# Profile Multi Stream
+add_executable(test_OU_matched test_svpf_matched_dgp.cu)
+
+target_include_directories(test_OU_matched
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CUDAToolkit_INCLUDE_DIRS}
+)
+
+target_link_libraries(test_OU_matched
+    PRIVATE
+        svpf
+        CUDA::cudart
+        CUDA::curand
+)
+
+set_target_properties(test_OU_matched PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+)
+
 
 
 

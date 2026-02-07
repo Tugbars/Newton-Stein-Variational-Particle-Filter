@@ -101,7 +101,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     // =========================================================================
     
     state->use_exact_gradient = 1;
-    state->lik_offset = 0.337f;
+    state->lik_offset = 0.335f;
     
     // --- SVLD + Annealing ---
     state->use_svld = 1;
