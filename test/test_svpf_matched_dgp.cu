@@ -600,16 +600,20 @@ static void print_gold_standard(int n_ticks, int base_seed, int n_particles, int
     printf("  FULL COMPARISON: SVPF vs BPF vs EWMA vs GARCH\n");
     printf("  BPF: %d particles | EWMA: lambda=0.94 | GARCH: grid-best | SVPF: %d particles\n", bpf_n, n_particles);
     printf("═══════════════════════════════════════════════════════════════════════════════\n");
-    printf("  %-24s %8s %8s %8s %8s %8s\n", 
-           "Scenario", "KF bnd", "BPF 50K", "EWMA", "GARCH", "SVPF");
-    printf("  ──────────────────────── ──────── ──────── ──────── ──────── ────────\n");
+    printf("  %-24s %8s %8s %8s %8s %8s %10s %10s\n", 
+           "Scenario", "KF bnd", "BPF 50K", "EWMA", "GARCH", "SVPF", "BPF ms", "SVPF ms");
+    printf("  ──────────────────────── ──────── ──────── ──────── ──────── ──────── ────────── ──────────\n");
     
     // We need SVPF results — re-run with same seeds as main table
     for (int i = 0; i < n_scenarios; i++) {
         MatchedTestData* data = scenarios[i].gen(n_ticks, base_seed + i);
         
         double kf  = kalman_steady_state_rmse(data->dgp_rho, data->dgp_sigma_z, data->dgp_nu_obs);
+        
+        double bpf_t0 = get_time_us();
         double bpf = bpf_run_rmse(data, bpf_n, base_seed + 100 + i);
+        double bpf_ms = (get_time_us() - bpf_t0) / 1000.0;
+        
         double ew  = ewma_rmse(data, 0.94);
         double ga  = garch_best_rmse(data);
         
@@ -618,8 +622,8 @@ static void print_gold_standard(int n_ticks, int base_seed, int n_particles, int
         MatchedMetrics svpf_m = run_matched_scenario(data, n_particles, n_stein,
                                                       base_seed, &svpf_elapsed);
         
-        printf("  %-24s %8.4f %8.4f %8.4f %8.4f %8.4f\n",
-               data->scenario_name, kf, bpf, ew, ga, svpf_m.logvol_rmse);
+        printf("  %-24s %8.4f %8.4f %8.4f %8.4f %8.4f %10.1f %10.1f\n",
+               data->scenario_name, kf, bpf, ew, ga, svpf_m.logvol_rmse, bpf_ms, svpf_elapsed);
         
         free_matched_data(data);
     }
@@ -632,8 +636,8 @@ static void print_gold_standard(int n_ticks, int base_seed, int n_particles, int
 
 int main(int argc, char** argv) {
     int n_ticks    = 5000;
-    int n_particles = 512;
-    int n_stein    = 8;
+    int n_particles = 400;
+    int n_stein    = 7;
     int base_seed  = 42;
     
     // Parse optional overrides
