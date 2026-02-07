@@ -17,11 +17,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-#include <curand_kernel.h>
-#include <thrust/device_ptr.h>
-#include <thrust/reduce.h>
-#include <thrust/scan.h>
-#include <thrust/extrema.h>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -491,175 +486,7 @@ static double bpf_run_rmse(const MatchedTestData* data, int n_pf, int seed) {
     return sqrt(sum_sq / count);
 }
 
-// =============================================================================
-// GPU Bootstrap Particle Filter (50K particles, fully parallel)
-// =============================================================================
-
-__device__ float gpu_bpf_sample_t(curandState* s, float nu) {
-    if (nu <= 0.0f || nu > 100.0f) return curand_normal(s);
-    float z = curand_normal(s);
-    float chi2 = 0.0f;
-    for (int k = 0; k < (int)nu; k++) {
-        float g = curand_normal(s);
-        chi2 += g * g;
-    }
-    return z * rsqrtf(chi2 / nu);
-}
-
-__device__ float gpu_bpf_log_t_pdf(float x, float nu) {
-    return lgammaf((nu + 1.0f) / 2.0f) - lgammaf(nu / 2.0f)
-         - 0.5f * logf(nu * 3.14159265f)
-         - (nu + 1.0f) / 2.0f * logf(1.0f + x * x / nu);
-}
-
-__global__ void gpu_bpf_init_rng(curandState* states, unsigned long long seed, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) curand_init(seed, i, 0, &states[i]);
-}
-
-__global__ void gpu_bpf_init_particles(float* h, curandState* states,
-                                        float mu, float std_stat, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) h[i] = mu + std_stat * curand_normal(&states[i]);
-}
-
-__global__ void gpu_bpf_propagate_weight(
-    float* h, float* log_w, curandState* states,
-    float rho, float sigma_z, float mu,
-    float nu_state, float nu_obs, float y_t,
-    int n, int do_propagate
-) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    
-    if (do_propagate) {
-        float eps = gpu_bpf_sample_t(&states[i], nu_state);
-        h[i] = mu + rho * (h[i] - mu) + sigma_z * eps;
-    }
-    
-    float h_i = h[i];
-    float eta = y_t * __expf(-h_i * 0.5f);
-    log_w[i] = (nu_obs > 0.0f)
-        ? gpu_bpf_log_t_pdf(eta, nu_obs) - h_i * 0.5f
-        : -0.9189385f - 0.5f * eta * eta - h_i * 0.5f;  // log N(0,1)
-}
-
-__global__ void gpu_bpf_exp_sub(float* w, const float* log_w, float max_lw, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) w[i] = __expf(log_w[i] - max_lw);
-}
-
-__global__ void gpu_bpf_scale_and_wh(float* w, float* wh, const float* h,
-                                      float inv_sum, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        w[i] *= inv_sum;
-        wh[i] = w[i] * h[i];
-    }
-}
-
-__global__ void gpu_bpf_resample(float* h_out, const float* h_in,
-                                  const float* cdf, float u_base, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    
-    float target = u_base + (float)i / (float)n;
-    if (target >= 1.0f) target -= 1.0f;
-    
-    int lo = 0, hi = n - 1;
-    while (lo < hi) {
-        int mid = (lo + hi) >> 1;
-        if (cdf[mid] < target) lo = mid + 1;
-        else hi = mid;
-    }
-    h_out[i] = h_in[lo];
-}
-
-static double gpu_bpf_run_rmse(const MatchedTestData* data, int n_pf, int seed) {
-    int n = data->n_ticks;
-    int skip = 100;
-    
-    float rho      = (float)data->dgp_rho;
-    float sigma_z  = (float)data->dgp_sigma_z;
-    float mu       = (float)data->dgp_mu;
-    float nu_state = (float)data->dgp_nu_state;
-    float nu_obs   = (float)data->dgp_nu_obs;
-    
-    float *d_h, *d_h2, *d_log_w, *d_w, *d_cdf, *d_wh;
-    curandState* d_rng;
-    cudaMalloc(&d_h,     n_pf * sizeof(float));
-    cudaMalloc(&d_h2,    n_pf * sizeof(float));
-    cudaMalloc(&d_log_w, n_pf * sizeof(float));
-    cudaMalloc(&d_w,     n_pf * sizeof(float));
-    cudaMalloc(&d_cdf,   n_pf * sizeof(float));
-    cudaMalloc(&d_wh,    n_pf * sizeof(float));
-    cudaMalloc(&d_rng,   n_pf * sizeof(curandState));
-    
-    int block = 256;
-    int grid  = (n_pf + block - 1) / block;
-    
-    gpu_bpf_init_rng<<<grid, block>>>(d_rng, (unsigned long long)seed, n_pf);
-    
-    float std_stat = sqrtf((sigma_z * sigma_z) / fmaxf(1.0f - rho * rho, 1e-6f));
-    gpu_bpf_init_particles<<<grid, block>>>(d_h, d_rng, mu, std_stat, n_pf);
-    
-    thrust::device_ptr<float> t_log_w(d_log_w);
-    thrust::device_ptr<float> t_w(d_w);
-    thrust::device_ptr<float> t_cdf(d_cdf);
-    thrust::device_ptr<float> t_wh(d_wh);
-    
-    pcg32_dgp_t host_rng;
-    pcg32_dgp_seed(&host_rng, seed + 999);
-    
-    float* h_est = (float*)malloc(n * sizeof(float));
-    
-    cudaDeviceSynchronize();  // finish init
-    
-    for (int t = 0; t < n; t++) {
-        float y_t = (float)data->returns[t];
-        
-        gpu_bpf_propagate_weight<<<grid, block>>>(
-            d_h, d_log_w, d_rng,
-            rho, sigma_z, mu, nu_state, nu_obs, y_t,
-            n_pf, (t > 0) ? 1 : 0);
-        
-        float max_lw = *thrust::max_element(t_log_w, t_log_w + n_pf);
-        
-        gpu_bpf_exp_sub<<<grid, block>>>(d_w, d_log_w, max_lw, n_pf);
-        float sum_w = thrust::reduce(t_w, t_w + n_pf, 0.0f);
-        
-        gpu_bpf_scale_and_wh<<<grid, block>>>(d_w, d_wh, d_h, 1.0f / sum_w, n_pf);
-        h_est[t] = thrust::reduce(t_wh, t_wh + n_pf, 0.0f);
-        
-        thrust::inclusive_scan(t_w, t_w + n_pf, t_cdf);
-        
-        float u = (float)pcg32_dgp_double(&host_rng) / (float)n_pf;
-        gpu_bpf_resample<<<grid, block>>>(d_h2, d_h, d_cdf, u, n_pf);
-        
-        float* tmp = d_h; d_h = d_h2; d_h2 = tmp;
-    }
-    
-    cudaDeviceSynchronize();
-    
-    double sum_sq = 0.0;
-    int count = 0;
-    for (int t = skip; t < n; t++) {
-        double err = (double)h_est[t] - data->true_h[t];
-        sum_sq += err * err;
-        count++;
-    }
-    
-    free(h_est);
-    cudaFree(d_h);
-    cudaFree(d_h2);
-    cudaFree(d_log_w);
-    cudaFree(d_w);
-    cudaFree(d_cdf);
-    cudaFree(d_wh);
-    cudaFree(d_rng);
-    
-    return sqrt(sum_sq / count);
-}
+#include "gpu_bpf.cuh"
 
 // =============================================================================
 // Classical Baselines: EWMA + GARCH(1,1)
@@ -791,7 +618,10 @@ static void print_gold_standard(int n_ticks, int base_seed, int n_particles, int
         
         // GPU BPF
         double gbpf_t0 = get_time_us();
-        double gbpf = gpu_bpf_run_rmse(data, bpf_n, base_seed + 200 + i);
+        double gbpf = gpu_bpf_run_rmse(data->returns, data->true_h, data->n_ticks,
+                                       bpf_n, (float)data->dgp_rho, (float)data->dgp_sigma_z,
+                                       (float)data->dgp_mu, (float)data->dgp_nu_state,
+                                       (float)data->dgp_nu_obs, base_seed + 200 + i);
         double gbpf_ms = (get_time_us() - gbpf_t0) / 1000.0;
         
         double ew = ewma_rmse(data, 0.94);
@@ -816,8 +646,8 @@ static void print_gold_standard(int n_ticks, int base_seed, int n_particles, int
 
 int main(int argc, char** argv) {
     int n_ticks    = 5000;
-    int n_particles = 128;
-    int n_stein    = 12;
+    int n_particles = 512;
+    int n_stein    = 8;
     int base_seed  = 42;
     
     // Parse optional overrides
@@ -897,6 +727,32 @@ int main(int argc, char** argv) {
     // --- Gold standard comparison ---
     print_gold_standard(n_ticks, base_seed, n_particles, n_stein);
     
+    // --- GPU BPF particle sweep (find the knee) ---
     printf("\n═══════════════════════════════════════════════════════════════════════════════\n");
+    printf("  GPU BPF PARTICLE SWEEP (Student-t Matched scenario)\n");
+    printf("═══════════════════════════════════════════════════════════════════════════════\n");
+    printf("  %10s %10s %10s %10s\n", "Particles", "RMSE", "Bias", "ms");
+    printf("  ────────── ────────── ────────── ──────────\n");
+    {
+        int counts[] = {500, 1000, 2000, 5000, 10000, 20000, 50000, 100000};
+        int n_counts = sizeof(counts) / sizeof(counts[0]);
+        MatchedTestData* data = gen_matched_student_t(n_ticks, base_seed + 1);
+        
+        for (int c = 0; c < n_counts; c++) {
+            double t0 = get_time_us();
+            double rmse = gpu_bpf_run_rmse(data->returns, data->true_h, data->n_ticks,
+                                           counts[c], (float)data->dgp_rho, (float)data->dgp_sigma_z,
+                                           (float)data->dgp_mu, (float)data->dgp_nu_state,
+                                           (float)data->dgp_nu_obs, base_seed + 300);
+            double ms = (get_time_us() - t0) / 1000.0;
+            
+            // Quick bias calc — run again to get h_est array
+            // (or just show RMSE + timing, bias needs stored estimates)
+            printf("  %10d %10.4f %10s %10.1f\n", counts[c], rmse, "--", ms);
+        }
+        free_matched_data(data);
+    }
+    
+    printf("═══════════════════════════════════════════════════════════════════════════════\n");
     return 0;
 }

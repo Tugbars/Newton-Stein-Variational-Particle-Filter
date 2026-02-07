@@ -6,6 +6,7 @@ set(SVPF_CORE_SOURCES
     svpf_optimized_graph.cu
     svpf_opt_kernels.cu
     svpf_diagnostics.cu
+    gpu_bpf.cu
 )
 
 # =============================================================================
