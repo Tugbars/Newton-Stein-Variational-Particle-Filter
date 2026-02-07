@@ -597,33 +597,22 @@ static void print_gold_standard(int n_ticks, int base_seed, int n_particles, int
     };
     int n_scenarios = sizeof(scenarios) / sizeof(scenarios[0]);
     int bpf_n = 50000;
-    int imm_particles = 10000;  // per model
-    
-    // ─── Build IMM grid (same for all scenarios — doesn't peek at DGP) ───
-    float imm_rhos[]   = {0.90f, 0.95f, 0.97f, 0.99f};
-    float imm_sigmas[] = {0.08f, 0.15f, 0.25f};
-    float imm_mus[]    = {-6.0f, -4.5f, -3.0f};
-    int n_imm_models;
-    ImmModelParams* imm_grid = gpu_imm_build_grid(
-        imm_rhos, 4, imm_sigmas, 3, imm_mus, 3,
-        0.0f, 5.0f,  // Gaussian state, Student-t(5) obs
-        &n_imm_models
-    );
+    int apf_n = 50000;
     
     printf("\n═══════════════════════════════════════════════════════════════════════════════════════════════════════════\n");
-    printf("  FULL COMPARISON: KF bound vs GPU-BPF(50K) vs IMM-BPF(%d models × %dK) vs SVPF(%d)\n",
-           n_imm_models, imm_particles / 1000, n_particles);
+    printf("  FULL COMPARISON: KF bound vs GPU-BPF(%dK) vs GPU-APF(%dK) vs SVPF(%d)\n",
+           bpf_n / 1000, apf_n / 1000, n_particles);
     printf("═══════════════════════════════════════════════════════════════════════════════════════════════════════════\n");
-    printf("  %-22s %7s %8s %8s %7s %9s %9s %9s %14s\n",
-           "Scenario", "KF bnd", "GPU BPF", "IMM BPF", "SVPF", "BPF ms", "IMM ms", "SVPF ms", "IMM best model");
-    printf("  ────────────────────── ─────── ──────── ──────── ─────── ───────── ───────── ───────── ──────────────\n");
+    printf("  %-22s %7s %8s %8s %7s %9s %9s %9s\n",
+           "Scenario", "KF bnd", "BPF 50K", "APF 50K", "SVPF", "BPF ms", "APF ms", "SVPF ms");
+    printf("  ────────────────────── ─────── ──────── ──────── ─────── ───────── ───────── ─────────\n");
     
     for (int i = 0; i < n_scenarios; i++) {
         MatchedTestData* data = scenarios[i].gen(n_ticks, base_seed + i);
         
         double kf = kalman_steady_state_rmse(data->dgp_rho, data->dgp_sigma_z, data->dgp_nu_obs);
         
-        // GPU BPF (single model, true params)
+        // GPU BPF (true params)
         double gbpf_t0 = get_time_us();
         double gbpf = gpu_bpf_run_rmse(data->returns, data->true_h, data->n_ticks,
                                        bpf_n, (float)data->dgp_rho, (float)data->dgp_sigma_z,
@@ -631,50 +620,26 @@ static void print_gold_standard(int n_ticks, int base_seed, int n_particles, int
                                        (float)data->dgp_nu_obs, base_seed + 200 + i);
         double gbpf_ms = (get_time_us() - gbpf_t0) / 1000.0;
         
-        // IMM-BPF (grid of models, doesn't know true params)
-        double imm_t0 = get_time_us();
-        GpuImmState* imm = gpu_imm_create(imm_grid, n_imm_models, imm_particles,
-                                           NULL, base_seed + 400 + i);
-        int skip = 100;
-        double imm_sum_sq = 0.0;
-        int imm_count = 0;
-        int last_best = 0;
-        float last_best_prob = 0.0f;
-        
-        for (int t = 0; t < data->n_ticks; t++) {
-            ImmResult ir = gpu_imm_step(imm, (float)data->returns[t]);
-            if (t >= skip) {
-                double err = (double)ir.h_mean - data->true_h[t];
-                imm_sum_sq += err * err;
-                imm_count++;
-            }
-            last_best = ir.best_model;
-            last_best_prob = ir.best_prob;
-        }
-        double imm_rmse = sqrt(imm_sum_sq / imm_count);
-        double imm_ms = (get_time_us() - imm_t0) / 1000.0;
-        
-        // Decode best model params
-        int best_k = last_best;
-        
-        gpu_imm_destroy(imm);
+        // GPU APF (true params, same particle count)
+        double gapf_t0 = get_time_us();
+        double gapf = gpu_apf_run_rmse(data->returns, data->true_h, data->n_ticks,
+                                       apf_n, (float)data->dgp_rho, (float)data->dgp_sigma_z,
+                                       (float)data->dgp_mu, (float)data->dgp_nu_state,
+                                       (float)data->dgp_nu_obs, base_seed + 300 + i);
+        double gapf_ms = (get_time_us() - gapf_t0) / 1000.0;
         
         // SVPF
         double svpf_elapsed;
         MatchedMetrics svpf_m = run_matched_scenario(data, n_particles, n_stein,
                                                       base_seed, &svpf_elapsed);
         
-        printf("  %-22s %7.4f %8.4f %8.4f %7.4f %9.1f %9.1f %9.1f  [%d] p=%.0f%% r=%.2f s=%.2f m=%.1f\n",
-               data->scenario_name, kf, gbpf, imm_rmse, svpf_m.logvol_rmse,
-               gbpf_ms, imm_ms, svpf_elapsed,
-               best_k, last_best_prob * 100.0f,
-               imm_grid[best_k].rho, imm_grid[best_k].sigma_z, imm_grid[best_k].mu);
+        printf("  %-22s %7.4f %8.4f %8.4f %7.4f %9.1f %9.1f %9.1f\n",
+               data->scenario_name, kf, gbpf, gapf, svpf_m.logvol_rmse,
+               gbpf_ms, gapf_ms, svpf_elapsed);
         
         free_matched_data(data);
     }
     printf("═══════════════════════════════════════════════════════════════════════════════════════════════════════════\n");
-    
-    free(imm_grid);
 }
 
 // =============================================================================
