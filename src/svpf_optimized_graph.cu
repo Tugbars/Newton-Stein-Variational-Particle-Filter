@@ -115,7 +115,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     // NOTE: lik_offset was tuned with repulsion ON. With repulsion disabled,
     // the interaction between likelihood gradient and guided proposal changes.
     // This value likely wants re-tuning (probably lower, toward 0.2).
-    state->lik_offset = 0.325f;
+    state->lik_offset = 0.10f;
     
     // --- SVLD + Annealing ---
     state->use_svld = 1;
@@ -189,7 +189,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     
     // === Student-t state dynamics ===
     state->use_student_t_state = 1;
-    state->nu_state = 2.0f;
+    state->nu_state = 5.0f;
     
     // === KSD tracking (ksd_prev drives rejuvenation trigger) ===
     state->ksd_prev = 1e10f;
@@ -204,7 +204,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     // === Adaptive Annealing (KL-based beta stepping) ===
     state->use_adaptive_anneal = 1;
     state->anneal_kl_threshold = 0.9f;
-    state->anneal_steps_per_beta = 5;
+    state->anneal_steps_per_beta = 3;
     state->anneal_max_stages = 50;
     state->anneal_stages_used = 0;
     state->anneal_final_var_ll = 0.0f;

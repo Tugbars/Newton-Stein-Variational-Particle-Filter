@@ -342,7 +342,7 @@ __global__ void svpf_fused_gradient_kernel(
         inv_hessian[j] = curvature;
         
         float inv_H = 1.0f / curvature;
-        precond_grad[j] = 0.7f * g * inv_H;
+        precond_grad[j] = 0.95f * g * inv_H;
     }
 }
 
@@ -425,7 +425,7 @@ __global__ void svpf_fused_stein_transport_full_newton_kernel(
     H_weighted = fminf(fmaxf(H_weighted, 0.1f), 100.0f);
     float inv_H_i = 1.0f / H_weighted;
     
-    float phi_i = (k_grad_sum + gk_sum) * inv_n * inv_H_i * 0.7f;
+    float phi_i = (k_grad_sum + gk_sum) * inv_n * inv_H_i * 0.95f;
     
     float v_prev = v_rmsprop[i];
     float v_new = rho_rmsprop * v_prev + (1.0f - rho_rmsprop) * phi_i * phi_i;
@@ -538,7 +538,7 @@ __global__ void svpf_fused_stein_transport_full_newton_ksd_kernel(
     H_weighted = fminf(fmaxf(H_weighted, 0.1f), 100.0f);
     float inv_H_i = 1.0f / H_weighted;
     
-    float phi_i = (k_grad_sum + gk_sum) * inv_n * inv_H_i * 0.7f;
+    float phi_i = (k_grad_sum + gk_sum) * inv_n * inv_H_i * 0.95f;
     
     float v_prev = v_rmsprop[i];
     float v_new = rho_rmsprop * v_prev + (1.0f - rho_rmsprop) * phi_i * phi_i;
