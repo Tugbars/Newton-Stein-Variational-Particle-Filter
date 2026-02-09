@@ -47,13 +47,17 @@ void svpf_optimized_init(SVPFOptimizedState* opt, int n);
 // =============================================================================
 
 SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_t stream) {
+    // NOTE: n_stein_steps is kept in signature for API compatibility but is unused.
+    // Actual iteration count is controlled by adaptive annealing:
+    //   total_steps = n_stages (from KL heuristic) × anneal_steps_per_beta (fixed 4)
+    (void)n_stein_steps;
+    
     SVPFState* state = (SVPFState*)malloc(sizeof(SVPFState));
     if (!state) return NULL;
     
     memset(&state->opt_backend, 0, sizeof(SVPFOptimizedState));
     
     state->n_particles = n_particles;
-    state->n_stein_steps = n_stein_steps;
     state->nu = nu;
     state->stream = stream ? stream : 0;
     state->timestep = 0;
@@ -111,14 +115,14 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     // NOTE: lik_offset was tuned with repulsion ON. With repulsion disabled,
     // the interaction between likelihood gradient and guided proposal changes.
     // This value likely wants re-tuning (probably lower, toward 0.2).
-    state->lik_offset = 0.400f;
+    state->lik_offset = 0.325f;
     
     // --- SVLD + Annealing ---
     state->use_svld = 1;
     state->use_annealing = 1;
     state->use_adaptive_beta = 1;   // KSD-adaptive beta (Maken 2022)
     state->n_anneal_steps = 5;
-    state->temperature = 0.42f;
+    state->temperature = 0.45f;
     state->rmsprop_rho = 0.7f;
     state->rmsprop_eps = 1e-6f;
     
@@ -126,11 +130,6 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     state->use_mim = 0;
     state->mim_jump_prob = 0.25f;
     state->mim_jump_scale = 8.2f;
-    
-    // --- Asymmetric persistence ---
-    state->use_asymmetric_rho = 0;
-    state->rho_up = 0.98f;
-    state->rho_down = 0.93f;
     
     // --- EKF Guide density ---
     state->use_guide = 1;
@@ -149,7 +148,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     state->vol_prev = 0.05f;
     
     // --- Partial rejuvenation (Maken 2022) ---
-    state->use_rejuvenation = 0;
+    state->use_rejuvenation = 1;
     state->rejuv_ksd_threshold = 0.05f;  // Trigger threshold
     state->rejuv_prob = 0.30f;           // 30% of particles
     state->rejuv_blend = 0.30f;          // 30% blend factor
@@ -179,7 +178,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     state->mu_max = -1.0f;
     
     // --- Adaptive sigma (volatility-of-volatility boost) ---
-    state->use_adaptive_sigma = 1;
+    state->use_adaptive_sigma = 0;
     state->sigma_boost_threshold = 0.95f;  // Start boosting when |z| > ~1
     state->sigma_boost_max = 3.2f;         // Max 3.2× boost
     state->sigma_z_effective = 0.10f;
@@ -198,12 +197,9 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     state->use_student_t_state = 1;
     state->nu_state = 2.0f;
     
-    // === KSD-based Adaptive Stein Steps ===
-    state->stein_min_steps = 32;
-    state->stein_max_steps = 32;
-    state->ksd_improvement_threshold = 0.05f;
+    // === KSD tracking (ksd_prev drives rejuvenation trigger) ===
     state->ksd_prev = 1e10f;
-    state->stein_steps_used = n_stein_steps;
+    state->stein_steps_used = 0;
     
     // === Heun's Method (OFF) ===
     state->use_heun = 0;
@@ -233,7 +229,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     
     // === Persistent kernel ===
     state->use_persistent_kernel = 1;
-
+    
     // Device scalars
     cudaMalloc(&state->d_scalar_max, sizeof(float));
     cudaMalloc(&state->d_scalar_sum, sizeof(float));
@@ -356,7 +352,7 @@ void svpf_initialize(SVPFState* state, const SVPFParams* params, unsigned long l
     
     // Reset KSD tracking
     state->ksd_prev = 1e10f;
-    state->stein_steps_used = state->n_stein_steps;
+    state->stein_steps_used = 0;
     
     cudaMemset(state->d_grad_v, 0, n * sizeof(float));
     
@@ -582,8 +578,7 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
     size_t grad_smem = 2 * n * sizeof(float);
     size_t stein_smem = 3 * n * sizeof(float);  // Full Newton always uses 3× shared
     
-    float rho_up = state->use_asymmetric_rho ? state->rho_up : params->rho;
-    float rho_down = state->use_asymmetric_rho ? state->rho_down : params->rho;
+    float rho_symmetric = params->rho;
     float delta_rho = state->use_local_params ? state->delta_rho : 0.0f;
     float delta_sigma = state->use_local_params ? state->delta_sigma : 0.0f;
     
@@ -599,7 +594,7 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
         svpf_predict_guided_antithetic_kernel<<<nb_half, BLOCK_SIZE, 0, cs>>>(
             state->h, state->h_prev, state->rng_states,
             opt->d_y_single, opt->d_h_mean_prev, 1,
-            rho_up, rho_down, effective_sigma_z, effective_mu, params->gamma,
+            rho_symmetric, rho_symmetric, effective_sigma_z, effective_mu, params->gamma,
             state->mim_jump_prob, state->mim_jump_scale,
             delta_rho, delta_sigma,
             state->guided_alpha_base, state->guided_alpha_shock,

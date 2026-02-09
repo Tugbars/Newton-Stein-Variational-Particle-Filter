@@ -47,13 +47,17 @@ void svpf_optimized_init(SVPFOptimizedState* opt, int n);
 // =============================================================================
 
 SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_t stream) {
+    // NOTE: n_stein_steps is kept in signature for API compatibility but is unused.
+    // Actual iteration count is controlled by adaptive annealing:
+    //   total_steps = n_stages (from KL heuristic) × anneal_steps_per_beta (fixed 4)
+    (void)n_stein_steps;
+    
     SVPFState* state = (SVPFState*)malloc(sizeof(SVPFState));
     if (!state) return NULL;
     
     memset(&state->opt_backend, 0, sizeof(SVPFOptimizedState));
     
     state->n_particles = n_particles;
-    state->n_stein_steps = n_stein_steps;
     state->nu = nu;
     state->stream = stream ? stream : 0;
     state->timestep = 0;
@@ -127,11 +131,6 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     state->mim_jump_prob = 0.25f;
     state->mim_jump_scale = 8.2f;
     
-    // --- Asymmetric persistence ---
-    state->use_asymmetric_rho = 0;
-    state->rho_up = 0.98f;
-    state->rho_down = 0.93f;
-    
     // --- EKF Guide density ---
     state->use_guide = 1;
     state->use_guide_preserving = 1;  // Variance-preserving shift (not contraction)
@@ -198,12 +197,9 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     state->use_student_t_state = 1;
     state->nu_state = 2.0f;
     
-    // === KSD-based Adaptive Stein Steps ===
-    state->stein_min_steps = 8;
-    state->stein_max_steps = 8;
-    state->ksd_improvement_threshold = 0.05f;
+    // === KSD tracking (ksd_prev drives rejuvenation trigger) ===
     state->ksd_prev = 1e10f;
-    state->stein_steps_used = n_stein_steps;
+    state->stein_steps_used = 0;
     
     // === Heun's Method (OFF) ===
     state->use_heun = 0;
@@ -356,7 +352,7 @@ void svpf_initialize(SVPFState* state, const SVPFParams* params, unsigned long l
     
     // Reset KSD tracking
     state->ksd_prev = 1e10f;
-    state->stein_steps_used = state->n_stein_steps;
+    state->stein_steps_used = 0;
     
     cudaMemset(state->d_grad_v, 0, n * sizeof(float));
     
@@ -582,8 +578,7 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
     size_t grad_smem = 2 * n * sizeof(float);
     size_t stein_smem = 3 * n * sizeof(float);  // Full Newton always uses 3× shared
     
-    float rho_up = state->use_asymmetric_rho ? state->rho_up : params->rho;
-    float rho_down = state->use_asymmetric_rho ? state->rho_down : params->rho;
+    float rho_symmetric = params->rho;
     float delta_rho = state->use_local_params ? state->delta_rho : 0.0f;
     float delta_sigma = state->use_local_params ? state->delta_sigma : 0.0f;
     
@@ -599,7 +594,7 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
         svpf_predict_guided_antithetic_kernel<<<nb_half, BLOCK_SIZE, 0, cs>>>(
             state->h, state->h_prev, state->rng_states,
             opt->d_y_single, opt->d_h_mean_prev, 1,
-            rho_up, rho_down, effective_sigma_z, effective_mu, params->gamma,
+            rho_symmetric, rho_symmetric, effective_sigma_z, effective_mu, params->gamma,
             state->mim_jump_prob, state->mim_jump_scale,
             delta_rho, delta_sigma,
             state->guided_alpha_base, state->guided_alpha_shock,
