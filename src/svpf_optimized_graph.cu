@@ -120,9 +120,8 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     // --- SVLD + Annealing ---
     state->use_svld = 1;
     state->use_annealing = 1;
-    state->use_adaptive_beta = 0;   // KSD-adaptive beta (Maken 2022)
     state->n_anneal_steps = 5;
-    state->temperature = 0.45f;
+    state->temperature = 0.42f;
     state->rmsprop_rho = 0.7f;
     state->rmsprop_eps = 1e-6f;
     
@@ -162,11 +161,6 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     state->guided_alpha_base = 0.0f;             // 0% when model fits
     state->guided_alpha_shock = 0.40f;            // 40% when model fails
     state->guided_innovation_threshold = 1.5f;    // 1.5σ = "surprised"
-    
-    // --- Local parameter perturbation ---
-    state->use_local_params = 0;
-    state->delta_rho = 0.02f;
-    state->delta_sigma = 0.1f;
     
     // --- Adaptive mu (Kalman drift) ---
     state->use_adaptive_mu = 1;
@@ -578,10 +572,6 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
     size_t grad_smem = 2 * n * sizeof(float);
     size_t stein_smem = 3 * n * sizeof(float);  // Full Newton always uses 3× shared
     
-    float rho_symmetric = params->rho;
-    float delta_rho = state->use_local_params ? state->delta_rho : 0.0f;
-    float delta_sigma = state->use_local_params ? state->delta_sigma : 0.0f;
-    
     // Upload y values
     float y_arr[2] = {y_prev, y_t};
     cudaMemcpyAsync(opt->d_y_single, y_arr, 2 * sizeof(float), cudaMemcpyHostToDevice, cs);
@@ -593,10 +583,10 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
         int nb_half = ((n / 2) + BLOCK_SIZE - 1) / BLOCK_SIZE;
         svpf_predict_guided_antithetic_kernel<<<nb_half, BLOCK_SIZE, 0, cs>>>(
             state->h, state->h_prev, state->rng_states,
-            opt->d_y_single, opt->d_h_mean_prev, 1,
-            rho_symmetric, rho_symmetric, effective_sigma_z, effective_mu, params->gamma,
+            opt->d_y_single, 1,
+            params->rho,
+            effective_sigma_z, effective_mu, params->gamma,
             state->mim_jump_prob, state->mim_jump_scale,
-            delta_rho, delta_sigma,
             state->guided_alpha_base, state->guided_alpha_shock,
             state->guided_innovation_threshold,
             state->student_t_implied_offset,

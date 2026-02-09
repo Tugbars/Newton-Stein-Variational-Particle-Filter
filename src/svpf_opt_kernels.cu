@@ -68,12 +68,10 @@ __global__ void svpf_predict_guided_antithetic_kernel(
     float* __restrict__ h_prev,
     curandStatePhilox4_32_10_t* __restrict__ rng,
     const float* __restrict__ d_y,
-    const float* __restrict__ d_h_mean,
     int t,
-    float rho_up, float rho_down,
+    float rho,
     float sigma_z, float mu, float gamma,
     float jump_prob, float jump_scale,
-    float delta_rho, float delta_sigma,
     float alpha_base, float alpha_shock,
     float innovation_threshold,
     float implied_offset,
@@ -96,8 +94,6 @@ __global__ void svpf_predict_guided_antithetic_kernel(
     h_prev[i] = h_i;
     h_prev[j] = h_j;
     
-    float h_bar = *d_h_mean;
-    
     // Generate ONE random sample, use +z and -z
     float z;
     if (use_student_t_state) {
@@ -112,13 +108,7 @@ __global__ void svpf_predict_guided_antithetic_kernel(
     
     // Process particle i (with +z)
     {
-        float dev = h_i - h_bar;
-        float rho_adjust = delta_rho * tanhf(dev);
-        float sigma_scale = 1.0f + delta_sigma * fabsf(dev);
         
-        float base_rho = (h_i > h_prev_i) ? rho_up : rho_down;
-        float rho = fminf(fmaxf(base_rho + rho_adjust, 0.0f), 0.999f);
-        float sigma_local = sigma_z * sigma_scale;
         
         float y_prev = (t > 0) ? d_y[t - 1] : 0.0f;
         float vol_prev = safe_exp(h_i / 2.0f);
@@ -140,18 +130,12 @@ __global__ void svpf_predict_guided_antithetic_kernel(
         float guided_alpha = alpha_base + (alpha_shock - alpha_base) * activation;
         float mean_proposal = (1.0f - guided_alpha) * mean_prior + guided_alpha * mean_implied;
         
-        h[i] = clamp_logvol(mean_proposal + sigma_local * scale * z);  // +z
+        h[i] = clamp_logvol(mean_proposal + sigma_z * scale * z);  // +z
     }
     
     // Process particle j (with -z)
     {
-        float dev = h_j - h_bar;
-        float rho_adjust = delta_rho * tanhf(dev);
-        float sigma_scale = 1.0f + delta_sigma * fabsf(dev);
         
-        float base_rho = (h_j > h_prev_j) ? rho_up : rho_down;
-        float rho = fminf(fmaxf(base_rho + rho_adjust, 0.0f), 0.999f);
-        float sigma_local = sigma_z * sigma_scale;
         
         float y_prev = (t > 0) ? d_y[t - 1] : 0.0f;
         float vol_prev = safe_exp(h_j / 2.0f);
@@ -173,7 +157,7 @@ __global__ void svpf_predict_guided_antithetic_kernel(
         float guided_alpha = alpha_base + (alpha_shock - alpha_base) * activation;
         float mean_proposal = (1.0f - guided_alpha) * mean_prior + guided_alpha * mean_implied;
         
-        h[j] = clamp_logvol(mean_proposal + sigma_local * scale * (-z));  // -z
+        h[j] = clamp_logvol(mean_proposal + sigma_z * scale * (-z));  // -z
     }
 }
 
