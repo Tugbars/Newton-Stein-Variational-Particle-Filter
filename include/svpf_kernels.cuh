@@ -94,6 +94,37 @@ __global__ void svpf_fused_gradient_kernel(
     int n
 );
 
+
+// ============================================================================
+// DESIGN NOTES — Split-Batch SVGD
+// ============================================================================
+//
+// Problem (Ba et al. ICLR 2022):
+//   Standard SVGD's S1 term uses the SAME particles to evaluate the score
+//   and to define the transport field. This creates deterministic bias --
+//   each particle influences its own update through the kernel-weighted average.
+//   With repulsion off, our update is PURE S1, so this is the dominant bias source.
+//
+// Solution:
+//   Even/odd split -- particle i only sees opposite-parity particles as references.
+//   No particle ever contributes to its own gradient field. Complete decoupling
+//   of "who defines the field" from "who gets updated by it."
+//
+// Implementation:
+//   Non-KSD kernel: inner loop strides by 2, starting at opposite parity.
+//     Cost: O(N * N/2) -- half the original inner loop.
+//   KSD kernel: single loop over all N, with is_ref branch for transport.
+//     KSD diagnostic must see all pairs for accurate measurement.
+//     Cost: O(N^2) same as before (KSD only runs on last iteration).
+//
+// Normalization:
+//   phi_i scaled by 1/n_ref (N/2) not 1/N, since reference set is half-sized.
+//   Kernel-weighted Hessian average uses K_sum_norm from reference set only.
+//
+// Config:
+//   state->use_split_batch = 1;  // Enable (default)
+//   state->use_split_batch = 0;  // Disable (revert to standard SVGD)
+
 // =============================================================================
 // Fused Stein + Transport Kernels (Full Newton only)
 // =============================================================================
@@ -106,9 +137,13 @@ __global__ void svpf_fused_stein_transport_full_newton_kernel(
     float* __restrict__ v_rmsprop,
     curandStatePhilox4_32_10_t* __restrict__ rng,
     const float* __restrict__ d_bandwidth,
-    float step_size, float beta_factor, float temperature,
-    float rho_rmsprop, float epsilon,
+    float step_size,
+    float beta_factor,
+    float temperature,
+    float rho_rmsprop,
+    float epsilon,
     int stein_sign_mode,
+    int use_split_batch,   // NEW: 1 = even/odd split, 0 = all particles
     int n
 );
 
@@ -121,9 +156,13 @@ __global__ void svpf_fused_stein_transport_full_newton_ksd_kernel(
     curandStatePhilox4_32_10_t* __restrict__ rng,
     const float* __restrict__ d_bandwidth,
     float* __restrict__ d_ksd_partial,
-    float step_size, float beta_factor, float temperature,
-    float rho_rmsprop, float epsilon,
+    float step_size,
+    float beta_factor,
+    float temperature,
+    float rho_rmsprop,
+    float epsilon,
     int stein_sign_mode,
+    int use_split_batch,   // NEW: 1 = even/odd split, 0 = all particles
     int n
 );
 

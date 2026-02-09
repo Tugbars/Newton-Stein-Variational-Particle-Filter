@@ -112,9 +112,6 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     // =========================================================================
     
     state->use_exact_gradient = 1;
-    // NOTE: lik_offset was tuned with repulsion ON. With repulsion disabled,
-    // the interaction between likelihood gradient and guided proposal changes.
-    // This value likely wants re-tuning (probably lower, toward 0.1).
     state->lik_offset = 0.20f;
     
     // --- SVLD + Annealing ---
@@ -221,6 +218,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     
     // === Persistent kernel ===
     state->use_persistent_kernel = 1;
+    state->use_split_batch = 1;  // Enable (default)
     
     // Device scalars
     cudaMalloc(&state->d_scalar_max, sizeof(float));
@@ -726,7 +724,7 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
                     state->d_grad_v, state->rng_states, opt->d_bandwidth,
                     opt->d_ksd_partial,
                     base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps,
-                    state->stein_repulsive_sign, n
+                    state->stein_repulsive_sign, state->use_split_batch, n
                 );
                 
                 svpf_ksd_reduce_kernel<<<1, BLOCK_SIZE, 0, cs>>>(
@@ -737,7 +735,7 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
                     state->h, state->grad_log_p, opt->d_inv_hessian,
                     state->d_grad_v, state->rng_states, opt->d_bandwidth,
                     base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps,
-                    state->stein_repulsive_sign, n
+                    state->stein_repulsive_sign, state->use_split_batch, n
                 );
             }
         }

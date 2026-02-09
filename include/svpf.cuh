@@ -357,6 +357,8 @@ typedef struct {
     // --- Optimized backend (embedded for thread safety) ---
     SVPFOptimizedState opt_backend;
 
+    int use_split_batch;    // 1 = even/odd split-batch SVGD, 0 = standard (all 
+
 } SVPFState;
 
 /**

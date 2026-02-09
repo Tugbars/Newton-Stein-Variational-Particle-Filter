@@ -365,6 +365,7 @@ __global__ void svpf_fused_stein_transport_full_newton_kernel(
     float rho_rmsprop,
     float epsilon,
     int stein_sign_mode,
+    int use_split_batch,
     int n
 ) {
     extern __shared__ float smem[];
@@ -386,7 +387,13 @@ __global__ void svpf_fused_stein_transport_full_newton_kernel(
     float global_bw = *d_bandwidth;
     float bw_sq = global_bw * global_bw;
     float inv_bw_sq = 1.0f / bw_sq;
-    float inv_n = 1.0f / (float)n;
+    
+    // Leave-one-out: skip j == i to break direct self-interaction in S1.
+    // Particle i cannot vote on its own update through the kernel-weighted average.
+    // Breaks the most direct circular dependency (Ba et al. 2022) without
+    // splitting the cloud into adversarial groups.
+    int n_ref = use_split_batch ? (n - 1) : n;
+    float inv_n_ref = 1.0f / (float)n_ref;
     
     // stein_sign_mode: 0 = no repulsion, 1 = positive (default SVGD), -1 = negative
     const bool use_repulsion = (stein_sign_mode != 0);
@@ -405,6 +412,11 @@ __global__ void svpf_fused_stein_transport_full_newton_kernel(
         float base = 1.0f + dist_sq;
         float K = 1.0f / base;
         float K_sq = K * K;
+        
+        // Leave-one-out: zero self-contribution (branchless)
+        float mask = use_split_batch ? (float)(j != i) : 1.0f;
+        K *= mask;
+        K_sq *= mask;
         
         // Kernel-smoothed target Hessian (Nk kernel geometry term removed —
         // it inflates curvature near clusters via inter-particle distances,
@@ -425,7 +437,7 @@ __global__ void svpf_fused_stein_transport_full_newton_kernel(
     H_weighted = fminf(fmaxf(H_weighted, 0.1f), 100.0f);
     float inv_H_i = 1.0f / H_weighted;
     
-    float phi_i = (k_grad_sum + gk_sum) * inv_n * inv_H_i * 0.95f;
+    float phi_i = (k_grad_sum + gk_sum) * inv_n_ref * inv_H_i * 0.95f;
     
     float v_prev = v_rmsprop[i];
     float v_new = rho_rmsprop * v_prev + (1.0f - rho_rmsprop) * phi_i * phi_i;
@@ -464,6 +476,7 @@ __global__ void svpf_fused_stein_transport_full_newton_ksd_kernel(
     float rho_rmsprop,
     float epsilon,
     int stein_sign_mode,
+    int use_split_batch,
     int n
 ) {
     extern __shared__ float smem[];
@@ -486,7 +499,10 @@ __global__ void svpf_fused_stein_transport_full_newton_ksd_kernel(
     float global_bw = *d_bandwidth;
     float bw_sq = global_bw * global_bw;
     float inv_bw_sq = 1.0f / bw_sq;
-    float inv_n = 1.0f / (float)n;
+    
+    // Leave-one-out setup (same as non-KSD variant)
+    int n_ref = use_split_batch ? (n - 1) : n;
+    float inv_n_ref = 1.0f / (float)n_ref;
     
     // stein_sign_mode: 0 = no repulsion, 1 = positive (default SVGD), -1 = negative
     const bool use_repulsion = (stein_sign_mode != 0);
@@ -498,6 +514,7 @@ __global__ void svpf_fused_stein_transport_full_newton_ksd_kernel(
     float gk_sum = 0.0f;
     float ksd_sum = 0.0f;
     
+    // Single loop over ALL particles — KSD uses all, transport skips j==i
     #pragma unroll 4
     for (int j = 0; j < n; j++) {
         float h_j = sh_h[j];
@@ -510,24 +527,23 @@ __global__ void svpf_fused_stein_transport_full_newton_ksd_kernel(
         float K = 1.0f / base;
         float K_sq = K * K;
         
-        // ----- Kernel-smoothed target Hessian (Nk removed) -----
-        H_weighted += sh_hess[j] * K;
-        K_sum_norm += K;
-        
-        // Attractive: kernel-smoothed score (always on)
-        k_grad_sum += K * s_j;
-        
-        // Repulsive: kernel gradient (disabled when stein_sign_mode == 0)
-        if (use_repulsion) {
-            gk_sum += sign_mult * 2.0f * diff * inv_bw_sq * K_sq;
-        }
-        
-        // ----- KSD Stein kernel (independent of repulsion setting) -----
+        // ----- KSD Stein kernel (always all particles) -----
         float grad_x_k = -2.0f * diff * inv_bw_sq * K_sq;
         float grad_y_k = -grad_x_k;
         float hess_xy_k = 2.0f * inv_bw_sq * K_sq * (4.0f * dist_sq * K - 1.0f);
         float u_ij = K * s_i * s_j + s_i * grad_y_k + s_j * grad_x_k + hess_xy_k;
         ksd_sum += u_ij;
+        
+        // ----- Transport: leave-one-out (branchless mask) -----
+        float mask = use_split_batch ? (float)(j != i) : 1.0f;
+        float K_masked = K * mask;
+        
+        H_weighted += sh_hess[j] * K_masked;
+        K_sum_norm += K_masked;
+        k_grad_sum += K_masked * s_j;
+        if (use_repulsion) {
+            gk_sum += sign_mult * 2.0f * diff * inv_bw_sq * K_sq * mask;
+        }
     }
     
     // Store partial KSD sum
@@ -538,7 +554,7 @@ __global__ void svpf_fused_stein_transport_full_newton_ksd_kernel(
     H_weighted = fminf(fmaxf(H_weighted, 0.1f), 100.0f);
     float inv_H_i = 1.0f / H_weighted;
     
-    float phi_i = (k_grad_sum + gk_sum) * inv_n * inv_H_i * 0.95f;
+    float phi_i = (k_grad_sum + gk_sum) * inv_n_ref * inv_H_i * 0.95f;
     
     float v_prev = v_rmsprop[i];
     float v_new = rho_rmsprop * v_prev + (1.0f - rho_rmsprop) * phi_i * phi_i;
