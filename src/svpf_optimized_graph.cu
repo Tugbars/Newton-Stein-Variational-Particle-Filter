@@ -182,7 +182,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     
     // === Student-t state dynamics ===
     state->use_student_t_state = 1;
-    state->nu_state = 3.0f;
+    state->nu_state = 2.0f;
     
     // === KSD-based Adaptive Stein Steps ===
     state->stein_min_steps = 8;
@@ -200,7 +200,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     // === Adaptive Annealing (KL-based beta stepping) ===
     state->use_adaptive_anneal = 1;
     state->anneal_kl_threshold = 0.9f;
-    state->anneal_steps_per_beta = 5;
+    state->anneal_steps_per_beta = 4;
     state->anneal_max_stages = 50;
     state->anneal_stages_used = 0;
     state->anneal_final_var_ll = 0.0f;

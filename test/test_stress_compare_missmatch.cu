@@ -443,7 +443,7 @@ static void run_ms(const ScenarioData& sc, const MisspecConfig& wrong,
 // =============================================================================
 
 int main(int argc, char** argv) {
-    int sp = 512, ss = 8; float snu = 50.0f;   // Gaussian DGP → high nu
+    int sp = 512, ss = 32; float snu = 50.0f;   // Gaussian DGP → high nu
     int bp = 50000;        float bnu = 50.0f;
     int seed = 42;
 
