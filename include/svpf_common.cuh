@@ -35,6 +35,21 @@
 #define SVPF_H_MAX 5.0f
 #endif
 
+// Add to svpf_kernels.cuh alongside existing sign mode constants:
+//
+// Existing:
+//   #define SVPF_STEIN_SIGN_DEFAULT  1   // Standard SVGD: positive repulsion
+//   #define SVPF_STEIN_SIGN_FLIP    -1   // Negative repulsion (experimental)
+//
+// Add:
+#define SVPF_STEIN_SIGN_NONE     0   // No repulsion: kernel-smoothed score ascent only
+//
+// When stein_sign_mode == 0, the transport kernels skip gk_sum accumulation entirely.
+// KSD diagnostic is unaffected (computed independently in the Stein kernel).
+//
+// To restore original SVGD behavior:
+//   state->stein_repulsive_sign = SVPF_STEIN_SIGN_DEFAULT;
+
 // =============================================================================
 // Math Helpers
 // =============================================================================

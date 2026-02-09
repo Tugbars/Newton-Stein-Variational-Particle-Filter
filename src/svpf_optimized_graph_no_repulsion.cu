@@ -111,14 +111,14 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     // NOTE: lik_offset was tuned with repulsion ON. With repulsion disabled,
     // the interaction between likelihood gradient and guided proposal changes.
     // This value likely wants re-tuning (probably lower, toward 0.2).
-    state->lik_offset = 0.400f;
+    state->lik_offset = 0.325f;
     
     // --- SVLD + Annealing ---
     state->use_svld = 1;
     state->use_annealing = 1;
     state->use_adaptive_beta = 1;   // KSD-adaptive beta (Maken 2022)
     state->n_anneal_steps = 5;
-    state->temperature = 0.42f;
+    state->temperature = 0.45f;
     state->rmsprop_rho = 0.7f;
     state->rmsprop_eps = 1e-6f;
     
@@ -149,7 +149,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     state->vol_prev = 0.05f;
     
     // --- Partial rejuvenation (Maken 2022) ---
-    state->use_rejuvenation = 0;
+    state->use_rejuvenation = 1;
     state->rejuv_ksd_threshold = 0.05f;  // Trigger threshold
     state->rejuv_prob = 0.30f;           // 30% of particles
     state->rejuv_blend = 0.30f;          // 30% blend factor
@@ -199,8 +199,8 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     state->nu_state = 2.0f;
     
     // === KSD-based Adaptive Stein Steps ===
-    state->stein_min_steps = 32;
-    state->stein_max_steps = 32;
+    state->stein_min_steps = 8;
+    state->stein_max_steps = 8;
     state->ksd_improvement_threshold = 0.05f;
     state->ksd_prev = 1e10f;
     state->stein_steps_used = n_stein_steps;
@@ -214,7 +214,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     // === Adaptive Annealing (KL-based beta stepping) ===
     state->use_adaptive_anneal = 1;
     state->anneal_kl_threshold = 0.9f;
-    state->anneal_steps_per_beta = 5;
+    state->anneal_steps_per_beta = 4;
     state->anneal_max_stages = 50;
     state->anneal_stages_used = 0;
     state->anneal_final_var_ll = 0.0f;
@@ -233,7 +233,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     
     // === Persistent kernel ===
     state->use_persistent_kernel = 1;
-
+    
     // Device scalars
     cudaMalloc(&state->d_scalar_max, sizeof(float));
     cudaMalloc(&state->d_scalar_sum, sizeof(float));
