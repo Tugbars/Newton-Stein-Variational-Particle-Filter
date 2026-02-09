@@ -115,12 +115,10 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     // NOTE: lik_offset was tuned with repulsion ON. With repulsion disabled,
     // the interaction between likelihood gradient and guided proposal changes.
     // This value likely wants re-tuning (probably lower, toward 0.1).
-    state->lik_offset = 0.08f;
+    state->lik_offset = 0.20f;
     
     // --- SVLD + Annealing ---
     state->use_svld = 1;
-    state->use_annealing = 0;
-    state->n_anneal_steps = 3;
     state->temperature = 0.45f;
     state->rmsprop_rho = 0.7f;
     state->rmsprop_eps = 1e-6f;
@@ -131,13 +129,13 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     state->mim_jump_scale = 8.2f;
     
     // --- EKF Guide density ---
-    state->use_guide = 0;
-    state->use_guide_preserving = 0;  // Variance-preserving shift (not contraction)
+    state->use_guide = 1;
+    state->use_guide_preserving = 1;  // Variance-preserving shift (not contraction)
     state->guide_strength = 0.05f;
     state->guide_mean = 0.0f;
     state->guide_var = 0.0f;
     state->guide_K = 0.0f;
-    state->guide_initialized = 0;
+    state->guide_initialized = 1;
     
     // --- Adaptive guide (innovation-gated strength) ---
     state->use_adaptive_guide = 1;
