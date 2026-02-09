@@ -114,13 +114,13 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     state->use_exact_gradient = 1;
     // NOTE: lik_offset was tuned with repulsion ON. With repulsion disabled,
     // the interaction between likelihood gradient and guided proposal changes.
-    // This value likely wants re-tuning (probably lower, toward 0.2).
-    state->lik_offset = 0.10f;
+    // This value likely wants re-tuning (probably lower, toward 0.1).
+    state->lik_offset = 0.08f;
     
     // --- SVLD + Annealing ---
     state->use_svld = 1;
-    state->use_annealing = 1;
-    state->n_anneal_steps = 5;
+    state->use_annealing = 0;
+    state->n_anneal_steps = 3;
     state->temperature = 0.45f;
     state->rmsprop_rho = 0.7f;
     state->rmsprop_eps = 1e-6f;
@@ -131,13 +131,13 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     state->mim_jump_scale = 8.2f;
     
     // --- EKF Guide density ---
-    state->use_guide = 1;
-    state->use_guide_preserving = 1;  // Variance-preserving shift (not contraction)
+    state->use_guide = 0;
+    state->use_guide_preserving = 0;  // Variance-preserving shift (not contraction)
     state->guide_strength = 0.05f;
     state->guide_mean = 0.0f;
     state->guide_var = 0.0f;
     state->guide_K = 0.0f;
-    state->guide_initialized = 1;
+    state->guide_initialized = 0;
     
     // --- Adaptive guide (innovation-gated strength) ---
     state->use_adaptive_guide = 1;
@@ -189,7 +189,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     
     // === Student-t state dynamics ===
     state->use_student_t_state = 1;
-    state->nu_state = 5.0f;
+    state->nu_state = 2.0f;
     
     // === KSD tracking (ksd_prev drives rejuvenation trigger) ===
     state->ksd_prev = 1e10f;
@@ -204,7 +204,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     // === Adaptive Annealing (KL-based beta stepping) ===
     state->use_adaptive_anneal = 1;
     state->anneal_kl_threshold = 0.9f;
-    state->anneal_steps_per_beta = 3;
+    state->anneal_steps_per_beta = 5;
     state->anneal_max_stages = 50;
     state->anneal_stages_used = 0;
     state->anneal_final_var_ll = 0.0f;
