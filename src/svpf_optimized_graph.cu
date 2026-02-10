@@ -116,7 +116,6 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     
     // --- SVLD + Annealing ---
     state->use_svld = 1;
-
     state->temperature = 0.45f;
     state->rmsprop_rho = 0.7f;
     state->rmsprop_eps = 1e-6f;
@@ -559,11 +558,6 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
         state->sigma_z_effective = effective_sigma_z;
     }
     
-    // Precompute constants
-    float student_t_const = lgammaf((state->nu + 1.0f) / 2.0f)
-                          - lgammaf(state->nu / 2.0f)
-                          - 0.5f * logf((float)M_PI * state->nu);
-    
     int nb = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
     size_t grad_smem = 2 * n * sizeof(float);
     size_t stein_smem = 3 * n * sizeof(float);  // Full Newton: h, grad, hess
@@ -652,9 +646,8 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
         opt->d_y_single, 
         opt->d_anneal_stats,
         1, params->rho, effective_sigma_z, effective_mu,
-        0.0f, state->nu, student_t_const, state->lik_offset,
+        state->nu, state->lik_offset,
         params->gamma, state->use_exact_gradient, state->use_newton,
-        state->use_fan_mode,
         state->use_student_t_state, state->nu_state,
         n
     );

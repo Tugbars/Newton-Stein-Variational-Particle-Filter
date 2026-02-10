@@ -6,6 +6,9 @@
  * Stats are reduced in-register using warp shuffles, then atomic-added to global.
  * 
  * Saves: 1 kernel launch + 1 global memory round-trip per timestep
+ * 
+ * Fan mode always on: uniform weights (log_w = 0), full posterior gradient,
+ * no beta tempering (annealing via step-size scaling in transport kernel).
  */
 
 #ifndef SVPF_FUSED_GRADIENT_STATS_CUH
@@ -53,19 +56,16 @@ __global__ void svpf_fused_gradient_stats_kernel(
     float* __restrict__ precond_grad,
     float* __restrict__ inv_hessian,
     const float* __restrict__ d_y,
-    float* __restrict__ d_stats,      // NEW: [4] output for stats (must be zeroed)
+    float* __restrict__ d_stats,      // [4] output for stats (must be zeroed)
     int y_idx,
     float rho,
     float sigma_z,
     float mu,
-    float beta,
     float nu,
-    float student_t_const,
     float lik_offset,
     float gamma,
     bool use_exact_gradient,
     bool use_newton,
-    bool use_fan_mode,
     int use_student_t_state,
     float nu_state,
     int n
@@ -177,13 +177,9 @@ __global__ void svpf_fused_gradient_stats_kernel(
         float A = scaled_y_sq / nu;
         float one_plus_A = 1.0f + A;
         
-        if (use_fan_mode) {
-            log_w_j = 0.0f;
-        } else {
-            log_w_j = student_t_const - 0.5f * h_j
-                    - (nu + 1.0f) * 0.5f * log1pf(fmaxf(A, -0.999f));
-        }
-        log_w[j] = log_w_j;
+        // Fan mode: uniform weights
+        log_w_j = 0.0f;
+        log_w[j] = 0.0f;
         
         float grad_lik;
         if (use_exact_gradient) {
@@ -196,8 +192,8 @@ __global__ void svpf_fused_gradient_stats_kernel(
         }
         
         // ===== COMBINE =====
-        float effective_beta = use_fan_mode ? 1.0f : beta;
-        g = grad_prior + effective_beta * grad_lik;
+        // Full posterior score: ∇log prior + ∇log likelihood
+        g = grad_prior + grad_lik;
         g = fminf(fmaxf(g, -10.0f), 10.0f);
         grad_combined[j] = g;
         
@@ -208,7 +204,7 @@ __global__ void svpf_fused_gradient_stats_kernel(
             curvature = fminf(fmaxf(curvature, 0.1f), 100.0f);
             inv_hessian[j] = curvature;
             float inv_H = 1.0f / curvature;
-            precond_grad[j] = 0.7f * g * inv_H;
+            precond_grad[j] = 0.95f * g * inv_H;
         }
         
         // ===== ACCUMULATE STATS (in registers) =====
