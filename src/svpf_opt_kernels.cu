@@ -200,14 +200,11 @@ __global__ void svpf_fused_gradient_kernel(
     float rho,
     float sigma_z,
     float mu,
-    float beta,
     float nu,
-    float student_t_const,
     float lik_offset,
     float gamma,
     bool use_exact_gradient,
     bool use_newton,
-    bool use_fan_mode,
     int use_student_t_state,
     float nu_state,
     int n
@@ -309,12 +306,8 @@ __global__ void svpf_fused_gradient_kernel(
     float A = scaled_y_sq / nu;
     float one_plus_A = 1.0f + A;
     
-    if (use_fan_mode) {
-        log_w[j] = 0.0f;
-    } else {
-        log_w[j] = student_t_const - 0.5f * h_j
-                 - (nu + 1.0f) * 0.5f * log1pf(fmaxf(A, -0.999f));
-    }
+    // Fan mode: uniform weights (no importance weighting)
+    log_w[j] = 0.0f;
     
     float grad_lik;
     if (use_exact_gradient) {
@@ -327,8 +320,9 @@ __global__ void svpf_fused_gradient_kernel(
     }
     
     // ===== COMBINE =====
-    float effective_beta = use_fan_mode ? 1.0f : beta;
-    float g = grad_prior + effective_beta * grad_lik;
+    // Full posterior score: ∇log p(h|y) = ∇log prior + ∇log likelihood
+    // Annealing is via step-size scaling (beta_factor in transport), not gradient tempering
+    float g = grad_prior + grad_lik;
     g = fminf(fmaxf(g, -10.0f), 10.0f);
     grad_combined[j] = g;
     
@@ -390,8 +384,8 @@ __global__ void svpf_fused_stein_transport_full_newton_kernel(
     
     // Leave-one-out: skip j == i to break direct self-interaction in S1.
     // Particle i cannot vote on its own update through the kernel-weighted average.
-    // Breaks the most direct circular dependency (Ba et al. 2022) without
-    // splitting the cloud into adversarial groups.
+    // Removes the strongest circular dependency (Ba et al. 2022) — the self-kernel
+    // term K(h_i, h_i) = 1 is the maximum-weight contributor.
     int n_ref = use_split_batch ? (n - 1) : n;
     float inv_n_ref = 1.0f / (float)n_ref;
     
@@ -418,9 +412,7 @@ __global__ void svpf_fused_stein_transport_full_newton_kernel(
         K *= mask;
         K_sq *= mask;
         
-        // Kernel-smoothed target Hessian (Nk kernel geometry term removed —
-        // it inflates curvature near clusters via inter-particle distances,
-        // creating circular dependency similar to repulsion)
+        // Kernel-smoothed target Hessian (Nk kernel geometry term removed)
         H_weighted += sh_hess[j] * K;
         K_sum_norm += K;
         
@@ -500,7 +492,7 @@ __global__ void svpf_fused_stein_transport_full_newton_ksd_kernel(
     float bw_sq = global_bw * global_bw;
     float inv_bw_sq = 1.0f / bw_sq;
     
-    // Leave-one-out setup (same as non-KSD variant)
+    // Leave-one-out (same as non-KSD variant)
     int n_ref = use_split_batch ? (n - 1) : n;
     float inv_n_ref = 1.0f / (float)n_ref;
     
@@ -514,7 +506,7 @@ __global__ void svpf_fused_stein_transport_full_newton_ksd_kernel(
     float gk_sum = 0.0f;
     float ksd_sum = 0.0f;
     
-    // Single loop over ALL particles — KSD uses all, transport skips j==i
+    // Single loop over ALL particles — KSD uses all, transport uses LOO mask
     #pragma unroll 4
     for (int j = 0; j < n; j++) {
         float h_j = sh_h[j];
@@ -527,14 +519,14 @@ __global__ void svpf_fused_stein_transport_full_newton_ksd_kernel(
         float K = 1.0f / base;
         float K_sq = K * K;
         
-        // ----- KSD Stein kernel (always all particles) -----
+        // ----- KSD Stein kernel (always all particles, unmasked) -----
         float grad_x_k = -2.0f * diff * inv_bw_sq * K_sq;
         float grad_y_k = -grad_x_k;
         float hess_xy_k = 2.0f * inv_bw_sq * K_sq * (4.0f * dist_sq * K - 1.0f);
         float u_ij = K * s_i * s_j + s_i * grad_y_k + s_j * grad_x_k + hess_xy_k;
         ksd_sum += u_ij;
         
-        // ----- Transport: leave-one-out (branchless mask) -----
+        // ----- Transport: leave-one-out (branchless) -----
         float mask = use_split_batch ? (float)(j != i) : 1.0f;
         float K_masked = K * mask;
         

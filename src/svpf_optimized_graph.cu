@@ -112,10 +112,11 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     // =========================================================================
     
     state->use_exact_gradient = 1;
-    state->lik_offset = 0.20f;
+    state->lik_offset = 0.09f;
     
     // --- SVLD + Annealing ---
     state->use_svld = 1;
+
     state->temperature = 0.45f;
     state->rmsprop_rho = 0.7f;
     state->rmsprop_eps = 1e-6f;
@@ -184,7 +185,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     
     // === Student-t state dynamics ===
     state->use_student_t_state = 1;
-    state->nu_state = 2.0f;
+    state->nu_state = 6.0f;
     
     // === KSD tracking (ksd_prev drives rejuvenation trigger) ===
     state->ksd_prev = 1e10f;
@@ -199,7 +200,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     // === Adaptive Annealing (KL-based beta stepping) ===
     state->use_adaptive_anneal = 1;
     state->anneal_kl_threshold = 0.9f;
-    state->anneal_steps_per_beta = 5;
+    state->anneal_steps_per_beta = 3;
     state->anneal_max_stages = 50;
     state->anneal_stages_used = 0;
     state->anneal_final_var_ll = 0.0f;
@@ -218,7 +219,6 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     
     // === Persistent kernel ===
     state->use_persistent_kernel = 1;
-    state->use_split_batch = 1;  // Enable (default)
     
     // Device scalars
     cudaMalloc(&state->d_scalar_max, sizeof(float));
@@ -566,7 +566,7 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
     
     int nb = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
     size_t grad_smem = 2 * n * sizeof(float);
-    size_t stein_smem = 3 * n * sizeof(float);  // Full Newton always uses 3× shared
+    size_t stein_smem = 3 * n * sizeof(float);  // Full Newton: h, grad, hess
     
     // Upload y values
     float y_arr[2] = {y_prev, y_t};
@@ -710,9 +710,8 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
                 state->h, state->h_prev, state->grad_log_p, state->log_weights,
                 opt->d_precond_grad, opt->d_inv_hessian,
                 opt->d_y_single, 1, params->rho, effective_sigma_z, effective_mu,
-                beta, state->nu, student_t_const, state->lik_offset,
+                state->nu, state->lik_offset,
                 params->gamma, state->use_exact_gradient, state->use_newton,
-                state->use_fan_mode,
                 state->use_student_t_state, state->nu_state,
                 n
             );
