@@ -168,7 +168,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     state->use_fan_mode = 1;
     
     // === Student-t state dynamics ===
-    state->use_student_t_state = 1;
+    state->use_student_t_state = 0;
     state->nu_state = 6.0f;
     
     // === KSD tracking (ksd_prev drives rejuvenation trigger) ===
