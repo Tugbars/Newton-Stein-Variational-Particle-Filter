@@ -129,8 +129,6 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     state->guide_innovation_threshold = 1.0f; // Z-score to start boosting
     state->vol_prev = 0.05f;
     
-    // --- Partial rejuvenation (REMOVED — conditional launch broke graph capture) ---
-    state->use_rejuvenation = 0;
     
     // --- Newton-Stein (Hessian preconditioning) ---
     state->use_newton = 1;
