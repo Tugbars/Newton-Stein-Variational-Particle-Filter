@@ -1,29 +1,19 @@
 /**
  * @file svpf_optimized_graph.cu
- * @brief Consolidated SVPF Implementation with Fixed-Schedule Stein Transport
+ * @brief Consolidated SVPF Implementation with Fixed Beta Schedule
  * 
  * Single implementation file containing:
  * - State management (svpf_create/destroy/initialize)
- * - Basic utility kernels
- * - Stein loop with fixed linear beta schedule (graph-capturable)
+ * - Fixed linear beta schedule (no mid-step D2H sync)
  * - Public API (svpf_step_graph, svpf_step_adaptive, svpf_run_sequence)
  * - Diagnostics (svpf_get_particles, svpf_get_stats, svpf_get_ess)
  * 
- * KSD (Kernel Stein Discrepancy) is computed on the final Stein iteration
- * in the same O(N²) pass as transport at zero extra cost.
- * 
- * REFACTORED: Removed adaptive annealing (eliminated mid-kernel D2H sync).
- * Stein iterations now use a fixed linear beta ramp:
- *   total_steps = anneal_n_stages_fixed × anneal_steps_per_beta
- * Configure before launch. Entire pipeline is fully async and graph-capturable.
- * 
- * REMOVED: Partial rejuvenation (conditional launch broke graph capture).
- * 
- * CHANGE: Repulsion disabled by default (stein_repulsive_sign = SVPF_STEIN_SIGN_NONE).
- *         SVPF v6 experiments showed repulsion is harmful in sequential filtering.
+ * PIPELINE: predict → guide → bandwidth → [gradient → stein] × N → outputs
+ * Fully async — single D2H at end, no mid-pipeline syncs.
  */
 
 #include "svpf_kernels.cuh"
+#include "svpf_fused_gradient_stats.cuh"  // Fused gradient + stats kernel
 
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
@@ -411,6 +401,10 @@ void svpf_optimized_init(SVPFOptimizedState* opt, int n) {
     
     cudaMallocHost(&opt->h_results_pinned, 4 * sizeof(float));
     
+    // === Adaptive Annealing Buffers ===
+    cudaMalloc(&opt->d_anneal_stats, 4 * sizeof(float));
+    cudaMallocHost(&opt->h_anneal_stats_pinned, 4 * sizeof(float));
+    
     opt->allocated_n = n;
     opt->initialized = true;
 }
@@ -450,6 +444,16 @@ static void svpf_optimized_cleanup(SVPFOptimizedState* opt) {
     if (opt->h_results_pinned) {
         cudaFreeHost(opt->h_results_pinned);
         opt->h_results_pinned = nullptr;
+    }
+    
+    // === Adaptive Annealing Buffers ===
+    if (opt->d_anneal_stats) {
+        cudaFree(opt->d_anneal_stats);
+        opt->d_anneal_stats = nullptr;
+    }
+    if (opt->h_anneal_stats_pinned) {
+        cudaFreeHost(opt->h_anneal_stats_pinned);
+        opt->h_anneal_stats_pinned = nullptr;
     }
     
     if (opt->graph_captured) {
@@ -509,7 +513,7 @@ static void svpf_adaptive_mu_update(
 // =============================================================================
 // ASYNC STEP: Launch all GPU work, return immediately
 // =============================================================================
-// Fixed linear beta schedule, fully async, graph-capturable.
+// Fixed linear beta schedule, fully async, no mid-step syncs.
 // Pre-configure: state->anneal_n_stages_fixed, state->anneal_steps_per_beta
 // Pipeline: predict → guide → bandwidth → [gradient → stein] × N → outputs
 
@@ -538,7 +542,8 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
         state->sigma_z_effective = effective_sigma_z;
     }
     
-    int nb = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    int nb = (n + SVPF_BLOCK_SIZE - 1) / SVPF_BLOCK_SIZE;
+    int nb_stein = (n + SVPF_STEIN_BLOCK_SIZE - 1) / SVPF_STEIN_BLOCK_SIZE;
     size_t grad_smem = 2 * n * sizeof(float);
     size_t stein_smem = 3 * n * sizeof(float);
     
@@ -547,11 +552,11 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
     cudaMemcpyAsync(opt->d_y_single, y_arr, 2 * sizeof(float), cudaMemcpyHostToDevice, cs);
     
     // =========================================================================
-    // PREDICT (Antithetic guided)
+    // PREDICT (Antithetic guided) — O(N), use standard block size
     // =========================================================================
     {
-        int nb_half = ((n / 2) + BLOCK_SIZE - 1) / BLOCK_SIZE;
-        svpf_predict_guided_antithetic_kernel<<<nb_half, BLOCK_SIZE, 0, cs>>>(
+        int nb_half = ((n / 2) + SVPF_BLOCK_SIZE - 1) / SVPF_BLOCK_SIZE;
+        svpf_predict_guided_antithetic_kernel<<<nb_half, SVPF_BLOCK_SIZE, 0, cs>>>(
             state->h, state->h_prev, state->rng_states,
             opt->d_y_single, 1,
             params->rho,
@@ -566,7 +571,7 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
     }
 
     // =========================================================================
-    // GUIDE (Variance-preserving)
+    // GUIDE (Variance-preserving) — O(N), use standard block size
     // =========================================================================
     float current_guide_strength = state->guide_strength_base;
     
@@ -592,21 +597,21 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
         }
         svpf_ekf_update(state, y_t, &guide_params);
         
-        svpf_apply_guide_preserving_kernel<<<nb, BLOCK_SIZE, 0, cs>>>(
+        svpf_apply_guide_preserving_kernel<<<nb, SVPF_BLOCK_SIZE, 0, cs>>>(
             state->h, opt->d_h_mean_prev, state->guide_mean, current_guide_strength, n
         );
     }
     
     // =========================================================================
-    // BANDWIDTH
+    // BANDWIDTH — single block reduction
     // =========================================================================
-    svpf_fused_bandwidth_kernel<<<1, BLOCK_SIZE, 0, cs>>>(
+    svpf_fused_bandwidth_kernel<<<1, SVPF_BLOCK_SIZE, 0, cs>>>(
         state->h, opt->d_y_single, opt->d_bandwidth, opt->d_bandwidth_sq,
         state->d_return_ema, state->d_return_var, 1, 0.3f, 0.05f, n
     );
     
     // =========================================================================
-    // STEIN ITERATIONS (Fixed linear beta schedule, NO D2H sync)
+    // STEIN ITERATIONS — O(N²), use SVPF_STEIN_BLOCK_SIZE for parallelism
     // =========================================================================
     
     int n_stages = state->anneal_n_stages_fixed;
@@ -624,8 +629,8 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
             total_steps++;
             bool is_last = (stage == n_stages - 1) && (s == steps_per_beta - 1);
             
-            // Gradient (prior + likelihood + hessian)
-            svpf_fused_gradient_kernel<<<nb, BLOCK_SIZE, grad_smem, cs>>>(
+            // Gradient — O(N²): each thread reads all N particles
+            svpf_fused_gradient_kernel<<<nb_stein, SVPF_STEIN_BLOCK_SIZE, grad_smem, cs>>>(
                 state->h, state->h_prev, state->grad_log_p, state->log_weights,
                 opt->d_precond_grad, opt->d_inv_hessian,
                 opt->d_y_single, 1, params->rho, effective_sigma_z, effective_mu,
@@ -635,9 +640,9 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
                 n
             );
             
-            // Stein transport (+KSD on last iteration only)
+            // Stein transport — O(N²): each thread iterates over all N particles
             if (is_last) {
-                svpf_fused_stein_transport_full_newton_ksd_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
+                svpf_fused_stein_transport_full_newton_ksd_kernel<<<nb_stein, SVPF_STEIN_BLOCK_SIZE, stein_smem, cs>>>(
                     state->h, state->grad_log_p, opt->d_inv_hessian,
                     state->d_grad_v, state->rng_states, opt->d_bandwidth,
                     opt->d_ksd_partial,
@@ -645,11 +650,12 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
                     state->stein_repulsive_sign, state->use_split_batch, n
                 );
                 
-                svpf_ksd_reduce_kernel<<<1, BLOCK_SIZE, 0, cs>>>(
+                // KSD reduce — single block reduction
+                svpf_ksd_reduce_kernel<<<1, SVPF_BLOCK_SIZE, 0, cs>>>(
                     opt->d_ksd_partial, opt->d_ksd, n
                 );
             } else {
-                svpf_fused_stein_transport_full_newton_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
+                svpf_fused_stein_transport_full_newton_kernel<<<nb_stein, SVPF_STEIN_BLOCK_SIZE, stein_smem, cs>>>(
                     state->h, state->grad_log_p, opt->d_inv_hessian,
                     state->d_grad_v, state->rng_states, opt->d_bandwidth,
                     base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps,
@@ -664,9 +670,9 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
     state->stein_steps_used = total_steps;
     
     // =========================================================================
-    // OUTPUTS (single async D2H — no sync until svpf_sync_outputs)
+    // OUTPUTS — single block reduction
     // =========================================================================
-    svpf_fused_outputs_kernel<<<1, BLOCK_SIZE, 0, cs>>>(
+    svpf_fused_outputs_kernel<<<1, SVPF_BLOCK_SIZE, 0, cs>>>(
         state->h, state->log_weights,
         opt->d_bandwidth, opt->d_ksd,
         opt->d_loglik_single, opt->d_vol_single, opt->d_h_mean_prev,

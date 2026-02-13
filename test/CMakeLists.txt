@@ -364,5 +364,40 @@ set_target_properties(test_stress_compare_missmatch PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
 )
 
+# Profile Multi Stream
+add_executable(test_svpf_param_injection svpf_test_param_injection.cu)
 
+target_include_directories(test_svpf_param_injection
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CUDAToolkit_INCLUDE_DIRS}
+)
 
+target_link_libraries(test_svpf_param_injection
+    PRIVATE
+        svpf
+        CUDA::cudart
+        CUDA::curand
+)
+
+set_target_properties(test_svpf_param_injection PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+)
+
+# Block Size Sweep Benchmark
+add_executable(bench_blocksize bench_blocksize.cu)
+
+target_include_directories(bench_blocksize
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CUDAToolkit_INCLUDE_DIRS}
+)
+
+target_link_libraries(bench_blocksize
+    PRIVATE
+        CUDA::cudart
+)
+
+set_target_properties(bench_blocksize PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+)

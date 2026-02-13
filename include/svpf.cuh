@@ -51,10 +51,11 @@ extern "C" {
 #define SVPF_BANDWIDTH_MAX         10.0f
 #define SVPF_H_MIN                 -15.0f
 #define SVPF_H_MAX                 5.0f
-#define SVPF_BLOCK_SIZE            256
-#define SVPF_SMALL_N_THRESHOLD     4096   // Threshold for persistent CTA path
-#define SVPF_GRAPH_PARAMS_SIZE     32     // Floats in graph parameter staging buffer
-#define SVPF_SMOOTH_MAX_LAG        8      // Max backward smoothing window
+#define SVPF_BLOCK_SIZE            256     // Cheap kernels (bandwidth, outputs, KSD reduce)
+#define SVPF_STEIN_BLOCK_SIZE      128     // O(N²) kernels (gradient, Stein transport)
+#define SVPF_SMALL_N_THRESHOLD     4096    // Threshold for persistent CTA path
+#define SVPF_GRAPH_PARAMS_SIZE     32      // Floats in graph parameter staging buffer
+#define SVPF_SMOOTH_MAX_LAG        8       // Max backward smoothing window
 
 // Stein sign: 0=legacy(attraction), 1=paper(repulsion, Fan et al. 2021)
 #define SVPF_STEIN_SIGN_LEGACY  0
@@ -169,16 +170,8 @@ typedef struct {
     // Capacity
     int allocated_n;               // Allocated particle count
     bool initialized;              // Whether backend is initialized
-
-    // Per-tick parameter staging for CUDA graph capture
-void*  d_tick_params;       // Device: SVPFTickParams (32 bytes)
-void*  h_tick_pinned;       // Host pinned: SVPFTickParams (32 bytes)
-void*  h_y_pinned;          // Host pinned: float[2] (y_prev, y_t)
-
-// Graph invalidation tracking
-int    graph_n_stages;      // Captured anneal_n_stages_fixed
-int    graph_steps_per_beta; // Captured anneal_steps_per_beta
 } SVPFOptimizedState;
+
 
 /**
  * @brief SV model parameters
@@ -366,9 +359,9 @@ typedef struct {
     // --- Optimized backend (embedded for thread safety) ---
     SVPFOptimizedState opt_backend;
 
-    int use_split_batch;    // 1 = even/odd split-batch SVGD, 0 = standard (all 
+    int use_split_batch;       // 1 = even/odd split-batch SVGD, 0 = standard
 
-    int anneal_n_stages_fixed;    // Fixed beta stage count (default 4)
+    int anneal_n_stages_fixed; // Fixed beta stage count (default 4)
 
 } SVPFState;
 

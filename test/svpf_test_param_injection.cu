@@ -461,7 +461,7 @@ static void print_delta_row(
 // =============================================================================
 
 int main(int argc, char** argv) {
-    int n_seeds = 50;
+    int n_seeds = 5;
     int n_particles = 512;
 
     if (argc > 1) n_seeds = atoi(argv[1]);

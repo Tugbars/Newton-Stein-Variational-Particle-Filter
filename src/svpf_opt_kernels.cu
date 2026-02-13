@@ -12,8 +12,6 @@
  * REMOVED: svpf_partial_rejuvenation_kernel (conditional launch broke graph capture)
  * 
  * CHANGE: stein_sign_mode == 0 disables repulsive kernel gradient entirely.
- *         Only kernel-smoothed score ascent (attractive term) is computed.
- *         See: SVPF v6 experiments — repulsion is harmful in sequential filtering.
  */
 
 #include "svpf_kernels.cuh"
@@ -22,7 +20,7 @@
 #include <stdio.h>
 
 // =============================================================================
-// Basic Utility Kernels (definitions)
+// Basic Utility Kernels
 // =============================================================================
 
 __global__ void svpf_init_rng_kernel(
@@ -58,12 +56,10 @@ __global__ void svpf_copy_kernel(const float* src, float* dst, int n) {
 }
 
 // =============================================================================
-// ANTITHETIC SAMPLING VERSION
+// ANTITHETIC PREDICT
 // =============================================================================
-// Each thread handles TWO particles: i and i + n/2
-// They share the same z, but particle i+n/2 uses -z
-// This halves variance of expectations over the transition distribution.
-// Launch with n/2 threads!
+// Each thread handles TWO particles: i and i + n/2, sharing +z / -z.
+// Launch with n/2 threads.
 
 __global__ void svpf_predict_guided_antithetic_kernel(
     float* __restrict__ h,
@@ -84,19 +80,14 @@ __global__ void svpf_predict_guided_antithetic_kernel(
     int half_n = n / 2;
     if (i >= half_n) return;
     
-    int j = i + half_n;  // Antithetic partner
+    int j = i + half_n;
     
-    // Load both particles
     float h_i = h[i];
     float h_j = h[j];
-    float h_prev_i = h_prev[i];
-    float h_prev_j = h_prev[j];
     
-    // Save to h_prev
     h_prev[i] = h_i;
     h_prev[j] = h_j;
     
-    // Generate ONE random sample, use +z and -z
     float z;
     if (use_student_t_state) {
         z = sample_student_t(&rng[i], nu_state);
@@ -104,14 +95,11 @@ __global__ void svpf_predict_guided_antithetic_kernel(
         z = curand_normal(&rng[i]);
     }
     
-    // MIM jump: same decision for both (they'll go opposite directions)
     float selector = curand_uniform(&rng[i]);
     float scale = (selector < jump_prob) ? jump_scale : 1.0f;
     
-    // Process particle i (with +z)
+    // Particle i (+z)
     {
-        
-        
         float y_prev = (t > 0) ? d_y[t - 1] : 0.0f;
         float vol_prev = safe_exp(h_i / 2.0f);
         float leverage = gamma * y_prev / (vol_prev + 1e-8f);
@@ -132,13 +120,11 @@ __global__ void svpf_predict_guided_antithetic_kernel(
         float guided_alpha = alpha_base + (alpha_shock - alpha_base) * activation;
         float mean_proposal = (1.0f - guided_alpha) * mean_prior + guided_alpha * mean_implied;
         
-        h[i] = clamp_logvol(mean_proposal + sigma_z * scale * z);  // +z
+        h[i] = clamp_logvol(mean_proposal + sigma_z * scale * z);
     }
     
-    // Process particle j (with -z)
+    // Particle j (-z)
     {
-        
-        
         float y_prev = (t > 0) ? d_y[t - 1] : 0.0f;
         float vol_prev = safe_exp(h_j / 2.0f);
         float leverage = gamma * y_prev / (vol_prev + 1e-8f);
@@ -159,12 +145,12 @@ __global__ void svpf_predict_guided_antithetic_kernel(
         float guided_alpha = alpha_base + (alpha_shock - alpha_base) * activation;
         float mean_proposal = (1.0f - guided_alpha) * mean_prior + guided_alpha * mean_implied;
         
-        h[j] = clamp_logvol(mean_proposal + sigma_z * scale * (-z));  // -z
+        h[j] = clamp_logvol(mean_proposal + sigma_z * scale * (-z));
     }
 }
 
 // =============================================================================
-// Guide Kernels
+// Guide Kernel
 // =============================================================================
 
 __global__ void svpf_apply_guide_preserving_kernel(
@@ -240,7 +226,6 @@ __global__ void svpf_fused_gradient_kernel(
     float hess_prior;
     
     if (use_student_t_state) {
-        // Student-t prior: bounded gradient
         float nu_sigma_sq = nu_state * sigma_z_sq;
         float nu_plus_1 = nu_state + 1.0f;
         float half_nu_plus_1 = 0.5f * nu_plus_1;
@@ -275,7 +260,6 @@ __global__ void svpf_fused_gradient_kernel(
         hess_prior = weighted_hess / (sum_r + 1e-8f);
         
     } else {
-        // Gaussian prior: original unbounded gradient
         float inv_2sigma_sq = 0.5f / sigma_z_sq;
         float inv_sigma_sq = 1.0f / sigma_z_sq;
         
@@ -308,7 +292,7 @@ __global__ void svpf_fused_gradient_kernel(
     float A = scaled_y_sq / nu;
     float one_plus_A = 1.0f + A;
     
-    // Fan mode: uniform weights (no importance weighting)
+    // Fan mode: uniform weights
     log_w[j] = 0.0f;
     
     float grad_lik;
@@ -322,8 +306,6 @@ __global__ void svpf_fused_gradient_kernel(
     }
     
     // ===== COMBINE =====
-    // Full posterior score: ∇log p(h|y) = ∇log prior + ∇log likelihood
-    // Annealing is via step-size scaling (beta_factor in transport), not gradient tempering
     float g = grad_prior + grad_lik;
     g = fminf(fmaxf(g, -10.0f), 10.0f);
     grad_combined[j] = g;
@@ -345,8 +327,7 @@ __global__ void svpf_fused_gradient_kernel(
 // =============================================================================
 // FUSED: Stein + Transport (Full Newton)
 // =============================================================================
-// CHANGE: stein_sign_mode == 0 disables repulsive term (gk_sum).
-//         Only kernel-smoothed score ascent is computed.
+// No d_tick dependency — all args are constant device pointers or baked-in config.
 
 __global__ void svpf_fused_stein_transport_full_newton_kernel(
     float* __restrict__ h,
@@ -384,14 +365,9 @@ __global__ void svpf_fused_stein_transport_full_newton_kernel(
     float bw_sq = global_bw * global_bw;
     float inv_bw_sq = 1.0f / bw_sq;
     
-    // Leave-one-out: skip j == i to break direct self-interaction in S1.
-    // Particle i cannot vote on its own update through the kernel-weighted average.
-    // Removes the strongest circular dependency (Ba et al. 2022) — the self-kernel
-    // term K(h_i, h_i) = 1 is the maximum-weight contributor.
     int n_ref = use_split_batch ? (n - 1) : n;
     float inv_n_ref = 1.0f / (float)n_ref;
     
-    // stein_sign_mode: 0 = no repulsion, 1 = positive (default SVGD), -1 = negative
     const bool use_repulsion = (stein_sign_mode != 0);
     float sign_mult = (stein_sign_mode == 1) ? 1.0f : -1.0f;
     
@@ -409,19 +385,14 @@ __global__ void svpf_fused_stein_transport_full_newton_kernel(
         float K = 1.0f / base;
         float K_sq = K * K;
         
-        // Leave-one-out: zero self-contribution (branchless)
         float mask = use_split_batch ? (float)(j != i) : 1.0f;
         K *= mask;
         K_sq *= mask;
         
-        // Kernel-smoothed target Hessian (Nk kernel geometry term removed)
         H_weighted += sh_hess[j] * K;
         K_sum_norm += K;
-        
-        // Attractive: kernel-smoothed score (always on)
         k_grad_sum += K * sh_grad[j];
         
-        // Repulsive: kernel gradient (disabled when stein_sign_mode == 0)
         if (use_repulsion) {
             gk_sum += sign_mult * 2.0f * diff * inv_bw_sq * K_sq;
         }
@@ -453,8 +424,6 @@ __global__ void svpf_fused_stein_transport_full_newton_kernel(
 // =============================================================================
 // FUSED: Stein + Transport (Full Newton with KSD)
 // =============================================================================
-// CHANGE: stein_sign_mode == 0 disables repulsive term (gk_sum).
-//         KSD diagnostic is unaffected — it uses the Stein kernel independently.
 
 __global__ void svpf_fused_stein_transport_full_newton_ksd_kernel(
     float* __restrict__ h,
@@ -489,16 +458,14 @@ __global__ void svpf_fused_stein_transport_full_newton_ksd_kernel(
     if (i >= n) return;
     
     float h_i = sh_h[i];
-    float s_i = sh_grad[i];  // Raw score for KSD
+    float s_i = sh_grad[i];
     float global_bw = *d_bandwidth;
     float bw_sq = global_bw * global_bw;
     float inv_bw_sq = 1.0f / bw_sq;
     
-    // Leave-one-out (same as non-KSD variant)
     int n_ref = use_split_batch ? (n - 1) : n;
     float inv_n_ref = 1.0f / (float)n_ref;
     
-    // stein_sign_mode: 0 = no repulsion, 1 = positive (default SVGD), -1 = negative
     const bool use_repulsion = (stein_sign_mode != 0);
     float sign_mult = (stein_sign_mode == 1) ? 1.0f : -1.0f;
     
@@ -508,7 +475,6 @@ __global__ void svpf_fused_stein_transport_full_newton_ksd_kernel(
     float gk_sum = 0.0f;
     float ksd_sum = 0.0f;
     
-    // Single loop over ALL particles — KSD uses all, transport uses LOO mask
     #pragma unroll 4
     for (int j = 0; j < n; j++) {
         float h_j = sh_h[j];
@@ -521,14 +487,14 @@ __global__ void svpf_fused_stein_transport_full_newton_ksd_kernel(
         float K = 1.0f / base;
         float K_sq = K * K;
         
-        // ----- KSD Stein kernel (always all particles, unmasked) -----
+        // KSD Stein kernel (unmasked)
         float grad_x_k = -2.0f * diff * inv_bw_sq * K_sq;
         float grad_y_k = -grad_x_k;
         float hess_xy_k = 2.0f * inv_bw_sq * K_sq * (4.0f * dist_sq * K - 1.0f);
         float u_ij = K * s_i * s_j + s_i * grad_y_k + s_j * grad_x_k + hess_xy_k;
         ksd_sum += u_ij;
         
-        // ----- Transport: leave-one-out (branchless) -----
+        // Transport: leave-one-out
         float mask = use_split_batch ? (float)(j != i) : 1.0f;
         float K_masked = K * mask;
         
@@ -540,10 +506,8 @@ __global__ void svpf_fused_stein_transport_full_newton_ksd_kernel(
         }
     }
     
-    // Store partial KSD sum
     d_ksd_partial[i] = ksd_sum;
     
-    // Kernel-smoothed target Hessian preconditioning
     H_weighted = H_weighted / fmaxf(K_sum_norm, 1e-6f);
     H_weighted = fminf(fmaxf(H_weighted, 0.1f), 100.0f);
     float inv_H_i = 1.0f / H_weighted;
@@ -568,7 +532,7 @@ __global__ void svpf_fused_stein_transport_full_newton_ksd_kernel(
 }
 
 // =============================================================================
-// KSD Reduction Kernel
+// KSD Reduction
 // =============================================================================
 
 __global__ void svpf_ksd_reduce_kernel(
