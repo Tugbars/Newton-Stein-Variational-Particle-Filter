@@ -169,6 +169,15 @@ typedef struct {
     // Capacity
     int allocated_n;               // Allocated particle count
     bool initialized;              // Whether backend is initialized
+
+    // Per-tick parameter staging for CUDA graph capture
+void*  d_tick_params;       // Device: SVPFTickParams (32 bytes)
+void*  h_tick_pinned;       // Host pinned: SVPFTickParams (32 bytes)
+void*  h_y_pinned;          // Host pinned: float[2] (y_prev, y_t)
+
+// Graph invalidation tracking
+int    graph_n_stages;      // Captured anneal_n_stages_fixed
+int    graph_steps_per_beta; // Captured anneal_steps_per_beta
 } SVPFOptimizedState;
 
 /**
@@ -358,6 +367,8 @@ typedef struct {
     SVPFOptimizedState opt_backend;
 
     int use_split_batch;    // 1 = even/odd split-batch SVGD, 0 = standard (all 
+
+    int anneal_n_stages_fixed;    // Fixed beta stage count (default 4)
 
 } SVPFState;
 

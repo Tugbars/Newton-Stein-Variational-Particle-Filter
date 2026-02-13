@@ -1,31 +1,29 @@
 /**
  * @file svpf_optimized_graph.cu
- * @brief Consolidated SVPF Implementation with KSD-based Adaptive Stein Steps
+ * @brief Consolidated SVPF Implementation with Fixed-Schedule Stein Transport
  * 
  * Single implementation file containing:
  * - State management (svpf_create/destroy/initialize)
  * - Basic utility kernels
- * - Stein loop with KSD-based early stopping (now via CUDA Graphs)
+ * - Stein loop with fixed linear beta schedule (graph-capturable)
  * - Public API (svpf_step_graph, svpf_step_adaptive, svpf_run_sequence)
  * - Diagnostics (svpf_get_particles, svpf_get_stats, svpf_get_ess)
  * 
- * KSD (Kernel Stein Discrepancy) is computed in the same O(N²) pass as Stein
- * transport at zero extra cost. Early stopping occurs when relative KSD
- * improvement drops below threshold.
+ * KSD (Kernel Stein Discrepancy) is computed on the final Stein iteration
+ * in the same O(N²) pass as transport at zero extra cost.
  * 
- * CUDA GRAPHS: The Stein loop is now captured as a CUDA Graph to eliminate
- * kernel launch overhead. This reduces 16-64 kernel launches to 1 graph launch.
+ * REFACTORED: Removed adaptive annealing (eliminated mid-kernel D2H sync).
+ * Stein iterations now use a fixed linear beta ramp:
+ *   total_steps = anneal_n_stages_fixed × anneal_steps_per_beta
+ * Configure before launch. Entire pipeline is fully async and graph-capturable.
+ * 
+ * REMOVED: Partial rejuvenation (conditional launch broke graph capture).
  * 
  * CHANGE: Repulsion disabled by default (stein_repulsive_sign = SVPF_STEIN_SIGN_NONE).
- *         SVPF v6 experiments showed repulsion is harmful in sequential filtering:
- *         - 27-38% bias reduction across all tested scenarios
- *         - Predict step noise maintains diversity without repulsion
- *         - Repulsive term introduces circular dependency → compounding bias
- *         lik_offset and Newton damping (0.7f) may need re-tuning without repulsion.
+ *         SVPF v6 experiments showed repulsion is harmful in sequential filtering.
  */
 
 #include "svpf_kernels.cuh"
-#include "svpf_fused_gradient_stats.cuh"  // Fused gradient + stats kernel
 
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
@@ -48,8 +46,8 @@ void svpf_optimized_init(SVPFOptimizedState* opt, int n);
 
 SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_t stream) {
     // NOTE: n_stein_steps is kept in signature for API compatibility but is unused.
-    // Actual iteration count is controlled by adaptive annealing:
-    //   total_steps = n_stages (from KL heuristic) × anneal_steps_per_beta (fixed 4)
+    // Actual iteration count is controlled by:
+    //   total_steps = anneal_n_stages_fixed × anneal_steps_per_beta
     (void)n_stein_steps;
     
     SVPFState* state = (SVPFState*)malloc(sizeof(SVPFState));
@@ -141,11 +139,8 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     state->guide_innovation_threshold = 1.0f; // Z-score to start boosting
     state->vol_prev = 0.05f;
     
-    // --- Partial rejuvenation (Maken 2022) ---
-    state->use_rejuvenation = 1;
-    state->rejuv_ksd_threshold = 0.05f;  // Trigger threshold
-    state->rejuv_prob = 0.30f;           // 30% of particles
-    state->rejuv_blend = 0.30f;          // 30% blend factor
+    // --- Partial rejuvenation (REMOVED — conditional launch broke graph capture) ---
+    state->use_rejuvenation = 0;
     
     // --- Newton-Stein (Hessian preconditioning) ---
     state->use_newton = 1;
@@ -196,14 +191,10 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     // === Antithetic Sampling ===
     state->use_antithetic = 1;
     
-    // === Adaptive Annealing (KL-based beta stepping) ===
-    state->use_adaptive_anneal = 1;
-    state->anneal_kl_threshold = 0.9f;
+    // === Fixed Annealing Schedule (graph-capturable, no D2H sync) ===
+    state->anneal_n_stages_fixed = 4;  // 4 stages × 3 steps = 12 total
     state->anneal_steps_per_beta = 3;
-    state->anneal_max_stages = 50;
     state->anneal_stages_used = 0;
-    state->anneal_final_var_ll = 0.0f;
-    state->anneal_final_h_std = 0.0f;
     
     // === Backward Smoothing (Fan et al. 2021 sliding window) ===
     state->use_smoothing = 1;
@@ -420,10 +411,6 @@ void svpf_optimized_init(SVPFOptimizedState* opt, int n) {
     
     cudaMallocHost(&opt->h_results_pinned, 4 * sizeof(float));
     
-    // === Adaptive Annealing Buffers ===
-    cudaMalloc(&opt->d_anneal_stats, 4 * sizeof(float));
-    cudaMallocHost(&opt->h_anneal_stats_pinned, 4 * sizeof(float));
-    
     opt->allocated_n = n;
     opt->initialized = true;
 }
@@ -463,16 +450,6 @@ static void svpf_optimized_cleanup(SVPFOptimizedState* opt) {
     if (opt->h_results_pinned) {
         cudaFreeHost(opt->h_results_pinned);
         opt->h_results_pinned = nullptr;
-    }
-    
-    // === Adaptive Annealing Buffers ===
-    if (opt->d_anneal_stats) {
-        cudaFree(opt->d_anneal_stats);
-        opt->d_anneal_stats = nullptr;
-    }
-    if (opt->h_anneal_stats_pinned) {
-        cudaFreeHost(opt->h_anneal_stats_pinned);
-        opt->h_anneal_stats_pinned = nullptr;
     }
     
     if (opt->graph_captured) {
@@ -532,6 +509,9 @@ static void svpf_adaptive_mu_update(
 // =============================================================================
 // ASYNC STEP: Launch all GPU work, return immediately
 // =============================================================================
+// Fixed linear beta schedule, fully async, graph-capturable.
+// Pre-configure: state->anneal_n_stages_fixed, state->anneal_steps_per_beta
+// Pipeline: predict → guide → bandwidth → [gradient → stein] × N → outputs
 
 void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams* params) {
     SVPFOptimizedState* opt = get_opt(state);
@@ -540,7 +520,7 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
     
     svpf_optimized_init(opt, n);
     
-    // Determine effective parameters
+    // --- Effective parameters (CPU-side, no GPU dependency) ---
     float effective_mu = state->use_adaptive_mu ? state->mu_state : params->mu;
     float effective_sigma_z = params->sigma_z;
     
@@ -560,7 +540,7 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
     
     int nb = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
     size_t grad_smem = 2 * n * sizeof(float);
-    size_t stein_smem = 3 * n * sizeof(float);  // Full Newton: h, grad, hess
+    size_t stein_smem = 3 * n * sizeof(float);
     
     // Upload y values
     float y_arr[2] = {y_prev, y_t};
@@ -626,79 +606,25 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
     );
     
     // =========================================================================
-    // ADAPTIVE ANNEALING STEIN ITERATIONS
+    // STEIN ITERATIONS (Fixed linear beta schedule, NO D2H sync)
     // =========================================================================
     
+    int n_stages = state->anneal_n_stages_fixed;
+    int steps_per_beta = state->anneal_steps_per_beta;
     int total_steps = 0;
     
     float base_step = SVPF_STEIN_STEP_SIZE * (state->use_guide ? 0.5f : 1.0f);
     float temp = state->use_svld ? state->temperature : 0.0f;
     
-    // -----------------------------------------------------------------
-    // 1. Compute initial gradient and stats at beta=0 (FUSED)
-    // -----------------------------------------------------------------
-    
-    cudaMemsetAsync(opt->d_anneal_stats, 0, 4 * sizeof(float), cs);
-    
-    svpf_fused_gradient_stats_kernel<<<nb, BLOCK_SIZE, grad_smem, cs>>>(
-        state->h, state->h_prev, state->grad_log_p, state->log_weights,
-        opt->d_precond_grad, opt->d_inv_hessian,
-        opt->d_y_single, 
-        opt->d_anneal_stats,
-        1, params->rho, effective_sigma_z, effective_mu,
-        state->nu, state->lik_offset,
-        params->gamma, state->use_exact_gradient, state->use_newton,
-        state->use_student_t_state, state->nu_state,
-        n
-    );
-    
-    // SINGLE D2H sync for the entire annealing
-    cudaMemcpyAsync(opt->h_anneal_stats_pinned, opt->d_anneal_stats,
-                    4 * sizeof(float), cudaMemcpyDeviceToHost, cs);
-    cudaStreamSynchronize(cs);
-    
-    // Convert raw sums to stats (CPU side)
-    float inv_n = 1.0f / (float)n;
-    
-    float sum_ll_diff = opt->h_anneal_stats_pinned[0];
-    float sum_ll_diff_sq = opt->h_anneal_stats_pinned[1];
-    float sum_grad = opt->h_anneal_stats_pinned[2];
-    float sum_h_diff_sq = opt->h_anneal_stats_pinned[3];
-    
-    float mean_ll_diff = sum_ll_diff * inv_n;
-    float mean_ll_diff_sq = sum_ll_diff_sq * inv_n;
-    float var_ll = mean_ll_diff_sq - (mean_ll_diff * mean_ll_diff);
-    var_ll = fmaxf(var_ll, 1e-6f);
-    
-    float mean_grad = sum_grad * inv_n;
-    float h_std = sqrtf(fmaxf(sum_h_diff_sq * inv_n, 1e-8f));
-    
-    // -----------------------------------------------------------------
-    // 2. Compute delta_beta and number of stages UPFRONT
-    // -----------------------------------------------------------------
-    float d_beta_kl = sqrtf(2.0f * state->anneal_kl_threshold / (var_ll + 1e-6f));
-    float d_beta_grad = 2.0f / (mean_grad + 1e-6f);
-    float d_beta_spatial = (h_std < 0.05f) ? 0.02f : 0.25f;
-    
-    float d_beta = fminf(d_beta_kl, fminf(d_beta_grad, d_beta_spatial));
-    d_beta = fmaxf(d_beta, 0.05f);
-    d_beta = fminf(d_beta, 0.35f);
-    
-    int n_stages = (int)ceilf(1.0f / d_beta);
-    n_stages = max(2, min(n_stages, state->anneal_max_stages));
-    
-    // -----------------------------------------------------------------
-    // 3. Run all stages WITHOUT any more syncs
-    // -----------------------------------------------------------------
     for (int stage = 0; stage < n_stages; stage++) {
-        float beta = fminf((float)(stage + 1) / (float)n_stages, 1.0f);
+        float beta = (float)(stage + 1) / (float)n_stages;
         float beta_factor = sqrtf(beta);
         
-        for (int s = 0; s < state->anneal_steps_per_beta; s++) {
+        for (int s = 0; s < steps_per_beta; s++) {
             total_steps++;
-            bool is_last_iteration = (stage == n_stages - 1) && (s == state->anneal_steps_per_beta - 1);
+            bool is_last = (stage == n_stages - 1) && (s == steps_per_beta - 1);
             
-            // Gradient
+            // Gradient (prior + likelihood + hessian)
             svpf_fused_gradient_kernel<<<nb, BLOCK_SIZE, grad_smem, cs>>>(
                 state->h, state->h_prev, state->grad_log_p, state->log_weights,
                 opt->d_precond_grad, opt->d_inv_hessian,
@@ -709,8 +635,8 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
                 n
             );
             
-            // Stein transport (Full Newton, +KSD on last iteration)
-            if (is_last_iteration) {
+            // Stein transport (+KSD on last iteration only)
+            if (is_last) {
                 svpf_fused_stein_transport_full_newton_ksd_kernel<<<nb, BLOCK_SIZE, stein_smem, cs>>>(
                     state->h, state->grad_log_p, opt->d_inv_hessian,
                     state->d_grad_v, state->rng_states, opt->d_bandwidth,
@@ -735,30 +661,10 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
     
     // Store diagnostics
     state->anneal_stages_used = n_stages;
-    state->anneal_final_var_ll = var_ll;
-    state->anneal_final_h_std = h_std;
     state->stein_steps_used = total_steps;
     
     // =========================================================================
-    // PARTIAL REJUVENATION (Maken et al. 2022)
-    // =========================================================================
-    if (state->use_rejuvenation && state->timestep > 10) {
-        if (state->ksd_prev > state->rejuv_ksd_threshold) {
-            float guide_std = sqrtf(fmaxf(state->guide_var, 1e-6f));
-            svpf_partial_rejuvenation_kernel<<<nb, BLOCK_SIZE, 0, cs>>>(
-                state->h,
-                state->guide_mean,
-                guide_std,
-                state->rejuv_prob,
-                state->rejuv_blend,
-                state->rng_states,
-                n
-            );
-        }
-    }
-    
-    // =========================================================================
-    // OUTPUTS (consolidated D2H transfer)
+    // OUTPUTS (single async D2H — no sync until svpf_sync_outputs)
     // =========================================================================
     svpf_fused_outputs_kernel<<<1, BLOCK_SIZE, 0, cs>>>(
         state->h, state->log_weights,

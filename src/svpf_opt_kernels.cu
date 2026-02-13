@@ -9,6 +9,8 @@
  * - svpf_fused_bandwidth_kernel (bandwidth + adaptive)
  * - svpf_fused_outputs_kernel (logsumexp + vol + h_mean)
  * 
+ * REMOVED: svpf_partial_rejuvenation_kernel (conditional launch broke graph capture)
+ * 
  * CHANGE: stein_sign_mode == 0 disables repulsive kernel gradient entirely.
  *         Only kernel-smoothed score ascent (attractive term) is computed.
  *         See: SVPF v6 experiments — repulsion is harmful in sequential filtering.
@@ -731,34 +733,5 @@ __global__ void svpf_fused_bandwidth_kernel(
         
         *d_bandwidth_sq = bw_sq;
         *d_bandwidth = bw;
-    }
-}
-
-// =============================================================================
-// PARTIAL REJUVENATION KERNEL (Maken et al. 2022)
-// =============================================================================
-
-__global__ void svpf_partial_rejuvenation_kernel(
-    float* __restrict__ h,
-    float guide_mean,
-    float guide_std,
-    float rejuv_prob,
-    float blend_factor,
-    curandStatePhilox4_32_10_t* __restrict__ rng,
-    int n
-) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    
-    float u = curand_uniform(&rng[i]);
-    
-    if (u < rejuv_prob) {
-        float z = curand_normal(&rng[i]);
-        float guide_sample = guide_mean + guide_std * z;
-        
-        float h_old = h[i];
-        float h_new = (1.0f - blend_factor) * h_old + blend_factor * guide_sample;
-        
-        h[i] = clamp_logvol(h_new);
     }
 }
