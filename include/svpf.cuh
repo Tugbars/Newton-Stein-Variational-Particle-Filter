@@ -52,8 +52,22 @@ extern "C" {
 #define SVPF_H_MIN                 -15.0f
 #define SVPF_H_MAX                 5.0f
 #define SVPF_BLOCK_SIZE            256     // Cheap kernels (bandwidth, outputs, KSD reduce)
-#define SVPF_STEIN_BLOCK_SIZE      128     // O(N²) kernels (gradient, Stein transport)
 #define SVPF_SMALL_N_THRESHOLD     4096    // Threshold for persistent CTA path
+
+// Optimal Stein block size for O(N²) kernels.
+// Targets ~4 blocks for SM parallelism, but avoids excessive blocks at small N
+// where launch overhead dominates.
+// Benchmarked on RTX 5080 (4-concurrent streams):
+//   N=256 → 256 (1 block),  N=512 → 128 (4 blocks),  N=1024 → 256 (4 blocks)
+static inline int svpf_optimal_stein_block_size(int n_particles) {
+    if (n_particles <= 256) return n_particles;  // Single block, minimize overhead
+    int bs = n_particles / 4;                    // Target 4 blocks
+    // Clamp to [64, 256] and round to warp boundary
+    if (bs < 64)  bs = 64;
+    if (bs > 256) bs = 256;
+    bs = (bs + 31) & ~31;                        // Round up to warp multiple
+    return bs;
+}
 #define SVPF_GRAPH_PARAMS_SIZE     32      // Floats in graph parameter staging buffer
 #define SVPF_SMOOTH_MAX_LAG        8       // Max backward smoothing window
 
@@ -169,6 +183,7 @@ typedef struct {
 
     // Capacity
     int allocated_n;               // Allocated particle count
+    int stein_block_size;          // Computed: optimal block size for O(N²) kernels
     bool initialized;              // Whether backend is initialized
 } SVPFOptimizedState;
 

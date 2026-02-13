@@ -168,7 +168,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     state->use_fan_mode = 1;
     
     // === Student-t state dynamics ===
-    state->use_student_t_state = 0;
+    state->use_student_t_state = 1;
     state->nu_state = 6.0f;
     
     // === KSD tracking (ksd_prev drives rejuvenation trigger) ===
@@ -406,6 +406,7 @@ void svpf_optimized_init(SVPFOptimizedState* opt, int n) {
     cudaMallocHost(&opt->h_anneal_stats_pinned, 4 * sizeof(float));
     
     opt->allocated_n = n;
+    opt->stein_block_size = svpf_optimal_stein_block_size(n);
     opt->initialized = true;
 }
 
@@ -543,7 +544,8 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
     }
     
     int nb = (n + SVPF_BLOCK_SIZE - 1) / SVPF_BLOCK_SIZE;
-    int nb_stein = (n + SVPF_STEIN_BLOCK_SIZE - 1) / SVPF_STEIN_BLOCK_SIZE;
+    int sbs = opt->stein_block_size;
+    int nb_stein = (n + sbs - 1) / sbs;
     size_t grad_smem = 2 * n * sizeof(float);
     size_t stein_smem = 3 * n * sizeof(float);
     
@@ -611,7 +613,7 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
     );
     
     // =========================================================================
-    // STEIN ITERATIONS — O(N²), use SVPF_STEIN_BLOCK_SIZE for parallelism
+    // STEIN ITERATIONS — O(N²), adaptive block size for SM parallelism
     // =========================================================================
     
     int n_stages = state->anneal_n_stages_fixed;
@@ -630,7 +632,7 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
             bool is_last = (stage == n_stages - 1) && (s == steps_per_beta - 1);
             
             // Gradient — O(N²): each thread reads all N particles
-            svpf_fused_gradient_kernel<<<nb_stein, SVPF_STEIN_BLOCK_SIZE, grad_smem, cs>>>(
+            svpf_fused_gradient_kernel<<<nb_stein, sbs, grad_smem, cs>>>(
                 state->h, state->h_prev, state->grad_log_p, state->log_weights,
                 opt->d_precond_grad, opt->d_inv_hessian,
                 opt->d_y_single, 1, params->rho, effective_sigma_z, effective_mu,
@@ -642,7 +644,7 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
             
             // Stein transport — O(N²): each thread iterates over all N particles
             if (is_last) {
-                svpf_fused_stein_transport_full_newton_ksd_kernel<<<nb_stein, SVPF_STEIN_BLOCK_SIZE, stein_smem, cs>>>(
+                svpf_fused_stein_transport_full_newton_ksd_kernel<<<nb_stein, sbs, stein_smem, cs>>>(
                     state->h, state->grad_log_p, opt->d_inv_hessian,
                     state->d_grad_v, state->rng_states, opt->d_bandwidth,
                     opt->d_ksd_partial,
@@ -655,7 +657,7 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
                     opt->d_ksd_partial, opt->d_ksd, n
                 );
             } else {
-                svpf_fused_stein_transport_full_newton_kernel<<<nb_stein, SVPF_STEIN_BLOCK_SIZE, stein_smem, cs>>>(
+                svpf_fused_stein_transport_full_newton_kernel<<<nb_stein, sbs, stein_smem, cs>>>(
                     state->h, state->grad_log_p, opt->d_inv_hessian,
                     state->d_grad_v, state->rng_states, opt->d_bandwidth,
                     base_step, beta_factor, temp, state->rmsprop_rho, state->rmsprop_eps,
