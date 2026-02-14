@@ -119,7 +119,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     // =========================================================================
     
     state->use_exact_gradient = 1;
-    state->lik_offset = 0.0729f;
+    state->lik_offset = 0.14f;
     
     state->use_svld = 1;
     state->temperature = 0.45f;
@@ -129,14 +129,6 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     state->use_mim = 0;
     state->mim_jump_prob = 0.25f;
     state->mim_jump_scale = 8.2f;
-    
-    state->use_guide = 0;
-    state->use_guide_preserving = 0;
-    state->guide_strength = 0.00f;
-    state->guide_mean = 0.0f;
-    state->guide_var = 0.0f;
-    state->guide_K = 0.0f;
-    state->guide_initialized = 0;
     
     state->use_adaptive_guide = 1;
     state->guide_strength_base = 0.05f;
@@ -168,7 +160,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     state->stein_repulsive_sign = SVPF_STEIN_SIGN_NONE;
     state->use_fan_mode = 1;
     state->use_student_t_state = 0;
-    state->nu_state = 6.0f;
+    state->nu_state = 2.5f;
     
     state->ksd_prev = 1e10f;
     state->stein_steps_used = 0;
@@ -177,7 +169,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     state->use_antithetic = 1;
     
     state->anneal_n_stages_fixed = 4;
-    state->anneal_steps_per_beta = 3;
+    state->anneal_steps_per_beta = 4;
     state->anneal_stages_used = 0;
     
     state->use_smoothing = 1;
@@ -303,10 +295,6 @@ void svpf_initialize(SVPFState* state, const SVPFParams* params, unsigned long l
         state->h, state->h_prev, n
     );
     
-    state->guide_initialized = 0;
-    state->guide_mean = params->mu;
-    state->guide_var = stationary_var;
-    
     if (state->use_adaptive_mu) {
         state->mu_state = params->mu;
         state->mu_var = 1.0f;
@@ -368,13 +356,6 @@ void svpf_optimized_init(SVPFOptimizedState* opt, int n) {
     float init_h_mean = -3.5f;
     cudaMemcpy(opt->d_h_mean_prev, &init_h_mean, sizeof(float), cudaMemcpyHostToDevice);
     
-    cudaMalloc(&opt->d_guide_mean, sizeof(float));
-    cudaMemcpy(opt->d_guide_mean, &init_h_mean, sizeof(float), cudaMemcpyHostToDevice);
-    
-    cudaMalloc(&opt->d_guide_strength, sizeof(float));
-    float init_guide_strength = 0.05f;
-    cudaMemcpy(opt->d_guide_strength, &init_guide_strength, sizeof(float), cudaMemcpyHostToDevice);
-    
     cudaMalloc(&opt->d_y_single, 2 * sizeof(float));
     cudaMalloc(&opt->d_loglik_single, sizeof(float));
     cudaMalloc(&opt->d_vol_single, sizeof(float));
@@ -416,8 +397,6 @@ static void svpf_optimized_cleanup(SVPFOptimizedState* opt) {
     cudaFree(opt->d_precond_grad);
     cudaFree(opt->d_inv_hessian);
     cudaFree(opt->d_h_mean_prev);
-    cudaFree(opt->d_guide_mean);
-    cudaFree(opt->d_guide_strength);
     cudaFree(opt->d_y_single);
     cudaFree(opt->d_loglik_single);
     cudaFree(opt->d_vol_single);
@@ -556,38 +535,6 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
     }
 
     // =========================================================================
-    // GUIDE (Variance-preserving)
-    // =========================================================================
-    float current_guide_strength = state->guide_strength_base;
-    
-    if (state->use_adaptive_guide && state->timestep > 0) {
-        float vol_est = fmaxf(state->vol_prev, 1e-4f);
-        float return_z = fabsf(y_t) / vol_est;
-        
-        float implied_h = logf(y_t * y_t + 1e-8f) + state->student_t_implied_offset;
-        float h_est = logf(vol_est * vol_est + 1e-8f);
-        float h_innovation = implied_h - h_est;
-        
-        if (h_innovation > 0.0f && return_z > state->guide_innovation_threshold) {
-            float severity = fminf((return_z - state->guide_innovation_threshold) / 3.0f, 1.0f);
-            float boost = (state->guide_strength_max - state->guide_strength_base) * severity;
-            current_guide_strength = state->guide_strength_base + boost;
-        }
-    }
-    
-    {
-        SVPFParams guide_params = *params;
-        if (state->use_adaptive_mu) {
-            guide_params.mu = effective_mu;
-        }
-        svpf_ekf_update(state, y_t, &guide_params);
-        
-        svpf_apply_guide_preserving_kernel<<<nb, SVPF_BLOCK_SIZE, 0, cs>>>(
-            state->h, opt->d_h_mean_prev, state->guide_mean, current_guide_strength, n
-        );
-    }
-    
-    // =========================================================================
     // BANDWIDTH
     // =========================================================================
     svpf_fused_bandwidth_kernel<<<1, SVPF_BLOCK_SIZE, 0, cs>>>(
@@ -603,7 +550,7 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
     int steps_per_beta = state->anneal_steps_per_beta;
     int total_steps = 0;
     
-    float base_step = SVPF_STEIN_STEP_SIZE * (state->use_guide ? 0.5f : 1.0f);
+    float base_step = SVPF_STEIN_STEP_SIZE;
     float temp = state->use_svld ? state->temperature : 0.0f;
     
     for (int stage = 0; stage < n_stages; stage++) {
