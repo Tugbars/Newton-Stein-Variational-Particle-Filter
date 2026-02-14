@@ -147,11 +147,7 @@ static inline MS_SVPF_Config ms_svpf_default_config(void) {
     
     /* Particles: REACTIVE is small scout, INERTIAL is full precision */
     c.n_particles_reactive = 256;   // Fast scout (was 512)
-    c.n_particles_inertial = 1024;  // Production precision
-    
-    /* Stein iterations: REACTIVE minimal, INERTIAL generous */
-    c.n_stein_reactive = 3;         // Minimal (was 4)
-    c.n_stein_inertial = 8;
+    c.n_particles_inertial = 512;  // Production precision
     
     /* Cross-scale boost thresholds */
     c.surprise_mild_threshold = 2.0f;
@@ -219,53 +215,7 @@ static inline MS_SVPF* ms_svpf_create(const MS_SVPF_Config* config) {
         /* Store scale-specific dynamics - FASTER */
         ms->rho_reactive = 0.92f;       // Half-life ~8 ticks
         ms->sigma_z_reactive = 0.18f;   // Higher exploration
-        
-        /* Asymmetric rho: slight */
-        f->use_asymmetric_rho = 1;
-        f->rho_up = 0.94f;
-        f->rho_down = 0.88f;
-        
-        /* MIM: AGGRESSIVE */
-        f->use_mim = 1;
-        f->mim_jump_prob = 0.30f;   // 30% scouts
-        f->mim_jump_scale = 10.0f;
-        
-        /* Guide: OFF - let particles fly freely */
-        f->use_guide = 0;
-        f->use_guided = 0;
-        f->use_adaptive_guide = 0;
-        
-        /* SVLD: Higher temp for exploration */
-        f->use_svld = 1;
-        f->temperature = 0.55f;     // Higher than standard
-        f->rmsprop_rho = 0.9f;
-        f->rmsprop_eps = 1e-6f;
-        
-        /* Annealing: OFF (react immediately) */
-        f->use_annealing = 0;
-        f->n_anneal_steps = 1;
-        
-        /* Newton: OFF (expensive, unnecessary for scout) */
-        f->use_newton = 0;
-        f->use_full_newton = 0;
-        
-        /* Adaptive features: ALL OFF (too slow for scout) */
-        f->use_adaptive_mu = 0;
-        f->use_adaptive_sigma = 0;
-        
-        /* Local params: OFF */
-        f->use_local_params = 0;
-        f->delta_rho = 0.0f;
-        f->delta_sigma = 0.0f;
-        
-        /* Exact gradient */
-        f->use_exact_gradient = 1;
-        f->lik_offset = 0.35f;
-        
-        /* KSD budget: MINIMAL (speed matters, not precision) */
-        f->stein_min_steps = 2;
-        f->stein_max_steps = 5;
-        f->ksd_improvement_threshold = 0.10f;
+    
     }
     
     /*═══════════════════════════════════════════════════════════════════════
@@ -280,79 +230,6 @@ static inline MS_SVPF* ms_svpf_create(const MS_SVPF_Config* config) {
         /* Store scale-specific dynamics - SAME as mono */
         ms->rho_inertial = 0.98f;       // Standard
         ms->sigma_z_inertial = 0.10f;   // Standard
-        
-        /* Asymmetric rho: ON (same as mono) */
-        f->use_asymmetric_rho = 1;
-        f->rho_up = 0.98f;
-        f->rho_down = 0.93f;
-        
-        /* MIM: Full production settings */
-        f->use_mim = 1;
-        f->mim_jump_prob = 0.25f;    // Same as mono
-        f->mim_jump_scale = 9.0f;
-        ms->mim_jump_prob_inertial_base = 0.25f;
-        
-        /* Guide: FULL adaptive suite (same as mono) */
-        f->use_guide = 1;
-        f->use_guide_preserving = 1;
-        f->guide_strength = 0.05f;
-        f->guide_mean = 0.0f;
-        f->guide_var = 0.0f;
-        f->guide_K = 0.0f;
-        f->guide_initialized = 0;
-        
-        f->use_adaptive_guide = 1;
-        f->guide_strength_base = 0.05f;
-        f->guide_strength_max = 0.30f;
-        f->guide_innovation_threshold = 1.0f;
-        
-        /* Guided prediction (same as mono) */
-        f->use_guided = 1;
-        f->guided_alpha_base = 0.0f;
-        f->guided_alpha_shock = 0.40f;
-        f->guided_innovation_threshold = 1.5f;
-        
-        /* SVLD: Standard (same as mono) */
-        f->use_svld = 1;
-        f->temperature = 0.45f;
-        f->rmsprop_rho = 0.9f;
-        f->rmsprop_eps = 1e-6f;
-        
-        /* Annealing: ON (same as mono) */
-        f->use_annealing = 1;
-        f->n_anneal_steps = 3;
-        
-        /* Newton: FULL (same as mono) */
-        f->use_newton = 1;
-        f->use_full_newton = 1;
-        
-        /* Adaptive features: ALL ON (same as mono) */
-        f->use_adaptive_mu = 1;
-        f->mu_state = -3.5f;
-        f->mu_var = 1.0f;
-        f->mu_process_var = 0.001f;
-        f->mu_obs_var_scale = 11.0f;
-        f->mu_min = -4.0f;
-        f->mu_max = -1.0f;
-        
-        f->use_adaptive_sigma = 1;
-        f->sigma_boost_threshold = 0.95f;
-        f->sigma_boost_max = 3.2f;
-        f->sigma_z_effective = 0.10f;
-        
-        /* Local params: OFF (mono doesn't use this) */
-        f->use_local_params = 0;
-        f->delta_rho = 0.0f;
-        f->delta_sigma = 0.0f;
-        
-        /* Exact gradient (same as mono) */
-        f->use_exact_gradient = 1;
-        f->lik_offset = 0.35f;
-        
-        /* KSD budget: GENEROUS (same as mono) */
-        f->stein_min_steps = 8;
-        f->stein_max_steps = 16;
-        f->ksd_improvement_threshold = 0.05f;
     }
     
     ms->vol_prev = 0.01f;

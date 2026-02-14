@@ -119,31 +119,24 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     // =========================================================================
     
     state->use_exact_gradient = 1;
-    state->lik_offset = 0.145f;
-    
+    state->lik_offset = 0.065f;
     state->use_svld = 1;
-    state->temperature = 0.50f;
+    state->temperature = 0.45f;
     state->rmsprop_rho = 0.7f;
     state->rmsprop_eps = 1e-6f;
-    
+    state->anneal_n_stages_fixed = 4;
+    state->anneal_steps_per_beta = 3;
+    state->anneal_stages_used = 0;
+    state->use_persistent_kernel = 1;
+    state->use_newton = 1;
+    state->use_full_newton = 1;
     state->use_mim = 0;
     state->mim_jump_prob = 0.25f;
     state->mim_jump_scale = 8.2f;
-    
-    state->use_adaptive_guide = 0;
-    state->guide_strength_base = 0.05f;
-    state->guide_strength_max = 0.30f;
-    state->guide_innovation_threshold = 1.0f;
-    state->vol_prev = 0.05f;
-    
-    state->use_newton = 1;
-    state->use_full_newton = 1;
-    
     state->use_guided = 0;
     state->guided_alpha_base = 0.0f;
     state->guided_alpha_shock = 0.40f;
     state->guided_innovation_threshold = 1.5f;
-    
     state->use_adaptive_mu = 1;
     state->mu_state = -3.5f;
     state->mu_var = 1.0f;
@@ -152,37 +145,35 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     state->mu_min = -4.0f;
     state->mu_max = -1.0f;
     
+    state->use_adaptive_guide = 0;
+    state->guide_strength_base = 0.00f;
+    state->guide_strength_max = 0.00f;
+    state->guide_innovation_threshold = 0.00f;
+    state->vol_prev = 0.00f;
     state->use_adaptive_sigma = 0;
-    state->sigma_boost_threshold = 0.95f;
-    state->sigma_boost_max = 3.2f;
-    state->sigma_z_effective = 0.10f;
-    
-    state->stein_repulsive_sign = SVPF_STEIN_SIGN_NONE;
-    state->use_fan_mode = 1;
-    state->use_student_t_state = 0;
-    state->nu_state = 2.5f;
-    
-    state->ksd_prev = 1e10f;
-    state->stein_steps_used = 0;
-    
+    state->sigma_boost_threshold =0.00f; 
+    state->sigma_boost_max = 0.00f;
+    state->sigma_z_effective = 0.00f;
     state->use_heun = 0;
-    state->use_antithetic = 1;
-    
-    state->anneal_n_stages_fixed = 5;
-    state->anneal_steps_per_beta = 4;
-    state->anneal_stages_used = 0;
-    
     state->use_smoothing = 0;
-    state->smooth_lag = 3;
+    state->smooth_lag = 0;
     state->smooth_output_lag = 1;
     for (int i = 0; i < SVPF_SMOOTH_MAX_LAG; i++) {
         state->smooth_h_mean[i] = 0.0f;
-        state->smooth_h_var[i] = 1.0f;
+        state->smooth_h_var[i] = 0.0f;
         state->smooth_y[i] = 0.0f;
     }
-    state->smooth_head = 1;
+    state->smooth_head = 0;
+    state->use_student_t_state = 0;
+    state->nu_state = 0.0f;
+
+    state->stein_repulsive_sign = SVPF_STEIN_SIGN_NONE;
+    state->use_fan_mode = 1;
+
+    state->ksd_prev = 1e10f;
+    state->stein_steps_used = 0;
     
-    state->use_persistent_kernel = 1;
+    state->use_antithetic = 1;
     
     // =========================================================================
     // NEW: Decorrelation (Bias Mitigation)
