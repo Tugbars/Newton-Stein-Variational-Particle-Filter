@@ -1,19 +1,23 @@
 /**
- * @file svpf_optimized_graph.cu
- * @brief Consolidated SVPF Implementation with Fixed Beta Schedule
+ * @file svpf_optimized_graph_with_decorrelation.cu
+ * @brief SVPF with Periodic Variance Injection for Bias Decorrelation
  * 
- * Single implementation file containing:
- * - State management (svpf_create/destroy/initialize)
- * - Fixed linear beta schedule (no mid-step D2H sync)
- * - Public API (svpf_step_graph, svpf_step_adaptive, svpf_run_sequence)
- * - Diagnostics (svpf_get_particles, svpf_get_stats, svpf_get_ess)
+ * MODIFICATION: Added periodic variance injection to break temporal correlation
+ * of temperature-induced noise that causes bias compounding across timesteps.
  * 
- * PIPELINE: predict → guide → bandwidth → [gradient → stein] × N → outputs
- * Fully async — single D2H at end, no mid-pipeline syncs.
+ * NEW FEATURES:
+ * - use_decorrelation: Enable/disable periodic variance injection
+ * - decorrelation_interval: How often to inject (e.g., every 25 timesteps)
+ * - decorrelation_scale: Magnitude of injection (fraction of sigma_z)
+ * - svpf_decorrelation_kernel: Adds i.i.d. noise to break serial correlation
+ * 
+ * MECHANISM: Every K timesteps, add independent Gaussian noise to particles.
+ * This breaks the chain: noise from t=0..K-1 is independent from t=K..2K-1.
+ * Prevents unbounded accumulation of temperature-induced drift.
  */
 
 #include "svpf_kernels.cuh"
-#include "svpf_fused_gradient_stats.cuh"  // Fused gradient + stats kernel
+#include "svpf_fused_gradient_stats.cuh"
 
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
@@ -31,13 +35,28 @@
 void svpf_optimized_init(SVPFOptimizedState* opt, int n);
 
 // =============================================================================
+// DECORRELATION KERNEL: Periodic Variance Injection
+// =============================================================================
+
+__global__ void svpf_decorrelation_kernel(
+    float* __restrict__ h,
+    curandStatePhilox4_32_10_t* __restrict__ rng_states,
+    float decorrelation_scale,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    
+    // Add i.i.d. Gaussian noise (independent of particle positions)
+    float noise = curand_normal(&rng_states[idx]);
+    h[idx] = clamp_logvol(h[idx] + decorrelation_scale * noise);
+}
+
+// =============================================================================
 // STATE MANAGEMENT: Create
 // =============================================================================
 
 SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_t stream) {
-    // NOTE: n_stein_steps is kept in signature for API compatibility but is unused.
-    // Actual iteration count is controlled by:
-    //   total_steps = anneal_n_stages_fixed × anneal_steps_per_beta
     (void)n_stein_steps;
     
     SVPFState* state = (SVPFState*)malloc(sizeof(SVPFState));
@@ -90,100 +109,77 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     cudaMalloc(&state->d_return_var, sizeof(float));
     cudaMalloc(&state->d_bw_alpha, sizeof(float));
     float init_ema = 0.0f;
-    float init_alpha = 0.4f;  // <-- this is bandwidth EMA alpha, not weight tempering
+    float init_alpha = 0.4f;
     cudaMemcpy(state->d_return_ema, &init_ema, sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(state->d_return_var, &init_ema, sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(state->d_bw_alpha, &init_alpha, sizeof(float), cudaMemcpyHostToDevice);
     
     // =========================================================================
-    // Production defaults (matches test harness configuration)
+    // Production defaults
     // =========================================================================
     
     state->use_exact_gradient = 1;
-    state->lik_offset = 0.09f;
+    state->lik_offset = 0.0729f;
     
-    // --- SVLD + Annealing ---
     state->use_svld = 1;
     state->temperature = 0.45f;
     state->rmsprop_rho = 0.7f;
     state->rmsprop_eps = 1e-6f;
     
-    // --- MIM (OFF by default — guided prediction supersedes) ---
     state->use_mim = 0;
     state->mim_jump_prob = 0.25f;
-    state->mim_jump_scale = 4.2f;
+    state->mim_jump_scale = 8.2f;
     
-    // --- EKF Guide density ---
-    state->use_guide = 1;
-    state->use_guide_preserving = 1;  // Variance-preserving shift (not contraction)
-    state->guide_strength = 0.05f;
+    state->use_guide = 0;
+    state->use_guide_preserving = 0;
+    state->guide_strength = 0.00f;
     state->guide_mean = 0.0f;
     state->guide_var = 0.0f;
     state->guide_K = 0.0f;
-    state->guide_initialized = 1;
+    state->guide_initialized = 0;
     
-    // --- Adaptive guide (innovation-gated strength) ---
     state->use_adaptive_guide = 1;
-    state->guide_strength_base = 0.05f;       // Base when model fits
-    state->guide_strength_max = 0.30f;        // Max during surprises
-    state->guide_innovation_threshold = 1.0f; // Z-score to start boosting
+    state->guide_strength_base = 0.05f;
+    state->guide_strength_max = 0.30f;
+    state->guide_innovation_threshold = 1.0f;
     state->vol_prev = 0.05f;
     
-    // --- Newton-Stein (Hessian preconditioning) ---
     state->use_newton = 1;
-    state->use_full_newton = 1;  // Kernel-smoothed target Hessian (Nk geometry term removed)
+    state->use_full_newton = 1;
     
-    // --- Guided Prediction with innovation gating ---
     state->use_guided = 1;
-    state->guided_alpha_base = 0.0f;             // 0% when model fits
-    state->guided_alpha_shock = 0.40f;            // 40% when model fails
-    state->guided_innovation_threshold = 1.5f;    // 1.5σ = "surprised"
+    state->guided_alpha_base = 0.0f;
+    state->guided_alpha_shock = 0.40f;
+    state->guided_innovation_threshold = 1.5f;
     
-    // --- Adaptive mu (Kalman drift) ---
     state->use_adaptive_mu = 1;
     state->mu_state = -3.5f;
     state->mu_var = 1.0f;
-    state->mu_process_var = 0.001f;   // Q: how fast can mu drift
-    state->mu_obs_var_scale = 11.0f;  // R = scale * bw²
+    state->mu_process_var = 0.001f;
+    state->mu_obs_var_scale = 11.0f;
     state->mu_min = -4.0f;
     state->mu_max = -1.0f;
     
-    // --- Adaptive sigma (volatility-of-volatility boost) ---
     state->use_adaptive_sigma = 1;
-    state->sigma_boost_threshold = 0.95f;  // Start boosting when |z| > ~1
-    state->sigma_boost_max = 3.2f;         // Max 3.2× boost
+    state->sigma_boost_threshold = 0.95f;
+    state->sigma_boost_max = 3.2f;
     state->sigma_z_effective = 0.10f;
     
-    // === Stein operator sign mode ===
-    // CHANGED: Disabled repulsion. SVPF v6 experiments showed repulsive term
-    // is harmful in sequential filtering — predict step noise maintains diversity,
-    // repulsion introduces circular dependency that compounds bias across timesteps.
-    // Set to SVPF_STEIN_SIGN_DEFAULT (1) to restore original SVGD behavior.
     state->stein_repulsive_sign = SVPF_STEIN_SIGN_NONE;
-    
-    // === Fan mode (weightless SVGD) ===
     state->use_fan_mode = 1;
-    
-    // === Student-t state dynamics ===
     state->use_student_t_state = 0;
     state->nu_state = 6.0f;
     
-    // === KSD tracking (ksd_prev drives rejuvenation trigger) ===
     state->ksd_prev = 1e10f;
     state->stein_steps_used = 0;
     
-    // === Heun's Method (OFF) ===
     state->use_heun = 0;
-    
-    // === Antithetic Sampling ===
     state->use_antithetic = 1;
     
-    // === Fixed Annealing Schedule (graph-capturable, no D2H sync) ===
-    state->anneal_n_stages_fixed = 4;  // 4 stages × 3 steps = 12 total
+    state->anneal_n_stages_fixed = 4;
     state->anneal_steps_per_beta = 3;
     state->anneal_stages_used = 0;
     
-    // === Backward Smoothing (Fan et al. 2021 sliding window) ===
     state->use_smoothing = 1;
     state->smooth_lag = 3;
     state->smooth_output_lag = 1;
@@ -194,8 +190,14 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     }
     state->smooth_head = 1;
     
-    // === Persistent kernel ===
     state->use_persistent_kernel = 1;
+    
+    // =========================================================================
+    // NEW: Decorrelation (Bias Mitigation)
+    // =========================================================================
+    state->use_decorrelation = 1;           // Enable by default
+    state->decorrelation_interval = 25;     // Every 25 timesteps
+    state->decorrelation_scale = 0.15f;     // 15% of sigma_z
     
     // Device scalars
     cudaMalloc(&state->d_scalar_max, sizeof(float));
@@ -215,7 +217,6 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     
     return state;
 }
-
 
 // =============================================================================
 // STATE MANAGEMENT: Destroy
@@ -279,11 +280,9 @@ void svpf_initialize(SVPFState* state, const SVPFParams* params, unsigned long l
     float rho = params->rho;
     float sigma_z = params->sigma_z;
     
-    // Clamp nu_state to ensure finite variance (requires nu > 2)
     float nu_state_clamped = fmaxf(state->nu_state, 2.5f);
     state->nu_state = nu_state_clamped;
     
-    // Compute stationary variance
     float base_var = (sigma_z * sigma_z) / (1.0f - rho * rho + 1e-6f);
     float stationary_var;
     
@@ -317,7 +316,6 @@ void svpf_initialize(SVPFState* state, const SVPFParams* params, unsigned long l
         state->sigma_z_effective = params->sigma_z;
     }
     
-    // Reset KSD tracking
     state->ksd_prev = 1e10f;
     state->stein_steps_used = 0;
     
@@ -383,12 +381,10 @@ void svpf_optimized_init(SVPFOptimizedState* opt, int n) {
     
     cudaMalloc(&opt->d_params_staging, SVPF_GRAPH_PARAMS_SIZE * sizeof(float));
     
-    // === KSD buffers ===
     cudaMalloc(&opt->d_ksd_partial, n * sizeof(float));
     cudaMalloc(&opt->d_ksd, sizeof(float));
     
-    // === Consolidated output pack (single D2H transfer) ===
-    cudaMalloc(&opt->d_output_pack, 8 * sizeof(float));  // 32 bytes aligned
+    cudaMalloc(&opt->d_output_pack, 8 * sizeof(float));
     cudaMallocHost(&opt->h_output_pinned, 8 * sizeof(float));
     
     cudaStreamCreateWithFlags(&opt->graph_stream, cudaStreamNonBlocking);
@@ -398,7 +394,6 @@ void svpf_optimized_init(SVPFOptimizedState* opt, int n) {
     
     cudaMallocHost(&opt->h_results_pinned, 4 * sizeof(float));
     
-    // === Adaptive Annealing Buffers ===
     cudaMalloc(&opt->d_anneal_stats, 4 * sizeof(float));
     cudaMallocHost(&opt->h_anneal_stats_pinned, 4 * sizeof(float));
     
@@ -428,11 +423,9 @@ static void svpf_optimized_cleanup(SVPFOptimizedState* opt) {
     cudaFree(opt->d_vol_single);
     cudaFree(opt->d_params_staging);
     
-    // === KSD buffers ===
     cudaFree(opt->d_ksd_partial);
     cudaFree(opt->d_ksd);
     
-    // === Consolidated output pack ===
     cudaFree(opt->d_output_pack);
     if (opt->h_output_pinned) {
         cudaFreeHost(opt->h_output_pinned);
@@ -444,7 +437,6 @@ static void svpf_optimized_cleanup(SVPFOptimizedState* opt) {
         opt->h_results_pinned = nullptr;
     }
     
-    // === Adaptive Annealing Buffers ===
     if (opt->d_anneal_stats) {
         cudaFree(opt->d_anneal_stats);
         opt->d_anneal_stats = nullptr;
@@ -506,14 +498,9 @@ static void svpf_adaptive_mu_update(
     state->mu_var = P_new;
 }
 
-// svpf_smooth_backward and svpf_get_smoothed_output are in svpf_kernels.cuh
-
 // =============================================================================
 // ASYNC STEP: Launch all GPU work, return immediately
 // =============================================================================
-// Fixed linear beta schedule, fully async, no mid-step syncs.
-// Pre-configure: state->anneal_n_stages_fixed, state->anneal_steps_per_beta
-// Pipeline: predict → guide → bandwidth → [gradient → stein] × N → outputs
 
 void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams* params) {
     SVPFOptimizedState* opt = get_opt(state);
@@ -522,7 +509,7 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
     
     svpf_optimized_init(opt, n);
     
-    // --- Effective parameters (CPU-side, no GPU dependency) ---
+    // --- Effective parameters ---
     float effective_mu = state->use_adaptive_mu ? state->mu_state : params->mu;
     float effective_sigma_z = params->sigma_z;
     
@@ -546,12 +533,11 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
     size_t grad_smem = 2 * n * sizeof(float);
     size_t stein_smem = 3 * n * sizeof(float);
     
-    // Upload y values
     float y_arr[2] = {y_prev, y_t};
     cudaMemcpyAsync(opt->d_y_single, y_arr, 2 * sizeof(float), cudaMemcpyHostToDevice, cs);
     
     // =========================================================================
-    // PREDICT (Antithetic guided) — O(N), use standard block size
+    // PREDICT (Antithetic guided)
     // =========================================================================
     {
         int nb_half = ((n / 2) + SVPF_BLOCK_SIZE - 1) / SVPF_BLOCK_SIZE;
@@ -570,7 +556,7 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
     }
 
     // =========================================================================
-    // GUIDE (Variance-preserving) — O(N), use standard block size
+    // GUIDE (Variance-preserving)
     // =========================================================================
     float current_guide_strength = state->guide_strength_base;
     
@@ -602,7 +588,7 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
     }
     
     // =========================================================================
-    // BANDWIDTH — single block reduction
+    // BANDWIDTH
     // =========================================================================
     svpf_fused_bandwidth_kernel<<<1, SVPF_BLOCK_SIZE, 0, cs>>>(
         state->h, opt->d_y_single, opt->d_bandwidth, opt->d_bandwidth_sq,
@@ -610,7 +596,7 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
     );
     
     // =========================================================================
-    // STEIN ITERATIONS — O(N²), adaptive block size for SM parallelism
+    // STEIN ITERATIONS
     // =========================================================================
     
     int n_stages = state->anneal_n_stages_fixed;
@@ -628,7 +614,6 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
             total_steps++;
             bool is_last = (stage == n_stages - 1) && (s == steps_per_beta - 1);
             
-            // Gradient — O(N²): each thread reads all N particles
             svpf_fused_gradient_kernel<<<nb_stein, sbs, grad_smem, cs>>>(
                 state->h, state->h_prev, state->grad_log_p, state->log_weights,
                 opt->d_precond_grad, opt->d_inv_hessian,
@@ -639,7 +624,6 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
                 n
             );
             
-            // Stein transport — O(N²): each thread iterates over all N particles
             if (is_last) {
                 svpf_fused_stein_transport_full_newton_ksd_kernel<<<nb_stein, sbs, stein_smem, cs>>>(
                     state->h, state->grad_log_p, opt->d_inv_hessian,
@@ -649,7 +633,6 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
                     state->stein_repulsive_sign, state->use_split_batch, n
                 );
                 
-                // KSD reduce — single block reduction
                 svpf_ksd_reduce_kernel<<<1, SVPF_BLOCK_SIZE, 0, cs>>>(
                     opt->d_ksd_partial, opt->d_ksd, n
                 );
@@ -664,12 +647,25 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
         }
     }
     
-    // Store diagnostics
     state->anneal_stages_used = n_stages;
     state->stein_steps_used = total_steps;
     
     // =========================================================================
-    // OUTPUTS — single block reduction
+    // NEW: PERIODIC DECORRELATION (Bias Mitigation)
+    // =========================================================================
+    if (state->use_decorrelation && state->decorrelation_interval > 0) {
+        if ((state->timestep > 0) && (state->timestep % state->decorrelation_interval == 0)) {
+            // Inject independent variance to break temporal correlation
+            float decorr_noise_scale = state->decorrelation_scale * effective_sigma_z;
+            
+            svpf_decorrelation_kernel<<<nb, SVPF_BLOCK_SIZE, 0, cs>>>(
+                state->h, state->rng_states, decorr_noise_scale, n
+            );
+        }
+    }
+    
+    // =========================================================================
+    // OUTPUTS
     // =========================================================================
     svpf_fused_outputs_kernel<<<1, SVPF_BLOCK_SIZE, 0, cs>>>(
         state->h, state->log_weights,
@@ -682,13 +678,12 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
     cudaMemcpyAsync(opt->h_output_pinned, opt->d_output_pack, 
                     5 * sizeof(float), cudaMemcpyDeviceToHost, cs);
     
-    // Store params needed for post-sync processing
     opt->pending_y_t = y_t;
     opt->pending_params = (const void*)params;
 }
 
 // =============================================================================
-// SYNC AND FINALIZE: Wait for GPU, read outputs, update state
+// SYNC AND FINALIZE
 // =============================================================================
 
 void svpf_sync_outputs(SVPFState* state, 
@@ -704,7 +699,6 @@ void svpf_sync_outputs(SVPFState* state,
     float vol_local = results[1];
     float ksd_local = results[4];
     
-    // Backward smoothing
     float h_var_est = bandwidth_local * bandwidth_local;
     const SVPFParams* params = (const SVPFParams*)opt->pending_params;
     svpf_smooth_backward(state, h_mean_local, h_var_est, opt->pending_y_t, params);
@@ -726,7 +720,7 @@ void svpf_sync_outputs(SVPFState* state,
 }
 
 // =============================================================================
-// SYNCHRONOUS STEP (Original API - calls async + sync)
+// SYNCHRONOUS STEP (Original API)
 // =============================================================================
 
 void svpf_step_graph(SVPFState* state, float y_t, float y_prev, const SVPFParams* params,

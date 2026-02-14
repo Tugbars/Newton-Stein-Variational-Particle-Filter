@@ -378,6 +378,10 @@ typedef struct {
 
     int anneal_n_stages_fixed; // Fixed beta stage count (default 4)
 
+    int use_decorrelation;      // Enable periodic variance injection
+    int decorrelation_interval; // Inject every N timesteps (e.g., 25)
+    float decorrelation_scale;  // Noise magnitude as fraction of sigma_z (e.g.,
+                                // 0.15)
 } SVPFState;
 
 /**

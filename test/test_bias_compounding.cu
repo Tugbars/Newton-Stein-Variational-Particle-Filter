@@ -157,6 +157,11 @@ int main() {
     const int n_particles = 256;
     const unsigned long long seed = 12345;
     
+    // NOTE: To test WITHOUT decorrelation, set these to 0 after svpf_create():
+    //   state->use_decorrelation = 0;
+    //   state->decorrelation_interval = 0;
+    //   state->decorrelation_scale = 0.0f;
+    
     // Generate synthetic data
     printf("Generating synthetic data (T=%d)...\n", T);
     GroundTruth gt = generate_synthetic_data(T, seed);
@@ -177,9 +182,21 @@ int main() {
     printf("--- EXPERIMENT A: Normal Run (No Reset) ---\n");
     
     SVPFState* state_A = svpf_create(n_particles, 12, gt.nu, 0);
+    
+    // Enable decorrelation (bias mitigation)
+    state_A->use_decorrelation = 1;
+    state_A->decorrelation_interval = 25;
+    state_A->decorrelation_scale = 0.15f;
+    
+    printf("Decorrelation: %s (interval=%d, scale=%.2f)\n",
+           state_A->use_decorrelation ? "ENABLED" : "DISABLED",
+           state_A->decorrelation_interval,
+           state_A->decorrelation_scale);
+    
     svpf_initialize(state_A, &params, seed);
     
     std::vector<BiasMetrics> bias_A(T);
+    int decorr_count = 0;
     
     for (int t = 0; t < T; t++) {
         float loglik, vol, h_mean;
@@ -189,6 +206,13 @@ int main() {
         
         bias_A[t] = measure_bias(state_A, gt.h_true[t + 1]);
         
+        // Track decorrelation events
+        if (state_A->use_decorrelation && state_A->decorrelation_interval > 0) {
+            if ((t > 0) && (t % state_A->decorrelation_interval == 0)) {
+                decorr_count++;
+            }
+        }
+        
         // Print key timesteps
         if (t == 0 || t == 9 || t == 19 || t == 49 || t == 50 || t == 99) {
             printf("t=%3d: bias=%.4f, abs_err=%.4f, RMSE=%.4f, h_true=%.3f, h_est=%.3f\n",
@@ -197,6 +221,8 @@ int main() {
         }
     }
     
+    printf("Decorrelation fired %d times (expected: %d)\n", 
+           decorr_count, T / state_A->decorrelation_interval);
     printf("\n");
     
     // ==========================================================================
@@ -205,6 +231,12 @@ int main() {
     printf("--- EXPERIMENT B: Reset at t=%d ---\n", reset_point);
     
     SVPFState* state_B = svpf_create(n_particles, 12, gt.nu, 0);
+    
+    // Enable decorrelation (same settings as A)
+    state_B->use_decorrelation = 1;
+    state_B->decorrelation_interval = 25;
+    state_B->decorrelation_scale = 0.15f;
+    
     svpf_initialize(state_B, &params, seed);
     
     // Run up to reset point
@@ -272,12 +304,24 @@ int main() {
     printf("INTERPRETATION:\n");
     printf("---------------\n");
     
+    printf("Decorrelation was: %s\n", state_A->use_decorrelation ? "ENABLED" : "DISABLED");
+    if (state_A->use_decorrelation) {
+        printf("  Interval: %d, Scale: %.2f\n", 
+               state_A->decorrelation_interval, state_A->decorrelation_scale);
+    }
+    printf("\n");
+    
     if (ratio_reset_vs_no_reset < 0.7f) {
         printf("✓ BIAS COMPOUNDS: bias(51|reset) << bias(51|no_reset)\n");
         printf("  → Resetting particles significantly reduced bias\n");
         printf("  → Bias accumulates across timesteps\n");
-        printf("  → Static lik_offset cannot fix this\n");
-        printf("  → Need: periodic rejuvenation, drift tracking, or architectural change\n");
+        if (state_A->use_decorrelation) {
+            printf("  → WARNING: Decorrelation is enabled but bias still compounds!\n");
+            printf("  → Decorrelation may need stronger settings or alternative approach\n");
+        } else {
+            printf("  → Static lik_offset cannot fix this\n");
+            printf("  → Need: periodic rejuvenation, drift tracking, or architectural change\n");
+        }
     } else if (ratio_reset_vs_no_reset > 1.3f) {
         printf("✗ ANOMALY: bias(51|reset) > bias(51|no_reset)\n");
         printf("  → Unexpected result, may need more trials for statistical significance\n");
@@ -285,8 +329,12 @@ int main() {
         printf("✓ BIAS IS LOCAL: bias(51|reset) ≈ bias(51|no_reset)\n");
         printf("  → Reset did not significantly change bias\n");
         printf("  → Bias is per-observation, not cumulative\n");
-        printf("  → Static lik_offset is near-optimal\n");
-        printf("  → Variation across observations is intrinsic to finite-particle SVLD\n");
+        if (state_A->use_decorrelation) {
+            printf("  → Decorrelation successfully breaks temporal correlation!\n");
+        } else {
+            printf("  → Static lik_offset is near-optimal\n");
+            printf("  → Variation across observations is intrinsic to finite-particle SVLD\n");
+        }
     }
     
     printf("\n");
