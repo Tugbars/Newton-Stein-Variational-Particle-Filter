@@ -35,24 +35,6 @@
 void svpf_optimized_init(SVPFOptimizedState* opt, int n);
 
 // =============================================================================
-// DECORRELATION KERNEL: Periodic Variance Injection
-// =============================================================================
-
-__global__ void svpf_decorrelation_kernel(
-    float* __restrict__ h,
-    curandStatePhilox4_32_10_t* __restrict__ rng_states,
-    float decorrelation_scale,
-    int n
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n) return;
-    
-    // Add i.i.d. Gaussian noise (independent of particle positions)
-    float noise = curand_normal(&rng_states[idx]);
-    h[idx] = clamp_logvol(h[idx] + decorrelation_scale * noise);
-}
-
-// =============================================================================
 // STATE MANAGEMENT: Create
 // =============================================================================
 
@@ -115,35 +97,23 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     cudaMemcpy(state->d_bw_alpha, &init_alpha, sizeof(float), cudaMemcpyHostToDevice);
     
     // =========================================================================
-    // Production defaults
+    // BAREBONE CONFIGURATION - Core SVLD-Newton Only
     // =========================================================================
     
     state->use_exact_gradient = 1;
-    state->lik_offset = 0.08f;
+    state->lik_offset = 0.02f;  // No manual bias correction
     
+    // SVLD: Temperature for diversity
     state->use_svld = 1;
-    state->temperature = 0.45f;
+    state->temperature = 0.51f;
     state->rmsprop_rho = 0.7f;
     state->rmsprop_eps = 1e-6f;
     
-    state->use_mim = 0;
-    state->mim_jump_prob = 0.25f;
-    state->mim_jump_scale = 8.2f;
-    
-    state->use_adaptive_guide = 0;
-    state->guide_strength_base = 0.05f;
-    state->guide_strength_max = 0.30f;
-    state->guide_innovation_threshold = 1.0f;
-    state->vol_prev = 0.05f;
-    
+    // Newton: Hessian preconditioning
     state->use_newton = 1;
     state->use_full_newton = 1;
     
-    state->use_guided = 0;
-    state->guided_alpha_base = 0.0f;
-    state->guided_alpha_shock = 0.40f;
-    state->guided_innovation_threshold = 1.5f;
-    
+    // Adaptive mu: Drift learning
     state->use_adaptive_mu = 1;
     state->mu_state = -3.5f;
     state->mu_var = 1.0f;
@@ -152,44 +122,18 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     state->mu_min = -4.0f;
     state->mu_max = -1.0f;
     
-    state->use_adaptive_sigma = 0;
-    state->sigma_boost_threshold = 0.95f;
-    state->sigma_boost_max = 3.2f;
-    state->sigma_z_effective = 0.10f;
-    
+    // Core Stein transport settings
     state->stein_repulsive_sign = SVPF_STEIN_SIGN_NONE;
     state->use_fan_mode = 1;
-    state->use_student_t_state = 0;
-    state->nu_state = 2.5f;
+    state->use_antithetic = 1;
+    state->anneal_n_stages_fixed = 4;
+    state->anneal_steps_per_beta = 5;
+    state->anneal_stages_used = 0;
     
     state->ksd_prev = 1e10f;
     state->stein_steps_used = 0;
     
-    state->use_heun = 0;
-    state->use_antithetic = 1;
-    
-    state->anneal_n_stages_fixed = 4;
-    state->anneal_steps_per_beta = 3;
-    state->anneal_stages_used = 0;
-    
-    state->use_smoothing = 0;
-    state->smooth_lag = 3;
-    state->smooth_output_lag = 1;
-    for (int i = 0; i < SVPF_SMOOTH_MAX_LAG; i++) {
-        state->smooth_h_mean[i] = 0.0f;
-        state->smooth_h_var[i] = 1.0f;
-        state->smooth_y[i] = 0.0f;
-    }
-    state->smooth_head = 1;
-    
     state->use_persistent_kernel = 1;
-    
-    // =========================================================================
-    // NEW: Decorrelation (Bias Mitigation)
-    // =========================================================================
-    state->use_decorrelation = 0;           // Enable by default
-    state->decorrelation_interval = 25;     // Every 25 timesteps
-    state->decorrelation_scale = 0.15f;     // 15% of sigma_z
     
     // Device scalars
     cudaMalloc(&state->d_scalar_max, sizeof(float));
@@ -298,10 +242,6 @@ void svpf_initialize(SVPFState* state, const SVPFParams* params, unsigned long l
     if (state->use_adaptive_mu) {
         state->mu_state = params->mu;
         state->mu_var = 1.0f;
-    }
-    
-    if (state->use_adaptive_sigma) {
-        state->sigma_z_effective = params->sigma_z;
     }
     
     state->ksd_prev = 1e10f;
@@ -492,20 +432,6 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
     float effective_mu = state->use_adaptive_mu ? state->mu_state : params->mu;
     float effective_sigma_z = params->sigma_z;
     
-    if (state->use_adaptive_sigma && state->timestep > 0) {
-        float vol_est = fmaxf(state->vol_prev, 1e-4f);
-        float return_z = fabsf(y_t) / vol_est;
-        
-        float sigma_boost = 1.0f;
-        if (return_z > state->sigma_boost_threshold) {
-            float severity = fminf((return_z - state->sigma_boost_threshold) / 3.0f, 1.0f);
-            sigma_boost = 1.0f + (state->sigma_boost_max - 1.0f) * severity;
-        }
-        
-        effective_sigma_z = params->sigma_z * sigma_boost;
-        state->sigma_z_effective = effective_sigma_z;
-    }
-    
     int nb = (n + SVPF_BLOCK_SIZE - 1) / SVPF_BLOCK_SIZE;
     int sbs = opt->stein_block_size;
     int nb_stein = (n + sbs - 1) / sbs;
@@ -516,22 +442,20 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
     cudaMemcpyAsync(opt->d_y_single, y_arr, 2 * sizeof(float), cudaMemcpyHostToDevice, cs);
     
     // =========================================================================
-    // PREDICT (Antithetic guided)
+    // PREDICT (Antithetic, pure AR(1) - no guided blending)
     // =========================================================================
     {
-        int nb_half = ((n / 2) + SVPF_BLOCK_SIZE - 1) / SVPF_BLOCK_SIZE;
-        svpf_predict_guided_antithetic_kernel<<<nb_half, SVPF_BLOCK_SIZE, 0, cs>>>(
-            state->h, state->h_prev, state->rng_states,
-            opt->d_y_single, 1,
-            params->rho,
-            effective_sigma_z, effective_mu, params->gamma,
-            state->mim_jump_prob, state->mim_jump_scale,
-            state->guided_alpha_base, state->guided_alpha_shock,
-            state->guided_innovation_threshold,
-            state->student_t_implied_offset,
-            state->use_student_t_state, state->nu_state,
-            n
-        );
+      int nb_half = ((n / 2) + SVPF_BLOCK_SIZE - 1) / SVPF_BLOCK_SIZE;
+      svpf_predict_guided_antithetic_kernel<<<nb_half, SVPF_BLOCK_SIZE, 0,
+                                              cs>>>(
+          state->h, state->h_prev, state->rng_states, opt->d_y_single, 1,
+          params->rho, effective_sigma_z, effective_mu, params->gamma, 0.0f,
+          1.0f,              // mim disabled (prob=0)
+          state->use_guided, // NEW: Pass the flag
+          state->guided_alpha_base, state->guided_alpha_shock,
+          state->guided_innovation_threshold, state->student_t_implied_offset,
+          0, 2.5f, // student_t_state disabled
+          n);
     }
 
     // =========================================================================
@@ -567,7 +491,7 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
                 opt->d_y_single, 1, params->rho, effective_sigma_z, effective_mu,
                 state->nu, state->lik_offset,
                 params->gamma, state->use_exact_gradient, state->use_newton,
-                state->use_student_t_state, state->nu_state,
+                0, 2.5f,  // student_t_state disabled
                 n
             );
             
@@ -596,20 +520,6 @@ void svpf_step_async(SVPFState* state, float y_t, float y_prev, const SVPFParams
     
     state->anneal_stages_used = n_stages;
     state->stein_steps_used = total_steps;
-    
-    // =========================================================================
-    // NEW: PERIODIC DECORRELATION (Bias Mitigation)
-    // =========================================================================
-    if (state->use_decorrelation && state->decorrelation_interval > 0) {
-        if ((state->timestep > 0) && (state->timestep % state->decorrelation_interval == 0)) {
-            // Inject independent variance to break temporal correlation
-            float decorr_noise_scale = state->decorrelation_scale * effective_sigma_z;
-            
-            svpf_decorrelation_kernel<<<nb, SVPF_BLOCK_SIZE, 0, cs>>>(
-                state->h, state->rng_states, decorr_noise_scale, n
-            );
-        }
-    }
     
     // =========================================================================
     // OUTPUTS
@@ -646,15 +556,9 @@ void svpf_sync_outputs(SVPFState* state,
     float vol_local = results[1];
     float ksd_local = results[4];
     
-    float h_var_est = bandwidth_local * bandwidth_local;
-    const SVPFParams* params = (const SVPFParams*)opt->pending_params;
-    svpf_smooth_backward(state, h_mean_local, h_var_est, opt->pending_y_t, params);
-    
-    float h_mean_output = svpf_get_smoothed_output(state, h_mean_local);
-    
     if (h_loglik_out) *h_loglik_out = results[0];
     if (h_vol_out) *h_vol_out = vol_local;
-    if (h_mean_out) *h_mean_out = h_mean_output;
+    if (h_mean_out) *h_mean_out = h_mean_local;  // Direct output (smoothing disabled)
     
     state->vol_prev = vol_local;
     state->ksd_prev = ksd_local;

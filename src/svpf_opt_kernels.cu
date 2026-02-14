@@ -70,6 +70,7 @@ __global__ void svpf_predict_guided_antithetic_kernel(
     float rho,
     float sigma_z, float mu, float gamma,
     float jump_prob, float jump_scale,
+    int use_guided,  // NEW: Flag to enable/disable guided blending
     float alpha_base, float alpha_shock,
     float innovation_threshold,
     float implied_offset,
@@ -105,20 +106,28 @@ __global__ void svpf_predict_guided_antithetic_kernel(
         float leverage = gamma * y_prev / (vol_prev + 1e-8f);
         float mean_prior = mu + rho * (h_i - mu) + leverage;
         
-        float y_curr = d_y[t];
-        float log_y2 = __logf(y_curr * y_curr + 1e-10f);
-        float mean_implied = fmaxf(log_y2 + implied_offset, -5.0f);
+        float mean_proposal;
         
-        float innovation = mean_implied - mean_prior;
-        float z_score = innovation / 2.5f;
-        
-        float activation = 0.0f;
-        if (z_score > innovation_threshold) {
-            activation = tanhf(z_score - innovation_threshold);
+        if (use_guided) {
+            // Guided prediction: blend prior with observation-implied mean
+            float y_curr = d_y[t];
+            float log_y2 = __logf(y_curr * y_curr + 1e-10f);
+            float mean_implied = fmaxf(log_y2 + implied_offset, -5.0f);
+            
+            float innovation = mean_implied - mean_prior;
+            float z_score = innovation / 2.5f;
+            
+            float activation = 0.0f;
+            if (z_score > innovation_threshold) {
+                activation = tanhf(z_score - innovation_threshold);
+            }
+            
+            float guided_alpha = alpha_base + (alpha_shock - alpha_base) * activation;
+            mean_proposal = (1.0f - guided_alpha) * mean_prior + guided_alpha * mean_implied;
+        } else {
+            // Pure AR(1) prediction: use prior only
+            mean_proposal = mean_prior;
         }
-        
-        float guided_alpha = alpha_base + (alpha_shock - alpha_base) * activation;
-        float mean_proposal = (1.0f - guided_alpha) * mean_prior + guided_alpha * mean_implied;
         
         h[i] = clamp_logvol(mean_proposal + sigma_z * scale * z);
     }
@@ -130,20 +139,28 @@ __global__ void svpf_predict_guided_antithetic_kernel(
         float leverage = gamma * y_prev / (vol_prev + 1e-8f);
         float mean_prior = mu + rho * (h_j - mu) + leverage;
         
-        float y_curr = d_y[t];
-        float log_y2 = __logf(y_curr * y_curr + 1e-10f);
-        float mean_implied = fmaxf(log_y2 + implied_offset, -5.0f);
+        float mean_proposal;
         
-        float innovation = mean_implied - mean_prior;
-        float z_score = innovation / 2.5f;
-        
-        float activation = 0.0f;
-        if (z_score > innovation_threshold) {
-            activation = tanhf(z_score - innovation_threshold);
+        if (use_guided) {
+            // Guided prediction: blend prior with observation-implied mean
+            float y_curr = d_y[t];
+            float log_y2 = __logf(y_curr * y_curr + 1e-10f);
+            float mean_implied = fmaxf(log_y2 + implied_offset, -5.0f);
+            
+            float innovation = mean_implied - mean_prior;
+            float z_score = innovation / 2.5f;
+            
+            float activation = 0.0f;
+            if (z_score > innovation_threshold) {
+                activation = tanhf(z_score - innovation_threshold);
+            }
+            
+            float guided_alpha = alpha_base + (alpha_shock - alpha_base) * activation;
+            mean_proposal = (1.0f - guided_alpha) * mean_prior + guided_alpha * mean_implied;
+        } else {
+            // Pure AR(1) prediction: use prior only
+            mean_proposal = mean_prior;
         }
-        
-        float guided_alpha = alpha_base + (alpha_shock - alpha_base) * activation;
-        float mean_proposal = (1.0f - guided_alpha) * mean_prior + guided_alpha * mean_implied;
         
         h[j] = clamp_logvol(mean_proposal + sigma_z * scale * (-z));
     }

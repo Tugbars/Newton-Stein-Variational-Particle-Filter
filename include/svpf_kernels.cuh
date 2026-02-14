@@ -48,11 +48,12 @@ __global__ void svpf_predict_guided_antithetic_kernel(
     float rho,
     float sigma_z, float mu, float gamma,
     float jump_prob, float jump_scale,
+    int use_guided,  // NEW: Flag to enable/disable guided blending
     float alpha_base, float alpha_shock,
     float innovation_threshold,
     float implied_offset,
     int use_student_t_state, float nu_state,
-    int n
+    int n  // FULL n, not n/2
 );
 
 // =============================================================================
