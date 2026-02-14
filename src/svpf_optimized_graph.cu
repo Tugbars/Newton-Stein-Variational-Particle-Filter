@@ -119,7 +119,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     // =========================================================================
     
     state->use_exact_gradient = 1;
-    state->lik_offset = 0.14f;
+    state->lik_offset = 0.08f;
     
     state->use_svld = 1;
     state->temperature = 0.45f;
@@ -152,7 +152,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     state->mu_min = -4.0f;
     state->mu_max = -1.0f;
     
-    state->use_adaptive_sigma = 1;
+    state->use_adaptive_sigma = 0;
     state->sigma_boost_threshold = 0.95f;
     state->sigma_boost_max = 3.2f;
     state->sigma_z_effective = 0.10f;
@@ -169,7 +169,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     state->use_antithetic = 1;
     
     state->anneal_n_stages_fixed = 4;
-    state->anneal_steps_per_beta = 4;
+    state->anneal_steps_per_beta = 3;
     state->anneal_stages_used = 0;
     
     state->use_smoothing = 1;
