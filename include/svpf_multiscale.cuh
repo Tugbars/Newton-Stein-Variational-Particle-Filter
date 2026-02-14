@@ -282,18 +282,18 @@ static inline MS_SVPF* ms_svpf_create(const MS_SVPF_Config* config) {
         ms->sigma_z_inertial = 0.10f;   // Standard
         
         /* Asymmetric rho: ON (same as mono) */
-        f->use_asymmetric_rho = 1;
+        f->use_asymmetric_rho = 0;
         f->rho_up = 0.98f;
         f->rho_down = 0.93f;
         
         /* MIM: Full production settings */
-        f->use_mim = 1;
+        f->use_mim = 0;
         f->mim_jump_prob = 0.25f;    // Same as mono
-        f->mim_jump_scale = 9.0f;
+        f->mim_jump_scale = 9.2f;
         ms->mim_jump_prob_inertial_base = 0.25f;
         
         /* Guide: FULL adaptive suite (same as mono) */
-        f->use_guide = 1;
+        f->use_guide = 0;
         f->use_guide_preserving = 1;
         f->guide_strength = 0.05f;
         f->guide_mean = 0.0f;
@@ -301,26 +301,22 @@ static inline MS_SVPF* ms_svpf_create(const MS_SVPF_Config* config) {
         f->guide_K = 0.0f;
         f->guide_initialized = 0;
         
-        f->use_adaptive_guide = 1;
+        f->use_adaptive_guide = 0;
         f->guide_strength_base = 0.05f;
         f->guide_strength_max = 0.30f;
         f->guide_innovation_threshold = 1.0f;
         
         /* Guided prediction (same as mono) */
-        f->use_guided = 1;
+        f->use_guided = 0;
         f->guided_alpha_base = 0.0f;
         f->guided_alpha_shock = 0.40f;
         f->guided_innovation_threshold = 1.5f;
         
         /* SVLD: Standard (same as mono) */
         f->use_svld = 1;
-        f->temperature = 0.45f;
-        f->rmsprop_rho = 0.9f;
+        f->temperature = 0.50f;
+        f->rmsprop_rho = 0.7f;
         f->rmsprop_eps = 1e-6f;
-        
-        /* Annealing: ON (same as mono) */
-        f->use_annealing = 1;
-        f->n_anneal_steps = 3;
         
         /* Newton: FULL (same as mono) */
         f->use_newton = 1;
@@ -335,7 +331,7 @@ static inline MS_SVPF* ms_svpf_create(const MS_SVPF_Config* config) {
         f->mu_min = -4.0f;
         f->mu_max = -1.0f;
         
-        f->use_adaptive_sigma = 1;
+        f->use_adaptive_sigma = 0;
         f->sigma_boost_threshold = 0.95f;
         f->sigma_boost_max = 3.2f;
         f->sigma_z_effective = 0.10f;
@@ -347,11 +343,11 @@ static inline MS_SVPF* ms_svpf_create(const MS_SVPF_Config* config) {
         
         /* Exact gradient (same as mono) */
         f->use_exact_gradient = 1;
-        f->lik_offset = 0.35f;
+        f->lik_offset = 0.03f;
         
         /* KSD budget: GENEROUS (same as mono) */
         f->stein_min_steps = 8;
-        f->stein_max_steps = 16;
+        f->stein_max_steps = 8;
         f->ksd_improvement_threshold = 0.05f;
     }
     
