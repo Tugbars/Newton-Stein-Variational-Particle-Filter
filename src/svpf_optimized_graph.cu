@@ -111,7 +111,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     // --- MIM (OFF by default — guided prediction supersedes) ---
     state->use_mim = 0;
     state->mim_jump_prob = 0.25f;
-    state->mim_jump_scale = 8.2f;
+    state->mim_jump_scale = 4.2f;
     
     // --- EKF Guide density ---
     state->use_guide = 1;
@@ -128,7 +128,6 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     state->guide_strength_max = 0.30f;        // Max during surprises
     state->guide_innovation_threshold = 1.0f; // Z-score to start boosting
     state->vol_prev = 0.05f;
-    
     
     // --- Newton-Stein (Hessian preconditioning) ---
     state->use_newton = 1;
@@ -166,7 +165,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     state->use_fan_mode = 1;
     
     // === Student-t state dynamics ===
-    state->use_student_t_state = 1;
+    state->use_student_t_state = 0;
     state->nu_state = 6.0f;
     
     // === KSD tracking (ksd_prev drives rejuvenation trigger) ===

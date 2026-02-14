@@ -401,3 +401,34 @@ target_link_libraries(bench_blocksize
 set_target_properties(bench_blocksize PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
 )
+
+
+# -----------------------------------------------------------------------------
+# Bias Compounding Diagnostic Test
+# Tests whether temperature-induced bias accumulates across sequential timesteps
+# -----------------------------------------------------------------------------
+add_executable(test_bias_compounding test_bias_compounding.cu)
+
+target_include_directories(test_bias_compounding
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CUDAToolkit_INCLUDE_DIRS}
+)
+
+target_link_libraries(test_bias_compounding
+    PRIVATE
+        svpf
+        svpf_tools 
+        CUDA::cudart
+        CUDA::curand
+)
+
+set_target_properties(test_bias_compounding PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+)
+
+add_test(NAME BiasCompoundingDiagnostic COMMAND test_bias_compounding)
+set_tests_properties(BiasCompoundingDiagnostic PROPERTIES
+    TIMEOUT 300
+    LABELS "diagnostic;bias;temperature"
+)
