@@ -432,3 +432,30 @@ set_tests_properties(BiasCompoundingDiagnostic PROPERTIES
     TIMEOUT 300
     LABELS "diagnostic;bias;temperature"
 )
+
+# Offset vs Difficulty Test
+add_executable(test_offset_vs_difficulty test_offset_vs_difficulty.cu)
+
+target_include_directories(test_offset_vs_difficulty
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CUDAToolkit_INCLUDE_DIRS}
+)
+
+target_link_libraries(test_offset_vs_difficulty
+    PRIVATE
+        svpf
+        svpf_tools 
+        CUDA::cudart
+        CUDA::curand
+)
+
+set_target_properties(test_offset_vs_difficulty PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+)
+
+add_test(NAME OffsetVsDifficulty COMMAND test_offset_vs_difficulty)
+set_tests_properties(OffsetVsDifficulty PROPERTIES
+    TIMEOUT 1800  # 30 minutes (18 combinations × ~60s each)
+    LABELS "diagnostic;offset;bias"
+)

@@ -130,7 +130,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     state->mim_jump_prob = 0.25f;
     state->mim_jump_scale = 8.2f;
     
-    state->use_adaptive_guide = 1;
+    state->use_adaptive_guide = 0;
     state->guide_strength_base = 0.05f;
     state->guide_strength_max = 0.30f;
     state->guide_innovation_threshold = 1.0f;
@@ -139,7 +139,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     state->use_newton = 1;
     state->use_full_newton = 1;
     
-    state->use_guided = 1;
+    state->use_guided = 0;
     state->guided_alpha_base = 0.0f;
     state->guided_alpha_shock = 0.40f;
     state->guided_innovation_threshold = 1.5f;
@@ -172,7 +172,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     state->anneal_steps_per_beta = 3;
     state->anneal_stages_used = 0;
     
-    state->use_smoothing = 1;
+    state->use_smoothing = 0;
     state->smooth_lag = 3;
     state->smooth_output_lag = 1;
     for (int i = 0; i < SVPF_SMOOTH_MAX_LAG; i++) {
@@ -187,7 +187,7 @@ SVPFState* svpf_create(int n_particles, int n_stein_steps, float nu, cudaStream_
     // =========================================================================
     // NEW: Decorrelation (Bias Mitigation)
     // =========================================================================
-    state->use_decorrelation = 1;           // Enable by default
+    state->use_decorrelation = 0;           // Enable by default
     state->decorrelation_interval = 25;     // Every 25 timesteps
     state->decorrelation_scale = 0.15f;     // 15% of sigma_z
     
